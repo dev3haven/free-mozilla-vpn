@@ -1,12 +1,25 @@
 # free_mozilla_vpn
 
-## Use mozilla vpn proxy manually
+## Use mozilla vpn proxy manually with python script
 
-1. Open Firefox and Log in to your Firefox account in **Firefox Browser**
+1. Open Firefox and Log in to your Firefox account in **Firefox Browser**. Start Mozilla VPN at least once **inside Firefox** using in-built function.
+2. Run `get_http_proxy_token_and_config.py` with your own credentials. Use **Google Authenticator** or another tool to get **2FA (TOTP)** code.
+    ```sh
+    py get_http_proxy_token_and_config.py --email example@gmail.com --password 123456 --totp 177067
+    ```
+3. Result will be printed in console and saved in file near the python script.
+4. 
+
+## Use mozilla vpn proxy manually with browser console JavaScript
+
+1. Open Firefox and Log in to your Firefox account in **Firefox Browser**. Start Mozilla VPN at least once **inside Firefox** using in-built function.
 2. press `ctrl+shift+alt+i` to open Firefox browser developer console
 3. copy and paste `firefox_console_get_http_proxy_token_and_config.js` and run
-4. Get jwt token, host, port
-5. Configure [sing-box](https://github.com/sagernet/sing-box) or another local proxy to add `Proxy-Authorization` with the `Bearer` jwt token http header to each http request
+4. Get jwt token, host, port and other
+5. Use [sing-box](https://github.com/sagernet/sing-box) or another local proxy to add `Proxy-Authorization` with the `Bearer` jwt token http header to each http request
+
+## How to use Mozilla VPN proxy with sing-box utility
+1. Configure [sing-box](https://github.com/sagernet/sing-box), add `Proxy-Authorization` with the `Bearer` as in the example
     ```sh
     sing-box run -c sing-box-config.json
     ```
@@ -35,4 +48,4 @@
       ]
     }
     ```
-7. The **jwt proxy token** will be outdated each few tens of minutes and you have to repeat it each 10-15 minutes
+2. The **jwt proxy token** will be outdated each few tens of minutes and you have to repeat it each 10-15 minutes
