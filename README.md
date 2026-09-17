@@ -7,6 +7,9 @@
 3. copy and paste `firefox_console_get_http_proxy_token_and_config.js` and run
 4. Get jwt token, host, port
 5. Configure [sing-box](https://github.com/sagernet/sing-box) or another local proxy to add `Proxy-Authorization` with the `Bearer` jwt token http header to each http request
+    ```sh
+    sing-box run -c sing-box-config.json
+    ```
     ```json
     {
       "log": { "disabled": true },
@@ -32,4 +35,4 @@
       ]
     }
     ```
-6. The **jwt proxy token** will be outdated each few tens of minutes and you have to repeat it each 10-15 minutes
+7. The **jwt proxy token** will be outdated each few tens of minutes and you have to repeat it each 10-15 minutes
