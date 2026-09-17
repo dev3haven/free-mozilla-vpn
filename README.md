@@ -2,10 +2,10 @@
 
 ## Use mozilla vpn proxy manually
 
-1. press ctrl+shift+alt+i to open Firefox browser developer console
+1. press `ctrl+shift+alt+i` to open Firefox browser developer console
 2. copy and paste `firefox_console_get_http_proxy_token_and_config.js` and run
 3. Get jwt token, host, port
-4. Configure [sing-box](https://github.com/sagernet/sing-box) or another local proxy to add `Proxy-Authorization` http header to each http request
+4. Configure [sing-box](https://github.com/sagernet/sing-box) or another local proxy to add `Proxy-Authorization` with the `Bearer` jwt token http header to each http request
     ```json
     {
       "log": { "disabled": true },
