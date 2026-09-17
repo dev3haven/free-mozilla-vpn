@@ -8,7 +8,7 @@
     py get_http_proxy_token_and_config.py --email example@gmail.com --password 123456 --totp 177067
     ```
 3. Result will be printed in console and saved in file near the python script.
-4. 
+4. Use [sing-box](https://github.com/sagernet/sing-box) or another local proxy to add `Proxy-Authorization` with the `Bearer` jwt token http header to each http request
 
 ## Use mozilla vpn proxy manually with browser console JavaScript
 
