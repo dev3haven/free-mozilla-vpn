@@ -32,3 +32,4 @@
       ]
     }
     ```
+6. The **jwt proxy token** will be outdated each few tens of minutes and you have to repeat it each 10-15 minutes
