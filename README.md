@@ -12,11 +12,11 @@ The script will start up local proxies for **all available proxy geo regions** o
 2. Go to your Mozilla Account, go to **Two-step authentication** and save QR code as `qr.png`
 3. Run `mozvpn_no_externals.py` with the command. `--qr qr.png` is **path** to a `png` image file.
     ```sh
-    py mozvpn_no_externals.py --email example@gmail.com --password 123456 --qr qr.png --use-sing-box --no-save
+    py mozvpn_no_externals.py --email example@gmail.com --password 123456 --qr qr.png --local-proxy --no-save
     ```
     OR you can use TOTP from **Google Authenticator**
     ```sh
-    py mozvpn_no_externals.py --email example@gmail.com --password 123456 --totp 177067 --use-sing-box --no-save
+    py mozvpn_no_externals.py --email example@gmail.com --password 123456 --totp 177067 --local-proxy --no-save
     ```
 
 
