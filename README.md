@@ -1,6 +1,6 @@
 # Free Mozilla VPN
 
-## Interactive python script `mozvpn_no_externals.py`
+## Interactive python script `mozvpn_no_externals.py` (RECOMMENDED)
 
 The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.  
 **Be aware** that using `--relogin` parameter can temporary block your account. In the case you need to use a **code from your email** and log in to Mozilla Account **using Firefox Browser**.
