@@ -11,6 +11,10 @@ The script will start up local proxies for **all available proxy geo regions** o
     ```sh
     py mozvpn_no_externals.py --email example@gmail.com --password 123456 --qr qr.png --use-sing-box --no-save
     ```
+    OR you can use TOTP from **Google Authenticator**
+    ```sh
+    py mozvpn_no_externals.py --email example@gmail.com --password 123456 --totp 177067 --use-sing-box --no-save
+    ```
 
 
 ## Interactive python script `mozvpn.py`
