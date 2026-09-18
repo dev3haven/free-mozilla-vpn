@@ -23,16 +23,17 @@ Before you start, make sure you have:
 
 The simplest way to run:
 
-1. Download the repository as a **ZIP** file and unpack it.
-2. Install the Python dependencies:
+1. Install [Python](https://www.python.org/).
+2. Download the repository as a **ZIP** file and unpack it.
+3. Install the Python dependencies:
    ```sh
    pip install pyotp zxing-cpp Pillow proxy.py
    ```
-3. Launch:
+4. Launch:
    - **Windows:** double-click `start.bat`
    - **Linux:** double-click `start.sh`
-4. Enter your Mozilla Account credentials: login, password, TOTP/QR.png.
-5. Your credentials will be saved locally — next time just run `start.bat` or `start.sh` again.
+5. Enter your Mozilla Account credentials: login, password, TOTP/QR.png.
+6. Your credentials will be saved locally — next time just run `start.bat` or `start.sh` again.
 
 ---
 
