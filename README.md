@@ -1,5 +1,18 @@
 # free_mozilla_vpn
 
+## Interactive python script `mozvpn.py`
+
+The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.
+
+1. Install [sing-box](https://github.com/sagernet/sing-box)
+2. Install python dependencies that the script ask you to install
+3. Open Firefox and Log in to your Firefox account in **Firefox Browser**. Start Mozilla VPN at least once **inside Firefox** using in-built function.
+4. Run `mozvpn.py` with the command. Use **Google Authenticator** or another tool to get **2FA (TOTP)** code.
+    ```sh
+    py mozvpn.py --email example@gmail.com --password 123456 --totp 177067 --use-sing-box --no-save
+    ```
+5. The script will cache your Mozilla **session token** locally and will reuse the token. The script will update the **Mozilla VPN proxy pass token** automaticly.
+
 ## Use mozilla vpn proxy manually with python script
 
 1. Open Firefox and Log in to your Firefox account in **Firefox Browser**. Start Mozilla VPN at least once **inside Firefox** using in-built function.
