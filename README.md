@@ -21,7 +21,7 @@ Before you start, make sure you have:
 
 ## 🚀 Quick Start (`start.bat` / `start.sh`)
 
-The simplest way to run:
+The simplest way to run. Choose `mozvpn.py` over `mozvpn_no_externals.py` if you have some troubles with `proxy.py` or other dependencies:
 
 1. Install [Python](https://www.python.org/).
 2. Download the repository as a **ZIP** file and unpack it.
