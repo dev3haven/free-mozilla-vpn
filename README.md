@@ -1,11 +1,22 @@
 # free_mozilla_vpn
 
+## Interactive python script `mozvpn_no_externals.py`
+
+The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.
+
+1. Install python dependencies that the script ask you to install: `pip install pyotp zxing-cpp Pillow proxy.py`
+2. Run `mozvpn_no_externals.py` with the command. `qr.png` is **path** to a `png` image file from **Two-step authentication** of your Mozilla Account, see your Mozilla Account configuration.
+    ```sh
+    py mozvpn_no_externals.py --email example@gmail.com --password 123456 --qr qr.png --use-sing-box --no-save
+    ```
+
+
 ## Interactive python script `mozvpn.py`
 
 The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.
 
 1. Install [sing-box](https://github.com/sagernet/sing-box)
-2. Install python dependencies that the script ask you to install
+2. Install python dependencies that the script ask you to install: `pip install pyotp zxing-cpp`
 3. Open Firefox and Log in to your Firefox account in **Firefox Browser**. Start Mozilla VPN at least once **inside Firefox** using in-built function.
 4. Run `mozvpn.py` with the command. Use **Google Authenticator** or another tool to get **2FA (TOTP)** code.
     ```sh
