@@ -25,15 +25,17 @@ The simplest way to run:
 
 1. Install [Python](https://www.python.org/).
 2. Download the repository as a **ZIP** file and unpack it.
-3. Install the Python dependencies:
+3. Install the Python dependencies for `start.bat` / `start.sh`
    ```sh
    pip install pyotp zxing-cpp Pillow proxy.py
    ```
+   OR install [sing-box](https://github.com/sagernet/sing-box) for `start_mozvpn.bat` / `start_mozvpn.sh`
 4. Launch:
-   - **Windows:** double-click `start.bat`
-   - **Linux:** double-click `start.sh`
+   - **Windows:** double-click `start.bat` or `start_mozvpn.bat`
+   - **Linux:** double-click `start.sh` or `start_mozvpn.sh`
 5. Enter your Mozilla Account credentials: login, password, TOTP/QR.png.
-6. Your credentials will be saved locally — next time just run `start.bat` or `start.sh` again.
+   - **Note!** `mozvpn.py` does not support QR mode.
+7. Your credentials will be saved locally — next time just run `start.bat` or `start.sh` again.
 
 ---
 
