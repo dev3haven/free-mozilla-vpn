@@ -8,10 +8,10 @@ If you do not have an active **VPN button** in your Firefox then go to `about:co
 If you **still** do not have the **VPN button** then go to **Settings -> Permissions and data** and activate **Allow Firefox to improve features, performance, and stability between updates** option.
 
 ## Simplest way to use Free Mozilla VPN (`start.bat`/`start.sh`)
-1. Download the repository as zip and unpack
-2. Double click on `start.bat` (Windows) or `start.sh` (Linux)
+1. Download the repository as a zip file and unpack.
+2. Double click on `start.bat` (Windows) or `start.sh` (Linux).
 3. Enter your **Mozilla Account** credentials: login. password, TOTP/QR.png.
-4. You credentials will be saved locally and you no need to reenter them next time, just launch `start.bat` or s`tart.sh` again.
+4. Your credentials will be saved locally and you no need to reenter them next time, just launch `start.bat` or s`tart.sh` again.
 
 ## Interactive python script `mozvpn_no_externals.py` (RECOMMENDED)
 
