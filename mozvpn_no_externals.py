@@ -4,6 +4,31 @@
 mozvpn.py — реквизиты прокси Mozilla VPN / Firefox IP Protection + авто-TOTP
 + автообновление proxyPass + локальные прокси на чистом Python (движок proxy.py).
 
+НОВОЕ В ЭТОЙ ВЕРСИИ (2026-09-18, правка №2 — удобство и диагностика блокировок):
+  7) Флаг локальных прокси переименован в --local-proxy. Алиасы --use-proxy и
+     устаревший --use-sing-box сохранены для совместимости; добавлена
+     переменная окружения MOZVPN_LOCAL_PROXY=1.
+  8) Подтверждение TOTP-секрета из QR (--qr) ВЫКЛЮЧЕНО по умолчанию: скрипт
+     больше не задаёт вопрос «правильный ли код?» — секрет сохраняется молча,
+     сгенерированный код печатается в консоль для сверки. Интерактивное
+     подтверждение включается флагом --qr-verify (или MOZVPN_QR_VERIFY=1),
+     явное отключение — --no-qr-verify.
+  9) Временная блокировка входа диагностируется ЯВНО: при HTTP 429 /
+     errno 114 («Client has sent too many requests») и errno 125 («The
+     request was blocked for security reasons») скрипт печатает, что вход
+     временно заблокирован из-за слишком многих неудачных попыток, и что
+     вход восстанавливается ПОДТВЕРЖДЕНИЕМ ПО EMAIL (письмо «New sign-in to
+     Firefox» / «Confirm your sign-in» / код подтверждения из письма), с
+     ожиданием retryAfter. Факты сверены с официальной документацией FxA
+     (mozilla.github.io/ecosystem-platform/api, проверено 2026-09-18):
+       - errno 114 -> HTTP 429, retryAfter в ТЕЛЕ ответа — в МИЛЛИСЕКУНДАХ
+         (заголовок Retry-After — в секундах);
+       - errno 125 -> HTTP 400, в теле могут быть verificationMethod /
+         verificationReason (какое подтверждение требует сервер);
+       - существует POST /v1/account/login/send_unblock_code
+         («Send an unblock code via email to reset rate-limiting for an
+         account») — восстановление входа через код из письма.
+
 НОВОЕ В ЭТОЙ ВЕРСИИ (2026-09-18, исправление «неверный код 2FA»):
   6) ИСПРАВЛЕНО: сгенерированный TOTP-код не совпадал с кодом в приложении-
      аутентификаторе, сервер отвечал «неверный код». Аутентификация сессии
@@ -89,9 +114,9 @@ mozvpn.py — реквизиты прокси Mozilla VPN / Firefox IP Protectio
 БЫСТРЫЙ СТАРТ (Windows 11 / Linux / macOS):
   pip install pyotp zxing-cpp Pillow proxy.py
   # первый запуск: логин, пароль, QR-картинка
-  python mozvpn.py --email a@b.c --password '***' --qr qr.png --use-sing-box
+  python mozvpn.py --email a@b.c --password '***' --qr qr.png --local-proxy
   # далее можно вообще без аргументов — всё закэшировано:
-  python mozvpn.py --use-sing-box
+  python mozvpn.py --local-proxy
 
 Поток получения реквизитов:
   1. POST /v1/account/credentials/status -> версия стретчинга (v1/v2) + clientSalt
@@ -281,8 +306,8 @@ WAF / Bot Management (актуально на 2026-09):
   python3 mozvpn.py --email a@b.c --password '***' --qr qr.png   # 1-й запуск
   python3 mozvpn.py --qr qr.png                      # добавить/обновить TOTP-секрет из QR
   python3 mozvpn.py --watch                          # цикл автообновления токена
-  python3 mozvpn.py --use-sing-box                   # + локальные прокси (движок proxy.py)
-  python3 mozvpn.py --use-proxy                      # то же самое (алиас)
+  python3 mozvpn.py --local-proxy                    # + локальные прокси (движок proxy.py)
+  python3 mozvpn.py --qr qr.png --qr-verify          # + подтверждение TOTP из QR вопросом
   python3 mozvpn.py --session-token <hex>            # фолбэк
   python3 mozvpn.py --session-token <hex> --totp 123456
   python3 mozvpn.py --country US --city "New York" --test
@@ -292,7 +317,8 @@ WAF / Bot Management (актуально на 2026-09):
   python3 mozvpn.py --json out.json / --no-save
 
 Переменные окружения: MOZVPN_EMAIL, MOZVPN_PASSWORD, MOZVPN_SESSION_TOKEN,
-  MOZVPN_TOTP, MOZVPN_TOTP_SECRET
+  MOZVPN_TOTP, MOZVPN_TOTP_SECRET, MOZVPN_LOCAL_PROXY (1/true/yes/on),
+  MOZVPN_QR_VERIFY (1/true/yes/on)
 Результат по умолчанию сохраняется рядом со скриптом: mozvpn-YYYYMMDD-HHMMSS.json
 Кэши (все с mode 600):
   ~/.config/mozvpn/session.json        — sessionToken
@@ -365,6 +391,43 @@ LOCAL_PORT_RANGE = 20000      # порты 20000..39999
 
 class MozVpnError(RuntimeError):
     """Ошибка бизнес-логики (логин/OAuth/Guardian), не фатальная для цикла."""
+
+
+def _retry_after_seconds(d) -> int | None:
+    """retryAfter из тела ответа в СЕКУНДАХ. Для errno 114/HTTP 429 официальная
+    документация FxA фиксирует retryAfter в теле в МИЛЛИСЕКУНДАХ
+    (заголовок Retry-After — в секундах), поэтому делим на 1000."""
+    ra = (d or {}).get("retryAfter")
+    if isinstance(ra, (int, float)) and ra > 0:
+        return max(1, int(round(ra / 1000)))
+    return None
+
+
+def blocked_login_message(retry_s=None, source="входа") -> str:
+    """Единый текст о ВРЕМЕННОЙ блокировке входа (HTTP 429/errno 114, errno 125).
+    Аккаунт не удалён и не заблокирован навсегда: вход восстанавливается
+    подтверждением по email (письмо «New sign-in to Firefox» / код
+    подтверждения)."""
+    wait = (f" Сервер просит повторить не раньше чем через ~{retry_s} с."
+            if retry_s else "")
+    return (
+        f"❌ ВХОД ВРЕМЕННО ЗАБЛОКИРОВАН ({source}): слишком много неудачных "
+        f"попыток подряд (неверный пароль и/или коды 2FA) — сервер временно "
+        f"отклоняет вход.{wait}\n"
+        "   Это НЕ удаление и НЕ вечная блокировка аккаунта. Вход "
+        "восстанавливается через ПОДТВЕРЖДЕНИЕ ПО EMAIL:\n"
+        "   1) Проверьте почту аккаунта (и папку «Спам»): Mozilla отправила\n"
+        "      письмо о входе («New sign-in to Firefox» / «Confirm your\n"
+        "      sign-in» / письмо с кодом подтверждения входа).\n"
+        "   2) Откройте письмо и подтвердите вход: кнопка «Confirm sign-in»\n"
+        "      либо код из письма на accounts.firefox.com.\n"
+        "   3) После подтверждения повторите запуск скрипта (в режиме\n"
+        "      --watch он повторит сам).\n"
+        "   Если письма нет — откройте в браузере accounts.firefox.com и\n"
+        "   войдите с этим аккаунтом: интерфейс предложит подтвердить вход,\n"
+        "   и письмо с кодом будет отправлено повторно."
+    )
+
 
 WAF_MESSAGE = """❌ HTTP 406 от *.firefox.com даже после автоматического решения challenge.
 
@@ -985,7 +1048,17 @@ def fxa_login(email: str, password: str, totp_provider=None,
         if errno == 103: raise MozVpnError("❌ Неверный пароль (errno 103). "
                                   "Если входили через Google/Apple — сначала задайте пароль: "
                                   "accounts.firefox.com → Settings.")
-        if errno == 114: raise MozVpnError("❌ Аккаунт заблокирован (повторите позже).")
+        # errno 114 -> HTTP 429 «Client has sent too many requests»
+        # errno 125 -> HTTP 400 «The request was blocked for security reasons».
+        # Оба случая — ВРЕМЕННАЯ блокировка входа (customs/rate-limit);
+        # восстановление — подтверждение входа по email (см. blocked_login_message).
+        if status == 429 or errno == 114:
+            raise MozVpnError(blocked_login_message(_retry_after_seconds(d), "логин"))
+        if errno == 125:
+            vm = d.get("verificationMethod") or ""
+            extra = (f" Сервер требует подтверждение методом '{vm}'."
+                     if vm else "")
+            raise MozVpnError(blocked_login_message(None, "логин") + "\n" + extra)
         if errno in (142, 144): raise MozVpnError("❌ Вход с этим email запрещён / пароль не задан "
                                          "(аккаунт создан через Google/Apple). Задайте пароль: "
                                          "accounts.firefox.com → Settings.")
@@ -1059,6 +1132,11 @@ def fxa_login(email: str, password: str, totp_provider=None,
                     print("ℹ️  У аккаунта на сервере TOTP не включён "
                           "(TOTP_TOKEN_NOT_FOUND) — TOTP-верификация невозможна.")
                     break
+                if s2 == 429 or d2.get("errno") in (114, 125):
+                    # Слишком много неверных кодов подряд — временная блокировка.
+                    raise MozVpnError(
+                        blocked_login_message(_retry_after_seconds(d2),
+                                              "проверки кодов 2FA"))
                 if s2 == 200:
                     # Сервер отклонил значение кода. Не шлём тот же код в том
                     # же окне — дожидаемся следующего и генерируем свежий
@@ -1861,7 +1939,7 @@ def run_manager(args, creds, totp_provider):
     exp, перелогин при протухшем sessionToken), опционально держит локальные
     прокси proxy.py."""
     sb = None
-    if args.use_sing_box:
+    if args.local_proxy:
         sb = PyProxyManager(args)
     locations, recommended = None, None
     json_out = args.json or None
@@ -1941,7 +2019,12 @@ def run_manager(args, creds, totp_provider):
         except MozVpnError as e:
             msg = str(e)
             print(msg)
-            if "перелогин" in msg or "недействителен" in msg or "истёк" in msg \
+            if "ВРЕМЕННО ЗАБЛОКИРОВАН" in msg:
+                print("⏳ Вход временно заблокирован — жду 10 минут перед "
+                      "следующей попыткой (см. инструкцию выше: подтвердите "
+                      "вход по email).")
+                time.sleep(600)
+            elif "перелогин" in msg or "недействителен" in msg or "истёк" in msg \
                or "reauth" in msg:
                 print("🔁 Требуется перелогин — пробую по сохранённым реквизитам ...")
                 force_relogin = True
@@ -1977,9 +2060,20 @@ def main():
                          "секрет сохранится и коды будут генерироваться сами")
     ap.add_argument("--watch", action="store_true",
                     help="непрерывно обновлять proxyPass за --refresh-margin сек до истечения")
-    ap.add_argument("--use-sing-box", "--use-proxy", dest="use_sing_box", action="store_true",
+    ap.add_argument("--local-proxy", "--use-proxy", "--use-sing-box", dest="local_proxy",
+                    action="store_true",
+                    default=os.environ.get("MOZVPN_LOCAL_PROXY", "").strip().lower()
+                            in ("1", "true", "yes", "on"),
                     help="поднимать локальные HTTP-прокси (движок proxy.py, чистый Python, "
-                         "без внешних утилит; флаг --use-sing-box сохранён для совместимости)")
+                         "без внешних утилит). --use-proxy и устаревший --use-sing-box "
+                         "сохранены как алиасы; включается и через MOZVPN_LOCAL_PROXY=1")
+    ap.add_argument("--qr-verify", action=argparse.BooleanOptionalAction,
+                    default=os.environ.get("MOZVPN_QR_VERIFY", "").strip().lower()
+                            in ("1", "true", "yes", "on"),
+                    help="после чтения --qr показать сгенерированный TOTP-код и спросить, "
+                         "совпадает ли он с приложением-аутентификатором. По умолчанию "
+                         "ВЫКЛЮЧЕНО: секрет сохраняется молча, код печатается для сверки. "
+                         "Отключить явно: --no-qr-verify")
     ap.add_argument("--max-proxies", type=int, default=0,
                     help="макс. число локальных прокси (0 = все города)")
     ap.add_argument("--no-input", action="store_true",
@@ -1999,7 +2093,7 @@ def main():
     ap.add_argument("--relogin", action="store_true", help="игнорировать кэш сессии")
     a = ap.parse_args()
 
-    # --- QR -> TOTP-секрет (первый запуск) + подтверждение сверкой с приложением ---
+    # --- QR -> TOTP-секрет (первый запуск) + опциональное подтверждение сверкой ---
     if a.qr:
         try:
             info = decode_qr_totp(a.qr)
@@ -2007,8 +2101,9 @@ def main():
             sys.exit(str(e))
         secret = info.pop("secret")
         # Защита от «молча неверного секрета» (устаревший QR, другой аккаунт,
-        # пересозданный 2FA): показываем код и просим сверить с приложением.
-        if not a.no_input and sys.stdin.isatty():
+        # пересозданный 2FA). По умолчанию ВЫКЛЮЧЕНО (вопрос не задаётся,
+        # всё работает молча) — включить интерактивную сверку: --qr-verify.
+        if a.qr_verify and not a.no_input and sys.stdin.isatty():
             try:
                 code, valid = totp_generate(secret, info["digits"],
                                             info["period"], info["algorithm"])
@@ -2036,6 +2131,15 @@ def main():
                         secret = validate_totp_secret(manual)
                     except MozVpnError as e:
                         sys.exit(str(e))
+        if not (a.qr_verify and not a.no_input and sys.stdin.isatty()):
+            # Верификация выключена: просто показываем код для сверки, без вопроса.
+            try:
+                code0, valid0 = totp_generate(secret, info["digits"],
+                                              info["period"], info["algorithm"])
+                print(f"🔢 Код из распознанного QR (для сверки, вопрос не задаётся, "
+                      f"--qr-verify чтобы включить): {code0}, действует ещё {valid0} с")
+            except MozVpnError as e:
+                print(e)
         save_credentials(email=a.email, totp_secret=secret,
                          totp_digits=info["digits"], totp_period=info["period"],
                          totp_algorithm=info["algorithm"])
@@ -2058,7 +2162,7 @@ def main():
 
     totp_provider = make_totp_provider(a, creds)
 
-    if a.use_sing_box or a.watch:
+    if a.local_proxy or a.watch:
         run_manager(a, creds, totp_provider)
         return
 
