@@ -2,10 +2,12 @@
 
 ## Interactive python script `mozvpn_no_externals.py`
 
-The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.
+The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.  
+**Be aware** that using `--relogin` parameter can temporary block your account. In the case you need to use a **code from your email** and log in to Mozilla Account **using Firefox Browser**.
 
 1. Install python dependencies that the script ask you to install: `pip install pyotp zxing-cpp Pillow proxy.py`
-2. Run `mozvpn_no_externals.py` with the command. `qr.png` is **path** to a `png` image file from **Two-step authentication** of your Mozilla Account, see your Mozilla Account configuration.
+2. Go to your Mozilla Account, go to **Two-step authentication** and save QR code as `qr.png`
+3. Run `mozvpn_no_externals.py` with the command. `--qr qr.png` is **path** to a `png` image file.
     ```sh
     py mozvpn_no_externals.py --email example@gmail.com --password 123456 --qr qr.png --use-sing-box --no-save
     ```
