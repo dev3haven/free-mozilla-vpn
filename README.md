@@ -9,9 +9,10 @@ If you **still** do not have the **VPN button** then go to **Settings -> Permiss
 
 ## Simplest way to use Free Mozilla VPN (`start.bat`/`start.sh`)
 1. Download the repository as a zip file and unpack.
-2. Double click on `start.bat` (Windows) or `start.sh` (Linux).
-3. Enter your **Mozilla Account** credentials: login. password, TOTP/QR.png.
-4. Your credentials will be saved locally and you no need to reenter them next time, just launch `start.bat` or s`tart.sh` again.
+2. Install python dependencies that the script ask you to install: `pip install pyotp zxing-cpp Pillow proxy.py`
+3. Double click on `start.bat` (Windows) or `start.sh` (Linux).
+4. Enter your **Mozilla Account** credentials: login. password, TOTP/QR.png.
+5. Your credentials will be saved locally and you no need to reenter them next time, just launch `start.bat` or s`tart.sh` again.
 
 ## Interactive python script `mozvpn_no_externals.py` (RECOMMENDED)
 
