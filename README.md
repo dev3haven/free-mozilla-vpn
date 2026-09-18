@@ -1,4 +1,4 @@
-# free_mozilla_vpn
+# Free Mozilla VPN
 
 ## Interactive python script `mozvpn_no_externals.py`
 
