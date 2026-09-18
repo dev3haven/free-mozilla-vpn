@@ -4,6 +4,8 @@ The script connect to Mozilla VPN and run local **http** proxies for each availa
 To connect to the Mozilla VPN you need to have: email/login, password, TOTP/QR.png from your Mozilla Acount.  
 You need to **launch Mozilla VPN from within Firefox Browser** at least **once** to let all of that to work.
 
+If you do not have an active **VPN button** in your Firefox then go to `about:config` page and set `browser.ipProtection.enabled` to `true`.
+
 ## Interactive python script `mozvpn_no_externals.py` (RECOMMENDED)
 
 The script will start up local proxies for **all available proxy geo regions** on their own ports. You can find all info in the script console output.  
