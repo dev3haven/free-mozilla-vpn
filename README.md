@@ -111,6 +111,12 @@ The script will cache your Mozilla **session token** and automatically update th
 4. Get the **JWT token**, host, port, and other parameters.
 5. Use sing-box (or another proxy) with the `Proxy-Authorization: Bearer <jwt>` header.
 
+### Test the proxy pass token
+
+```
+curl -s --proxy https://p.m1.fastly-masque.net:2499 --proxy-header "Proxy-Authorization: Bearer eyJhbGci...8Zo8g" --proxy-insecure https://hackmyip.com
+```
+
 ---
 
 ## 🌐 Using with sing-box
@@ -139,7 +145,7 @@ The script will cache your Mozilla **session token** and automatically update th
          "server": "p.m1.fastly-masque.net",
          "server_port": 2499,
          "headers": {
-           "Proxy-Authorization": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpX...Gi7QsSPZsCqqLaXnNLl4A"
+           "Proxy-Authorization": "Bearer eyJhbGci...8Zo8g"
          },
          "tls": { "enabled": true }
        }
