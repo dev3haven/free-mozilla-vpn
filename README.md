@@ -36,6 +36,11 @@ The simplest way to run. Choose `mozvpn.py` over `mozvpn_no_externals.py` if you
 5. Enter your Mozilla Account credentials: login, password, TOTP/QR.png.
    - **Note!** `mozvpn.py` does not support QR mode.
 7. Your credentials will be saved locally — next time just run `start.bat` or `start.sh` again.
+8. Test one of the local HTTP proxies
+   ```sh
+   # 25510 is a port from '127.0.0.1:25510  United States/United States  -> us.m1.fastly-masque.net:2499' output
+   curl -s --proxy http://127.0.0.1:25510 --proxy-insecure https://hackmyip.com
+   ```
 
 ---
 
