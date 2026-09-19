@@ -25,11 +25,11 @@ The simplest way to run. Choose `mozvpn.py` over `mozvpn_no_externals.py` if you
 
 1. Install [Python](https://www.python.org/).
 2. Download the repository as a **ZIP** file and unpack it.
-3. Install the Python dependencies for `start.bat` / `start.sh`
+3. Install the Python dependencies for `start.bat` / `start.sh` only!
    ```sh
    pip install pyotp zxing-cpp Pillow proxy.py
    ```
-   OR install [sing-box](https://github.com/sagernet/sing-box) for `start_mozvpn.bat` / `start_mozvpn.sh`
+   **OR** install [sing-box](https://github.com/sagernet/sing-box) for `start_mozvpn.bat` / `start_mozvpn.sh`
 4. Launch:
    - **Windows:** double-click `start.bat` or `start_mozvpn.bat`
    - **Linux:** double-click `start.sh` or `start_mozvpn.sh`
