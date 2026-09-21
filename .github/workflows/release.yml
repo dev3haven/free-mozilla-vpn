@@ -1,0 +1,123 @@
+name: Build Release (Nuitka)
+
+on:
+  push:
+    tags:
+      - 'release/*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: mozvpn-windows.exe
+            nuitka_extra: --windows-console-mode=force
+          - os: ubuntu-latest
+            artifact_name: mozvpn-linux
+            nuitka_extra: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache patchelf build-essential
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "Nuitka[app]" ordered-set zstandard
+          python -m pip install pyotp zxing-cpp Pillow proxy.py
+
+      - name: Build with Nuitka
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Имя исходника (лежит в корне репозитория)
+          SCRIPT="mozvpn_no_externals.py"
+
+          # Общие флаги, которые вы указали
+          COMMON=(
+            --onefile
+            --output-dir=dist
+            --remove-output
+            --assume-yes-for-downloads
+            --show-progress
+            --include-package=pyotp
+            --include-package=zxingcpp
+            --include-package=PIL
+            --include-package=proxy
+            --nofollow-import-to=tkinter
+            --nofollow-import-to=unittest
+            --nofollow-import-to=test
+          )
+
+          # Платформо-зависимые флаги
+          EXTRA="${{ matrix.nuitka_extra }}"
+
+          python -m nuitka \
+            "${COMMON[@]}" \
+            ${EXTRA} \
+            --output-filename="${{ matrix.artifact_name }}" \
+            "$SCRIPT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          # Windows
+          cp artifacts/mozvpn-windows.exe/mozvpn-windows.exe release/ || true
+          # Linux
+          cp artifacts/mozvpn-linux/mozvpn-linux release/ || true
+          ls -la release/
+
+      - name: Create Release & upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release/mozvpn-windows.exe
+            release/mozvpn-linux
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
