@@ -1,3 +1,31 @@
+# ============================================================================
+# Build Release (Nuitka) — multi-architecture CI/CD
+#
+# Архитектуры (все собираются НАТИВНО, без QEMU-эмуляции — Nuitka не умеет
+# кросс-компиляцию, поэтому каждая цель собирается на совместимом окружении):
+#   - Windows x64          -> windows-latest                          (native)
+#   - Windows x86 (32-bit) -> windows-latest + setup-python x86       (native, WoW64)
+#   - Linux   x64          -> ubuntu-latest                           (native)
+#   - Linux   arm64        -> ubuntu-24.04-arm (бесплатный ARM-раннер) (native)
+#   - Linux   armv7        -> ubuntu-24.04-arm + docker linux/arm/v7   (native AArch32
+#                            на ARMv8-процессоре: 64-битные ARM-ядра исполняют
+#                            32-битный ARMv7-код напрямую — старые Raspberry Pi,
+#                            Android-устройства с armhf и т.п.)
+#   - Linux   i386         -> ubuntu-latest + docker linux/386        (native на
+#                            x86-64 CPU: старые 32-битные Linux-системы)
+#   - Android x86_64       -> ubuntu-latest + termux/termux-docker:x86_64
+#                            (Termux-окружение с bionic; Nuitka официально
+#                            поддерживает Android через Termux)
+#   - Android aarch64      -> ubuntu-24.04-arm + termux/termux-docker:aarch64
+#
+# ВАЖНО про зависимости: для «экзотических» целей (x86 win32, armv7, i386,
+# Android) готовых wheel-пакетов zxing-cpp / Pillow может не быть. Установка
+# сделана «best-effort»: pyotp (чистый Python) обязателен, остальные ставятся
+# по возможности, а флаги --include-package добавляются ТОЛЬКО для реально
+# импортируемых модулей — сборка не падает, бинарник просто собирается без
+# необязательных QR/TOTP-модулей (как у варианта mozvpn_no_externals.py).
+# ============================================================================
+
 name: Build Release (Nuitka)
 
 on:
@@ -9,53 +37,102 @@ permissions:
   contents: write
 
 jobs:
+  # ==========================================================================
+  # 1. Нативные сборки: Windows x64/x86 + Linux x64/arm64
+  # ==========================================================================
   build:
-    name: Build ${{ matrix.script }} (${{ matrix.os }})
+    name: Build ${{ matrix.script }} (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, ubuntu-24.04-arm]
         script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
         exclude:
           # Без externals-скрипт не тянет zxing-cpp/Pillow — при желании уберите исключение
           - os: ubuntu-latest
             script: mozvpn_no_externals.py
         include:
-          # Правила именования артефактов
+          # -------- Windows x64 --------
           - os: windows-latest
+            label: windows-x64
+            py_arch: x64
+            nuitka_extra: "--windows-console-mode=force"
+          # -------- Windows x86 (32-битные системы) --------
+          - os: windows-latest
+            label: windows-x86
+            py_arch: x86
+            nuitka_extra: "--windows-console-mode=force"
+          # -------- Linux x64 --------
+          - os: ubuntu-latest
+            label: linux-x64
+            py_arch: x64
+            nuitka_extra: ""
+          # -------- Linux arm64 (ARM-раннер GitHub, нативно) --------
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            py_arch: arm64
+            nuitka_extra: ""
+
+          # -------- Правила именования артефактов --------
+          - os: windows-latest
+            label: windows-x64
             script: mozvpn.py
             artifact_name: mozvpn-windows.exe
           - os: windows-latest
+            label: windows-x64
             script: mozvpn_beta.py
             artifact_name: mozvpn-beta-windows.exe
           - os: windows-latest
+            label: windows-x64
             script: mozvpn_no_externals.py
             artifact_name: mozvpn-no-externals-windows.exe
+          - os: windows-latest
+            label: windows-x86
+            script: mozvpn.py
+            artifact_name: mozvpn-windows-x86.exe
+          - os: windows-latest
+            label: windows-x86
+            script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-windows-x86.exe
+          - os: windows-latest
+            label: windows-x86
+            script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-windows-x86.exe
           - os: ubuntu-latest
+            label: linux-x64
             script: mozvpn.py
             artifact_name: mozvpn-linux
           - os: ubuntu-latest
+            label: linux-x64
             script: mozvpn_beta.py
             artifact_name: mozvpn-beta-linux
           - os: ubuntu-latest
+            label: linux-x64
             script: mozvpn_no_externals.py
             artifact_name: mozvpn-no-externals-linux
-          # Платформо-зависимые флаги
-          - os: windows-latest
-            nuitka_extra: "--windows-console-mode=force"
-          - os: ubuntu-latest
-            nuitka_extra: ""
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            script: mozvpn.py
+            artifact_name: mozvpn-linux-arm64
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux-arm64
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux-arm64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: Set up Python (${{ matrix.py_arch }})
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          architecture: x64
+          architecture: ${{ matrix.py_arch }}
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -64,10 +141,17 @@ jobs:
           sudo apt-get install -y ccache patchelf build-essential
 
       - name: Install Python dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "Nuitka[app]" ordered-set zstandard
-          python -m pip install pyotp zxing-cpp Pillow proxy.py
+          # pyotp — чистый Python, обязателен везде.
+          python -m pip install pyotp
+          # zxing-cpp / Pillow / proxy.py — best-effort: для x86/arm целей
+          # wheel-ов может не быть; сборка продолжится без них.
+          python -m pip install zxing-cpp Pillow proxy.py \
+            || echo "::warning::optional deps (zxing-cpp/Pillow/proxy.py) failed on this arch — building without them"
 
       - name: Build with Nuitka
         shell: bash
@@ -82,19 +166,33 @@ jobs:
             --remove-output
             --assume-yes-for-downloads
             --show-progress
-            --include-package=pyotp
-            --include-package=zxingcpp
-            --include-package=PIL
-            --include-package=proxy
             --nofollow-import-to=tkinter
             --nofollow-import-to=unittest
             --nofollow-import-to=test
           )
 
+          # --include-package добавляем ТОЛЬКО для реально импортируемых
+          # модулей (на целях без wheel-ов их просто нет в окружении).
+          INCLUDES=( --include-package=pyotp )
+          if python -c "import zxingcpp" 2>/dev/null; then
+            INCLUDES+=( --include-package=zxingcpp )
+          else
+            echo "::notice::zxingcpp not importable — building without QR support"
+          fi
+          if python -c "import PIL" 2>/dev/null; then
+            INCLUDES+=( --include-package=PIL )
+          else
+            echo "::notice::PIL not importable — building without image support"
+          fi
+          if python -c "import proxy" 2>/dev/null; then
+            INCLUDES+=( --include-package=proxy )
+          fi
+
           EXTRA="${{ matrix.nuitka_extra }}"
 
           python -m nuitka \
             "${COMMON[@]}" \
+            "${INCLUDES[@]}" \
             ${EXTRA} \
             --output-filename="${{ matrix.artifact_name }}" \
             "$SCRIPT"
@@ -107,9 +205,271 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ==========================================================================
+  # 2. Linux i386 (32-битный x86 Linux) — docker linux/386 на x64-раннере.
+  #    i386-код исполняется x86-64 CPU нативно (эмуляция не нужна).
+  # ==========================================================================
+  build-linux-i386:
+    name: Build ${{ matrix.script }} (linux-i386)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        include:
+          - script: mozvpn.py
+            artifact_name: mozvpn-linux-i386
+          - script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux-i386
+          - script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux-i386
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare container build script
+        run: |
+          cat > ci-build-in-docker.sh <<'EOS'
+          set -euo pipefail
+          SCRIPT="$1"
+          ARTIFACT="$2"
+          apt-get update
+          apt-get install -y ccache patchelf build-essential
+          python -m pip install --upgrade pip
+          python -m pip install "Nuitka[app]" ordered-set zstandard
+          python -m pip install pyotp
+          python -m pip install zxing-cpp Pillow proxy.py \
+            || echo "optional deps failed on i386 — building without them"
+          INCLUDES=( --include-package=pyotp )
+          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+          python -m nuitka \
+            --onefile \
+            --output-dir=dist \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --show-progress \
+            --nofollow-import-to=tkinter \
+            --nofollow-import-to=unittest \
+            --nofollow-import-to=test \
+            "${INCLUDES[@]}" \
+            --output-filename="$ARTIFACT" \
+            "$SCRIPT"
+          EOS
+          chmod +x ci-build-in-docker.sh
+
+      - name: Build in linux/386 container
+        run: |
+          docker run --rm \
+            --platform linux/386 \
+            -v "$PWD":/src -w /src \
+            python:3.12-bookworm \
+            bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
+  # 3. Linux armv7 (32-битный ARM: старые Raspberry Pi, armhf-дистрибутивы,
+  #    старые Android с arm-Termux). Запускается на БЕСПЛАТНОМ arm64-раннере
+  #    GitHub (ubuntu-24.04-arm): процессоры ARMv8 исполняют 32-битный
+  #    ARMv7-код нативно — QEMU не нужен, сборка быстрая.
+  # ==========================================================================
+  build-linux-armv7:
+    name: Build ${{ matrix.script }} (linux-armv7)
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        include:
+          - script: mozvpn.py
+            artifact_name: mozvpn-linux-armv7
+          - script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux-armv7
+          - script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux-armv7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare container build script
+        run: |
+          cat > ci-build-in-docker.sh <<'EOS'
+          set -euo pipefail
+          SCRIPT="$1"
+          ARTIFACT="$2"
+          apt-get update
+          apt-get install -y ccache patchelf build-essential
+          python -m pip install --upgrade pip
+          python -m pip install "Nuitka[app]" ordered-set zstandard
+          python -m pip install pyotp
+          python -m pip install zxing-cpp Pillow proxy.py \
+            || echo "optional deps failed on armv7 — building without them"
+          INCLUDES=( --include-package=pyotp )
+          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+          python -m nuitka \
+            --onefile \
+            --output-dir=dist \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --show-progress \
+            --nofollow-import-to=tkinter \
+            --nofollow-import-to=unittest \
+            --nofollow-import-to=test \
+            "${INCLUDES[@]}" \
+            --output-filename="$ARTIFACT" \
+            "$SCRIPT"
+          EOS
+          chmod +x ci-build-in-docker.sh
+
+      - name: Build in linux/arm/v7 container
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "$PWD":/src -w /src \
+            python:3.12-bookworm \
+            bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
+  # 4. Android (Termux / bionic) — Nuitka официально поддерживает Android
+  #    через Termux (user manual: "pkg install patchelf ccache binutils ldd
+  #    termux-elf-cleaner"). Собираем в официальном образе
+  #    termux/termux-docker — тот же пакетный набор, что и на реальном
+  #    устройстве, поэтому бинарник работает и в Termux на Android,
+  #    включая Android-x86 (тег x86_64).
+  #    aarch64-тег запускается нативно на ARM-раннере, x86_64 — на x64-раннере
+  #    (эмуляция не нужна).
+  #    Сборка экспериментальная: continue-on-error — фейл джобы Android
+  #    не ломает релиз остальных платформ.
+  # ==========================================================================
+  build-android:
+    name: Build ${{ matrix.script }} (android-${{ matrix.termux_tag }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        termux_tag: [x86_64, aarch64]
+        include:
+          # Какой раннер запускать для какого тега Termux (нативно, без QEMU)
+          - termux_tag: x86_64
+            os: ubuntu-latest
+          - termux_tag: aarch64
+            os: ubuntu-24.04-arm
+          # Правила именования артефактов
+          - script: mozvpn.py
+            termux_tag: x86_64
+            artifact_name: mozvpn-android-x86_64
+          - script: mozvpn.py
+            termux_tag: aarch64
+            artifact_name: mozvpn-android-aarch64
+          - script: mozvpn_beta.py
+            termux_tag: x86_64
+            artifact_name: mozvpn-beta-android-x86_64
+          - script: mozvpn_beta.py
+            termux_tag: aarch64
+            artifact_name: mozvpn-beta-android-aarch64
+          - script: mozvpn_no_externals.py
+            termux_tag: x86_64
+            artifact_name: mozvpn-no-externals-android-x86_64
+          - script: mozvpn_no_externals.py
+            termux_tag: aarch64
+            artifact_name: mozvpn-no-externals-android-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare Termux build script
+        run: |
+          cat > termux-build.sh <<'EOS'
+          set -euo pipefail
+          SCRIPT="$1"
+          ARTIFACT="$2"
+
+          # Termux-окружение: пакеты те же, что рекомендует
+          # документация Nuitka для Android.
+          pkg install -y python patchelf ccache binutils ldd termux-elf-cleaner
+
+          pip install --upgrade pip
+          pip install "Nuitka[app]" ordered-set zstandard
+          pip install pyotp
+          pip install zxing-cpp Pillow proxy.py \
+            || echo "optional deps failed in Termux — building without them"
+
+          INCLUDES=( --include-package=pyotp )
+          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+
+          mkdir -p ~/work
+          cp "/host-src/$SCRIPT" ~/work/
+          cd ~/work
+
+          python -m nuitka \
+            --onefile \
+            --output-dir=dist \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --show-progress \
+            --nofollow-import-to=tkinter \
+            --nofollow-import-to=unittest \
+            --nofollow-import-to=test \
+            "${INCLUDES[@]}" \
+            --output-filename="$ARTIFACT" \
+            "$SCRIPT"
+
+          cp "dist/$ARTIFACT" /host-dist/
+          EOS
+
+          # Каталоги, доступные контейнеру: исходники (чтение) и вывод (запись).
+          mkdir -p dist-host
+          chmod 777 dist-host
+
+      - name: Build in Termux container (${{ matrix.termux_tag }})
+        timeout-minutes: 300
+        run: |
+          docker run --rm \
+            -v "$PWD":/host-src:ro \
+            -v "$PWD/dist-host":/host-dist \
+            termux/termux-docker:${{ matrix.termux_tag }} \
+            bash /host-src/termux-build.sh \
+              "${{ matrix.script }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist-host/${{ matrix.artifact_name }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ==========================================================================
+  # 5. Release: собирает ВСЕ артефакты со ВСЕХ архитектур
+  # ==========================================================================
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-linux-i386, build-linux-armv7, build-android]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -123,14 +483,38 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
-          # Windows
+          # ---- Windows x64 ----
           cp artifacts/mozvpn-windows.exe/mozvpn-windows.exe release/ || true
           cp artifacts/mozvpn-beta-windows.exe/mozvpn-beta-windows.exe release/ || true
           cp artifacts/mozvpn-no-externals-windows.exe/mozvpn-no-externals-windows.exe release/ || true
-          # Linux
+          # ---- Windows x86 (32-bit) ----
+          cp artifacts/mozvpn-windows-x86.exe/mozvpn-windows-x86.exe release/ || true
+          cp artifacts/mozvpn-beta-windows-x86.exe/mozvpn-beta-windows-x86.exe release/ || true
+          cp artifacts/mozvpn-no-externals-windows-x86.exe/mozvpn-no-externals-windows-x86.exe release/ || true
+          # ---- Linux x64 ----
           cp artifacts/mozvpn-linux/mozvpn-linux release/ || true
           cp artifacts/mozvpn-beta-linux/mozvpn-beta-linux release/ || true
           cp artifacts/mozvpn-no-externals-linux/mozvpn-no-externals-linux release/ || true
+          # ---- Linux arm64 ----
+          cp artifacts/mozvpn-linux-arm64/mozvpn-linux-arm64 release/ || true
+          cp artifacts/mozvpn-beta-linux-arm64/mozvpn-beta-linux-arm64 release/ || true
+          cp artifacts/mozvpn-no-externals-linux-arm64/mozvpn-no-externals-linux-arm64 release/ || true
+          # ---- Linux armv7 (старые ARM-устройства) ----
+          cp artifacts/mozvpn-linux-armv7/mozvpn-linux-armv7 release/ || true
+          cp artifacts/mozvpn-beta-linux-armv7/mozvpn-beta-linux-armv7 release/ || true
+          cp artifacts/mozvpn-no-externals-linux-armv7/mozvpn-no-externals-linux-armv7 release/ || true
+          # ---- Linux i386 (старые 32-битные x86) ----
+          cp artifacts/mozvpn-linux-i386/mozvpn-linux-i386 release/ || true
+          cp artifacts/mozvpn-beta-linux-i386/mozvpn-beta-linux-i386 release/ || true
+          cp artifacts/mozvpn-no-externals-linux-i386/mozvpn-no-externals-linux-i386 release/ || true
+          # ---- Android x86_64 (Android-x86 и Termux на x86) ----
+          cp artifacts/mozvpn-android-x86_64/mozvpn-android-x86_64 release/ || true
+          cp artifacts/mozvpn-beta-android-x86_64/mozvpn-beta-android-x86_64 release/ || true
+          cp artifacts/mozvpn-no-externals-android-x86_64/mozvpn-no-externals-android-x86_64 release/ || true
+          # ---- Android aarch64 (ARM-устройства) ----
+          cp artifacts/mozvpn-android-aarch64/mozvpn-android-aarch64 release/ || true
+          cp artifacts/mozvpn-beta-android-aarch64/mozvpn-beta-android-aarch64 release/ || true
+          cp artifacts/mozvpn-no-externals-android-aarch64/mozvpn-no-externals-android-aarch64 release/ || true
           ls -la release/
 
       - name: Create Release & upload assets
@@ -142,11 +526,6 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            release/mozvpn-windows.exe
-            release/mozvpn-beta-windows.exe
-            release/mozvpn-no-externals-windows.exe
-            release/mozvpn-linux
-            release/mozvpn-beta-linux
-            release/mozvpn-no-externals-linux
+            release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
