@@ -495,9 +495,11 @@ jobs:
 
           # Termux-окружение: пакеты те же, что рекомендует
           # документация Nuitka для Android.
+          # ВАЖНО: pip в Termux — это пакет python-pip; его самостоятельное
+          # обновление ЗАПРЕЩЕНО (ошибка "Installing pip is forbidden"),
+          # поэтому НИКАКОГО `pip install --upgrade pip` здесь быть не должно.
           pkg install -y python patchelf ccache binutils ldd termux-elf-cleaner
 
-          pip install --upgrade pip
           pip install "Nuitka[app]" ordered-set zstandard
           pip install pyotp
           pip install zxing-cpp Pillow proxy.py \
