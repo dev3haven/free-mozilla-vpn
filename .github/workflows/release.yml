@@ -42,6 +42,27 @@ on:
 permissions:
   contents: write
 
+# УСКОРЕНИЕ СБОРКИ БЕЗ ПОТЕРИ ОПТИМИЗАЦИИ (проверено по документации Nuitka):
+#   ПРИОРИТЕТ — максимальная оптимизация бинарника, поэтому:
+#   1) --lto=yes     — Link-Time Optimization («whole program optimization»)
+#                      ВКЛЮЧЕНА явно: лучший код в бинарнике (медленнее
+#                      собирается — сознательная цена; документация Nuitka).
+#   2) anti-bloat    — --enable-plugin=anti-bloat + --noinclude-*-mode=nofollow
+#                      отсекает бесполезные импорты (pytest/setuptools и т.п.):
+#                      бинарник меньше, компиляция БЫСТРЕЕ, рантайм не страдает
+#                      (официальная рекомендация Nuitka для ускорения сборки).
+#   3) ccache + actions/cache — кэш объектных файлов МЕЖДУ запусками
+#                      (при повторных тегах/хотфиксах пересобираются только
+#                      изменённые файлы; на оптимизации это не сказывается:
+#                      ccache кэширует результат компиляции, флаги те же).
+#   4) ordered-set + zstandard — рекомендованы самим Nuitka для скорости
+#                      компиляции (предупреждение "very slow fallback").
+#   5) concurrency  — не даёт двум релизным сборкам одного тега работать
+#                      параллельно впустую.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ==========================================================================
   # 1. Нативные сборки: Windows x64/x86 + Linux x64/arm64
@@ -49,6 +70,7 @@ jobs:
   build:
     name: Build ${{ matrix.script }} (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -134,6 +156,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Кэш ccache между запусками (только Linux: там ccache в PATH)
+      - name: Cache ccache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.script }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.script }}-
+
       - name: Set up Python (${{ matrix.py_arch }})
         uses: actions/setup-python@v5
         with:
@@ -171,10 +203,15 @@ jobs:
             --output-dir=dist
             --remove-output
             --assume-yes-for-downloads
-            --show-progress
+            --lto=yes
             --nofollow-import-to=tkinter
             --nofollow-import-to=unittest
             --nofollow-import-to=test
+            # anti-bloat: отсекает ненужные импорты (pytest/setuptools и др.)
+            # — МЕНЬШЕ бинарник И БЫСТРЕЕ компиляция, рантайм-оптимизации не тронуты
+            --enable-plugin=anti-bloat
+            --noinclude-pytest-mode=nofollow
+            --noinclude-setuptools-mode=nofollow
           )
 
           # --include-package добавляем ТОЛЬКО для реально импортируемых
@@ -218,6 +255,7 @@ jobs:
   build-linux-i386:
     name: Build ${{ matrix.script }} (linux-i386)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -233,6 +271,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Кэш ccache между запусками: каталог монтируется в контейнер
+      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
+      - name: Cache ccache (container)
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.artifact_name }}-
 
       - name: Prepare container build script
         run: |
@@ -256,10 +304,13 @@ jobs:
             --output-dir=dist \
             --remove-output \
             --assume-yes-for-downloads \
-            --show-progress \
+            --lto=yes \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
             --nofollow-import-to=test \
+            --enable-plugin=anti-bloat \
+            --noinclude-pytest-mode=nofollow \
+            --noinclude-setuptools-mode=nofollow \
             "${INCLUDES[@]}" \
             --output-filename="$ARTIFACT" \
             "$SCRIPT"
@@ -270,6 +321,7 @@ jobs:
         run: |
           docker run --rm \
             --platform linux/386 \
+            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.12-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
@@ -291,6 +343,7 @@ jobs:
   build-linux-armv7:
     name: Build ${{ matrix.script }} (linux-armv7)
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -306,6 +359,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Кэш ccache между запусками: каталог монтируется в контейнер
+      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
+      - name: Cache ccache (container)
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.artifact_name }}-
 
       - name: Prepare container build script
         run: |
@@ -329,10 +392,13 @@ jobs:
             --output-dir=dist \
             --remove-output \
             --assume-yes-for-downloads \
-            --show-progress \
+            --lto=yes \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
             --nofollow-import-to=test \
+            --enable-plugin=anti-bloat \
+            --noinclude-pytest-mode=nofollow \
+            --noinclude-setuptools-mode=nofollow \
             "${INCLUDES[@]}" \
             --output-filename="$ARTIFACT" \
             "$SCRIPT"
@@ -343,6 +409,7 @@ jobs:
         run: |
           docker run --rm \
             --platform linux/arm/v7 \
+            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.12-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
@@ -367,6 +434,7 @@ jobs:
     name: Build ${{ matrix.script }} (linux-armv5)
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -382,6 +450,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Кэш ccache между запусками: каталог монтируется в контейнер
+      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
+      - name: Cache ccache (container)
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.artifact_name }}-
 
       - name: Prepare container build script
         run: |
@@ -405,10 +483,13 @@ jobs:
             --output-dir=dist \
             --remove-output \
             --assume-yes-for-downloads \
-            --show-progress \
+            --lto=yes \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
             --nofollow-import-to=test \
+            --enable-plugin=anti-bloat \
+            --noinclude-pytest-mode=nofollow \
+            --noinclude-setuptools-mode=nofollow \
             "${INCLUDES[@]}" \
             --output-filename="$ARTIFACT" \
             "$SCRIPT"
@@ -419,6 +500,7 @@ jobs:
         run: |
           docker run --rm \
             --platform linux/arm/v5 \
+            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.12-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
@@ -445,6 +527,7 @@ jobs:
     name: Build ${{ matrix.script }} (linux-armv6)
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -460,6 +543,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # Кэш ccache между запусками: каталог монтируется в контейнер
+      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
+      - name: Cache ccache (container)
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.artifact_name }}-
 
       - name: Prepare container build script
         run: |
@@ -483,10 +576,13 @@ jobs:
             --output-dir=dist \
             --remove-output \
             --assume-yes-for-downloads \
-            --show-progress \
+            --lto=yes \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
             --nofollow-import-to=test \
+            --enable-plugin=anti-bloat \
+            --noinclude-pytest-mode=nofollow \
+            --noinclude-setuptools-mode=nofollow \
             "${INCLUDES[@]}" \
             --output-filename="$ARTIFACT" \
             "$SCRIPT"
@@ -497,6 +593,7 @@ jobs:
         run: |
           docker run --rm \
             --platform linux/arm/v6 \
+            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.12-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
@@ -528,6 +625,7 @@ jobs:
     name: Build ${{ matrix.script }} (linux-armv9)
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -543,6 +641,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-armv9-${{ matrix.script }}-${{ github.sha }}
+          restore-keys: |
+            ccache-armv9-${{ matrix.script }}-
 
       - name: Set up Python (arm64)
         uses: actions/setup-python@v5
@@ -598,10 +704,13 @@ jobs:
             --output-dir=dist \
             --remove-output \
             --assume-yes-for-downloads \
-            --show-progress \
+            --lto=yes \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
             --nofollow-import-to=test \
+            --enable-plugin=anti-bloat \
+            --noinclude-pytest-mode=nofollow \
+            --noinclude-setuptools-mode=nofollow \
             "${INCLUDES[@]}" \
             --output-filename="${{ matrix.artifact_name }}" \
             "$SCRIPT"
@@ -630,6 +739,7 @@ jobs:
     name: Build ${{ matrix.script }} (android-${{ matrix.termux_tag }})
     runs-on: ${{ matrix.os }}
     continue-on-error: true
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -665,6 +775,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Кэш ccache между запусками (монтируется в Termux-контейнер)
+      - name: Cache ccache (Termux)
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-${{ github.sha }}
+          restore-keys: |
+            ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-
+
       - name: Prepare Termux build script
         run: |
           cat > termux-build.sh <<'EOS'
@@ -696,10 +815,13 @@ jobs:
             --output-dir=dist \
             --remove-output \
             --assume-yes-for-downloads \
-            --show-progress \
+            --lto=yes \
             --nofollow-import-to=tkinter \
             --nofollow-import-to=unittest \
             --nofollow-import-to=test \
+            --enable-plugin=anti-bloat \
+            --noinclude-pytest-mode=nofollow \
+            --noinclude-setuptools-mode=nofollow \
             "${INCLUDES[@]}" \
             --output-filename="$ARTIFACT" \
             "$SCRIPT"
@@ -715,6 +837,7 @@ jobs:
         timeout-minutes: 300
         run: |
           docker run --rm \
+            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/host-src:ro \
             -v "$PWD/dist-host":/host-dist \
             termux/termux-docker:${{ matrix.termux_tag }} \
