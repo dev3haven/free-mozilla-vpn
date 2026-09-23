@@ -29,28 +29,30 @@
 #   - armv9  (ARMv9-A tuning): a specialized build that does not run on
 #     armv8 devices; the universal linux-arm64 build remains.
 #
-# DOCKER NETWORKING — ADAPTIVE PROBE (no assumptions).
-# History: every hardcoded networking scheme failed on some runner:
-#   - --network host                 -> inherited loopback resolver fails
-#   - default bridge + --dns 8.8.8.8 -> correct resolv.conf, egress blocked
-#   - user-defined bridge (127.0.0.11 embedded DNS) -> upstream is the
-#     host's loopback 127.0.0.53, unreachable from the container namespace
-#   - --dns 172.17.0.1 (resolved on docker0) -> failed on the next run
-# Runner network behavior is NOT deterministic, so this workflow does not
-# guess anymore: each docker job starts with a "Probe container DNS" step
-# that TESTS candidates in a real container and picks the first that
-# actually resolves on THIS runner:
-#   1) the host's real upstream resolvers (from
-#      /run/systemd/resolve/resolv.conf — the actual servers, not the
-#      127.0.0.53 stub)
-#   2) Azure virtual DNS 168.63.129.16 (runners are Azure VMs)
-#   3) 1.1.1.1, 8.8.8.8
-#   4) 172.17.0.1 — after exposing systemd-resolved on the docker0 gateway
-#      via DNSStubListenerExtra (documented pattern for resolved+Docker)
-#   5) fallback: --network host (shares the host network namespace)
-# The winner is exported as CONTAINER_NET_FLAG / CONTAINER_DNS_FLAG and used
-# by the build container. If NOTHING works, the job fails in ~1 minute
-# with diagnostics instead of wasting a 20-minute build.
+# DOCKER NETWORKING — FINAL DESIGN (evidence-based).
+# In-container DNS on GitHub-hosted runners is unreliable: actions/runner-
+# images#6526 confirms that container networking/DNS is broken on a subset
+# of the Azure-hosted runner fleet and behavior differs per machine. Real
+# failed runs of this very workflow confirmed it: --network host fails,
+# --dns 8.8.8.8/1.1.1.1 fails (egress to external resolvers blocked), the
+# user-defined bridge embedded DNS fails (its upstream is the loopback
+# 127.0.0.53 stub, unreachable from a container namespace), --dns 172.17.0.1
+# with DNSStubListenerExtra fails on some machines.
+# THEREFORE the workflow no longer RELIES on in-container DNS:
+#   1) First it probes DNS candidates (host upstream resolvers from
+#      /run/systemd/resolve/resolv.conf, Azure virtual DNS 168.63.129.16,
+#      1.1.1.1, 8.8.8.8, 172.17.0.1 with the resolved listener exposed on
+#      the docker0 gateway, then --network host). If one works — great.
+#   2) If NOTHING works, it switches to a DNS-FREE path: all hostnames the
+#      build needs (Debian mirrors, PyPI, Nuitka downloads; for Termux also
+#      the repository domains extracted from the image's apt sources) are
+#      resolved ON THE HOST — where DNS always works — and injected into
+#      the container via `docker run --add-host host:IP` (official docker
+#      run flag; the entries land in /etc/hosts). HTTPS still works: SNI
+#      and certificate validation use the hostname, not the IP.
+# The chosen flags are exported via GITHUB_ENV and applied to the build
+# container. If even the --add-host verification fails, the job aborts in
+# ~1 minute with full diagnostics instead of wasting a long build.
 #
 # IMPORTANT about dependencies: for "exotic" targets (x86 win32, armv7, i386,
 # Android), prebuilt wheels of zxing-cpp / Pillow may not exist — pip then
@@ -317,13 +319,7 @@ jobs:
   # ==========================================================================
   # 2. Linux i386 (32-bit x86 Linux) — docker linux/386 on an x64 runner.
   #    i386 code executes natively on x86-64 CPUs (no emulation needed).
-  #
   #    NETWORKING: adaptive — see the DOCKER NETWORKING block at the top.
-  #    The probe step tests DNS candidates in a real container and exports
-  #    CONTAINER_NET_FLAG / CONTAINER_DNS_FLAG for the build step.
-  #    The probe runs on the native amd64 python image (DNS behavior is
-  #    identical for all platforms on the same runner/daemon).
-  #
   #    i386 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
   #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
   # ==========================================================================
@@ -357,68 +353,96 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.artifact_name }}-
 
-      - name: Probe container DNS (adaptive)
+      - name: Probe container networking (adaptive)
         run: |
           set -uo pipefail
+          # Probe in the SAME platform as the build so the result is valid.
+          PROBE_PLATFORM="--platform linux/386"
           PROBE_IMAGE="python:3.14-trixie"
+          VERIFY_HOSTS="deb.debian.org pypi.org"
 
-          # Candidate 4 preparation: expose the host's systemd-resolved on
-          # the docker0 gateway (documented resolved+Docker pattern). The
-          # 127.0.0.53 loopback stub is unreachable from containers, so
-          # without this 172.17.0.1 would have no listener on it.
+          # dns_works <resolver>: does a real container resolve via this --dns?
+          dns_works() {
+            timeout 90 docker run --rm ${PROBE_PLATFORM} --dns "$1" \
+              -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+              sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done' \
+              >/dev/null 2>&1
+          }
+
+          # --- Candidate 172.17.0.1 preparation: expose the host's
+          # systemd-resolved on the docker0 gateway (loopback stub is
+          # unreachable from containers).
           sudo mkdir -p /etc/systemd/resolved.conf.d
           printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
             | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf >/dev/null
           sudo systemctl restart systemd-resolved || true
 
-          # Candidates: the host's REAL upstream resolvers first (from
-          # /run/systemd/resolve/resolv.conf — actual servers, not the
-          # 127.0.0.53 stub), then Azure virtual DNS, public resolvers,
-          # and the docker0 gateway with the exposed resolved listener.
-          CANDS="$({ grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null || true; } | awk '{print $2}')"
-          CANDS="$(printf '%s\n168.63.129.16\n1.1.1.1\n8.8.8.8\n172.17.0.1\n' "$CANDS")"
+          NET_FLAG=""; DNS_FLAG=""; ADDHOST_FLAG=""
 
-          WORKING=()
-          SEEN=" "
+          # --- 1) DNS candidates (host upstreams first, then Azure,
+          #        public, docker0 gateway) ---
+          CANDS="$( { grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'; \
+                      echo 168.63.129.16; echo 1.1.1.1; echo 8.8.8.8; echo 172.17.0.1; } )"
+          WORKING=(); SEEN=" "
           while IFS= read -r c; do
             [ -z "$c" ] && continue
             case "$SEEN" in *" $c "*) continue ;; esac
             SEEN="$SEEN $c "
             echo "Probing DNS candidate: $c ..."
-            if timeout 60 docker run --rm --dns "$c" "$PROBE_IMAGE" \
-                 getent hosts deb.debian.org >/dev/null 2>&1; then
+            if dns_works "$c"; then
               echo "  -> WORKS"
               WORKING+=("$c")
-              if [ "${#WORKING[@]}" -ge 2 ]; then break; fi
+              [ "${#WORKING[@]}" -ge 2 ] && break
             else
               echo "  -> failed"
             fi
           done <<< "$CANDS"
 
-          NET_FLAG=""
-          DNS_FLAG=""
           if [ "${#WORKING[@]}" -gt 0 ]; then
             DNS_FLAG="--dns ${WORKING[0]}"
-            if [ "${#WORKING[@]}" -gt 1 ]; then
-              DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
-            fi
+            [ "${#WORKING[@]}" -gt 1 ] && DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
           else
             echo "No --dns candidate worked; probing --network host ..."
-            if timeout 60 docker run --rm --network host "$PROBE_IMAGE" \
-                 getent hosts deb.debian.org; then
+            if timeout 90 docker run --rm --network host \
+                 -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+                 sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
               NET_FLAG="--network host"
             else
-              echo "ERROR: no working container networking found on this runner" >&2
-              echo "Host resolv.conf:"; cat /etc/resolv.conf || true
-              echo "Upstream resolv.conf:"; cat /run/systemd/resolve/resolv.conf || true
-              exit 1
+              # --- 3) DNS-FREE fallback: resolve everything on the HOST and
+              #        inject host:IP into the container's /etc/hosts.
+              echo "Falling back to --add-host (host-resolved IPs) ..."
+              HOSTS="deb.debian.org security.debian.org pypi.org files.pythonhosted.org nuitka.net"
+              ADDHOST_FLAG=""
+              for h in $HOSTS; do
+                ip="$(getent ahostsv4 "$h" | awk '{print $1; exit}' || true)"
+                if [ -n "$ip" ]; then
+                  ADDHOST_FLAG="$ADDHOST_FLAG --add-host $h:$ip"
+                else
+                  echo "WARNING: could not resolve '$h' on the host" >&2
+                fi
+              done
+              if [ -z "$ADDHOST_FLAG" ]; then
+                echo "ERROR: host-side resolution failed entirely" >&2
+                cat /etc/resolv.conf >&2 || true
+                exit 1
+              fi
+              # Verify the /etc/hosts path in a real container.
+              if ! timeout 90 docker run --rm ${PROBE_PLATFORM} ${ADDHOST_FLAG} \
+                    -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+                    sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
+                echo "ERROR: no working container networking on this runner (even --add-host)" >&2
+                echo "--- host /etc/resolv.conf ---"; cat /etc/resolv.conf >&2 || true
+                echo "--- /run/systemd/resolve/resolv.conf ---"; cat /run/systemd/resolve/resolv.conf >&2 || true
+                exit 1
+              fi
             fi
           fi
 
-          echo "Chosen container networking: NET='$NET_FLAG' DNS='$DNS_FLAG'"
+          echo "Chosen networking: NET='$NET_FLAG' DNS='$DNS_FLAG' ADDHOST='$ADDHOST_FLAG'"
           {
             echo "CONTAINER_NET_FLAG=$NET_FLAG"
             echo "CONTAINER_DNS_FLAG=$DNS_FLAG"
+            echo "CONTAINER_ADDHOST_FLAG=$ADDHOST_FLAG"
           } >> "$GITHUB_ENV"
 
       - name: Prepare container build script
@@ -484,11 +508,11 @@ jobs:
 
       - name: Build in linux/386 container
         run: |
-          # $CONTAINER_NET_FLAG / $CONTAINER_DNS_FLAG: chosen by the probe
-          # step for THIS runner (unquoted expansion is intentional — the
-          # variables contain 0-2 space-separated docker flags each).
+          # Flags chosen by the probe step for THIS runner. Unquoted
+          # expansion is intentional: each variable holds 0..N
+          # space-separated docker flags (or is empty).
           docker run --rm \
-            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG \
+            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG $CONTAINER_ADDHOST_FLAG \
             --platform linux/386 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
@@ -508,9 +532,7 @@ jobs:
   #    older Android with arm Termux). Runs on the FREE GitHub arm64 runner
   #    (ubuntu-26.04-arm): ARMv8 CPUs execute 32-bit ARMv7 code natively —
   #    no QEMU needed, the build is fast.
-  #    NETWORKING: adaptive probe, same as the i386 job. The probe uses
-  #    debian:trixie-slim with --platform linux/arm/v7 (Debian publishes
-  #    armhf variants; the python image does not guarantee arm/v7).
+  #    NETWORKING: adaptive — see the DOCKER NETWORKING block at the top.
   #    armv7 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
   #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
   # ==========================================================================
@@ -544,69 +566,93 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.artifact_name }}-
 
-      - name: Probe container DNS (adaptive)
+      - name: Probe container networking (adaptive)
         run: |
           set -uo pipefail
-          # Probe in the same platform as the build: debian:trixie-slim has
-          # an armhf (linux/arm/v7) variant.
-          PROBE_IMAGE="debian:trixie-slim"
+          # Probe in the SAME platform as the build. python:3.14-trixie has
+          # no guaranteed arm/v7 tag, so probe on debian:trixie-slim
+          # (multi-arch incl. armhf); DNS behavior is identical for all
+          # containers on the same daemon.
           PROBE_PLATFORM="--platform linux/arm/v7"
+          PROBE_IMAGE="debian:trixie-slim"
+          VERIFY_HOSTS="deb.debian.org pypi.org"
 
-          # Candidate 4 preparation: expose the host's systemd-resolved on
-          # the docker0 gateway (see the networking notes at the top).
+          dns_works() {
+            timeout 90 docker run --rm ${PROBE_PLATFORM} --dns "$1" \
+              -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+              sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done' \
+              >/dev/null 2>&1
+          }
+
+          # --- Candidate 172.17.0.1 preparation (expose resolved on docker0)
           sudo mkdir -p /etc/systemd/resolved.conf.d
           printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
             | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf >/dev/null
           sudo systemctl restart systemd-resolved || true
 
-          # Candidates: the host's REAL upstream resolvers first (from
-          # /run/systemd/resolve/resolv.conf — actual servers, not the
-          # 127.0.0.53 stub), then Azure virtual DNS, public resolvers,
-          # and the docker0 gateway with the exposed resolved listener.
-          CANDS="$({ grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null || true; } | awk '{print $2}')"
-          CANDS="$(printf '%s\n168.63.129.16\n1.1.1.1\n8.8.8.8\n172.17.0.1\n' "$CANDS")"
+          NET_FLAG=""; DNS_FLAG=""; ADDHOST_FLAG=""
 
-          WORKING=()
-          SEEN=" "
+          # --- 1) DNS candidates ---
+          CANDS="$( { grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'; \
+                      echo 168.63.129.16; echo 1.1.1.1; echo 8.8.8.8; echo 172.17.0.1; } )"
+          WORKING=(); SEEN=" "
           while IFS= read -r c; do
             [ -z "$c" ] && continue
             case "$SEEN" in *" $c "*) continue ;; esac
             SEEN="$SEEN $c "
             echo "Probing DNS candidate: $c ..."
-            if timeout 90 docker run --rm $PROBE_PLATFORM --dns "$c" "$PROBE_IMAGE" \
-                 getent hosts deb.debian.org >/dev/null 2>&1; then
+            if dns_works "$c"; then
               echo "  -> WORKS"
               WORKING+=("$c")
-              if [ "${#WORKING[@]}" -ge 2 ]; then break; fi
+              [ "${#WORKING[@]}" -ge 2 ] && break
             else
               echo "  -> failed"
             fi
           done <<< "$CANDS"
 
-          NET_FLAG=""
-          DNS_FLAG=""
           if [ "${#WORKING[@]}" -gt 0 ]; then
             DNS_FLAG="--dns ${WORKING[0]}"
-            if [ "${#WORKING[@]}" -gt 1 ]; then
-              DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
-            fi
+            [ "${#WORKING[@]}" -gt 1 ] && DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
           else
             echo "No --dns candidate worked; probing --network host ..."
-            if timeout 90 docker run --rm $PROBE_PLATFORM --network host "$PROBE_IMAGE" \
-                 getent hosts deb.debian.org; then
+            if timeout 90 docker run --rm --network host \
+                 -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+                 sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
               NET_FLAG="--network host"
             else
-              echo "ERROR: no working container networking found on this runner" >&2
-              echo "Host resolv.conf:"; cat /etc/resolv.conf || true
-              echo "Upstream resolv.conf:"; cat /run/systemd/resolve/resolv.conf || true
-              exit 1
+              # --- 3) DNS-FREE fallback: --add-host with host-resolved IPs
+              echo "Falling back to --add-host (host-resolved IPs) ..."
+              HOSTS="deb.debian.org security.debian.org pypi.org files.pythonhosted.org nuitka.net"
+              ADDHOST_FLAG=""
+              for h in $HOSTS; do
+                ip="$(getent ahostsv4 "$h" | awk '{print $1; exit}' || true)"
+                if [ -n "$ip" ]; then
+                  ADDHOST_FLAG="$ADDHOST_FLAG --add-host $h:$ip"
+                else
+                  echo "WARNING: could not resolve '$h' on the host" >&2
+                fi
+              done
+              if [ -z "$ADDHOST_FLAG" ]; then
+                echo "ERROR: host-side resolution failed entirely" >&2
+                cat /etc/resolv.conf >&2 || true
+                exit 1
+              fi
+              if ! timeout 90 docker run --rm ${PROBE_PLATFORM} ${ADDHOST_FLAG} \
+                    -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+                    sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
+                echo "ERROR: no working container networking on this runner (even --add-host)" >&2
+                echo "--- host /etc/resolv.conf ---"; cat /etc/resolv.conf >&2 || true
+                echo "--- /run/systemd/resolve/resolv.conf ---"; cat /run/systemd/resolve/resolv.conf >&2 || true
+                exit 1
+              fi
             fi
           fi
 
-          echo "Chosen container networking: NET='$NET_FLAG' DNS='$DNS_FLAG'"
+          echo "Chosen networking: NET='$NET_FLAG' DNS='$DNS_FLAG' ADDHOST='$ADDHOST_FLAG'"
           {
             echo "CONTAINER_NET_FLAG=$NET_FLAG"
             echo "CONTAINER_DNS_FLAG=$DNS_FLAG"
+            echo "CONTAINER_ADDHOST_FLAG=$ADDHOST_FLAG"
           } >> "$GITHUB_ENV"
 
       - name: Prepare container build script
@@ -671,10 +717,10 @@ jobs:
 
       - name: Build in linux/arm/v7 container
         run: |
-          # $CONTAINER_NET_FLAG / $CONTAINER_DNS_FLAG: chosen by the probe
-          # step for THIS runner (unquoted expansion is intentional).
+          # Flags chosen by the probe step for THIS runner (unquoted
+          # expansion is intentional — see the i386 job).
           docker run --rm \
-            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG \
+            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG $CONTAINER_ADDHOST_FLAG \
             --platform linux/arm/v7 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
@@ -696,18 +742,15 @@ jobs:
   #    in Termux on Android, including Android-x86 (the x86_64 tag).
   #    The aarch64 tag runs natively on the ARM runner, x86_64 on the x64
   #    runner (no emulation needed).
-  #
-  #    NETWORKING: adaptive probe, same as the docker Linux jobs (see the
-  #    DOCKER NETWORKING block at the top). The probe runs on a Debian
-  #    container (Termux has no getent — bionic libc, not glibc), but the
-  #    DNS path is identical for all containers on the same daemon.
-  #
+  #    NETWORKING: adaptive — see the DOCKER NETWORKING block at the top.
+  #    In the --add-host fallback the Termux repository domains are
+  #    extracted from the image's own apt sources (no network needed for
+  #    that), so every host the build contacts is covered.
   #    PACKAGE MANAGER: apt-get (NOT pkg) — pkg is a wrapper over the
   #    `apt` command, which ALWAYS prints "WARNING: apt does not have a
   #    stable CLI interface. Use with caution in scripts." when run
   #    non-interactively; apt-get prints no warning (stable CLI for
   #    scripts).
-  #
   #    ANDROID HAS NO PREBUILT WHEELS: zxing-cpp and Pillow are built from
   #    sdist. The REQUIRED build prerequisites are (official docs):
   #      - zxing-cpp: CMake >= 3.18 + C++ compiler (Termux: cmake + clang)
@@ -715,7 +758,6 @@ jobs:
   #        (zlib and libjpeg are REQUIRED by default — Pillow docs)
   #    Without them pip failed with: "ERROR: Failed to build 'zxing-cpp'
   #    when installing backend dependencies for zxing-cpp".
-  #
   #    The build is experimental: continue-on-error — an Android job failure
   #    does not break the release of the other platforms.
   # ==========================================================================
@@ -768,77 +810,100 @@ jobs:
           restore-keys: |
             ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-
 
-      - name: Probe container DNS (adaptive)
+      - name: Probe container networking (adaptive)
         run: |
           set -uo pipefail
           # Probe on a Debian container: Termux has no getent (bionic
-          # libc), but the DNS path is identical for all containers.
+          # libc, not glibc), but DNS behavior is identical for all
+          # containers on the same daemon.
+          PROBE_PLATFORM=""
           PROBE_IMAGE="debian:trixie-slim"
+          VERIFY_HOSTS="pypi.org packages.termux.dev"
 
-          # Candidate 4 preparation: expose the host's systemd-resolved on
-          # the docker0 gateway (see the networking notes at the top).
+          dns_works() {
+            timeout 90 docker run --rm ${PROBE_PLATFORM} --dns "$1" \
+              -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+              sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done' \
+              >/dev/null 2>&1
+          }
+
+          # --- Candidate 172.17.0.1 preparation (expose resolved on docker0)
           sudo mkdir -p /etc/systemd/resolved.conf.d
           printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
             | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf >/dev/null
           sudo systemctl restart systemd-resolved || true
 
-          # Candidates: the host's REAL upstream resolvers first (from
-          # /run/systemd/resolve/resolv.conf — actual servers, not the
-          # 127.0.0.53 stub), then Azure virtual DNS, public resolvers,
-          # and the docker0 gateway with the exposed resolved listener.
-          # NOTE: for Termux also resolve packages.termux.dev in the probe
-          # — the Termux repositories must be reachable too.
-          CANDS="$({ grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null || true; } | awk '{print $2}')"
-          CANDS="$(printf '%s\n168.63.129.16\n1.1.1.1\n8.8.8.8\n172.17.0.1\n' "$CANDS")"
+          NET_FLAG=""; DNS_FLAG=""; ADDHOST_FLAG=""
 
-          probe() {
-            # $1 = resolver IP, $2.. = extra docker flags
-            local res="$1"; shift
-            timeout 90 docker run --rm "$@" --dns "$res" "$PROBE_IMAGE" \
-              sh -c 'getent hosts deb.debian.org && getent hosts pypi.org && getent hosts packages.termux.dev' \
-              >/dev/null 2>&1
-          }
-
-          WORKING=()
-          SEEN=" "
+          # --- 1) DNS candidates ---
+          CANDS="$( { grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'; \
+                      echo 168.63.129.16; echo 1.1.1.1; echo 8.8.8.8; echo 172.17.0.1; } )"
+          WORKING=(); SEEN=" "
           while IFS= read -r c; do
             [ -z "$c" ] && continue
             case "$SEEN" in *" $c "*) continue ;; esac
             SEEN="$SEEN $c "
             echo "Probing DNS candidate: $c ..."
-            if probe "$c"; then
+            if dns_works "$c"; then
               echo "  -> WORKS"
               WORKING+=("$c")
-              if [ "${#WORKING[@]}" -ge 2 ]; then break; fi
+              [ "${#WORKING[@]}" -ge 2 ] && break
             else
               echo "  -> failed"
             fi
           done <<< "$CANDS"
 
-          NET_FLAG=""
-          DNS_FLAG=""
           if [ "${#WORKING[@]}" -gt 0 ]; then
             DNS_FLAG="--dns ${WORKING[0]}"
-            if [ "${#WORKING[@]}" -gt 1 ]; then
-              DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
-            fi
+            [ "${#WORKING[@]}" -gt 1 ] && DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
           else
             echo "No --dns candidate worked; probing --network host ..."
-            if timeout 90 docker run --rm --network host "$PROBE_IMAGE" \
-                 sh -c 'getent hosts deb.debian.org && getent hosts pypi.org && getent hosts packages.termux.dev'; then
+            if timeout 90 docker run --rm --network host \
+                 -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+                 sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
               NET_FLAG="--network host"
             else
-              echo "ERROR: no working container networking found on this runner" >&2
-              echo "Host resolv.conf:"; cat /etc/resolv.conf || true
-              echo "Upstream resolv.conf:"; cat /run/systemd/resolve/resolv.conf || true
-              exit 1
+              # --- 3) DNS-FREE fallback: --add-host with host-resolved IPs.
+              # The Termux repository domains are extracted from the
+              # image's own apt sources (reading files needs no network).
+              echo "Falling back to --add-host (host-resolved IPs) ..."
+              TERMUX_PREFIX="/data/data/com.termux/files/usr"
+              TERMUX_HOSTS="$(docker run --rm \
+                termux/termux-docker:${{ matrix.termux_tag }} \
+                sh -c "cat ${TERMUX_PREFIX}/etc/apt/sources.list ${TERMUX_PREFIX}/etc/apt/sources.list.d/* 2>/dev/null || true" \
+                | grep -oE 'https?://[^/[:space:]]+' | sed -E 's#https?://##' | sort -u || true)"
+              HOSTS="$TERMUX_HOSTS packages.termux.dev pypi.org files.pythonhosted.org nuitka.net"
+              ADDHOST_FLAG=""
+              for h in $HOSTS; do
+                [ -z "$h" ] && continue
+                ip="$(getent ahostsv4 "$h" | awk '{print $1; exit}' || true)"
+                if [ -n "$ip" ]; then
+                  ADDHOST_FLAG="$ADDHOST_FLAG --add-host $h:$ip"
+                else
+                  echo "WARNING: could not resolve '$h' on the host" >&2
+                fi
+              done
+              if [ -z "$ADDHOST_FLAG" ]; then
+                echo "ERROR: host-side resolution failed entirely" >&2
+                cat /etc/resolv.conf >&2 || true
+                exit 1
+              fi
+              if ! timeout 90 docker run --rm ${PROBE_PLATFORM} ${ADDHOST_FLAG} \
+                    -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
+                    sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
+                echo "ERROR: no working container networking on this runner (even --add-host)" >&2
+                echo "--- host /etc/resolv.conf ---"; cat /etc/resolv.conf >&2 || true
+                echo "--- /run/systemd/resolve/resolv.conf ---"; cat /run/systemd/resolve/resolv.conf >&2 || true
+                exit 1
+              fi
             fi
           fi
 
-          echo "Chosen container networking: NET='$NET_FLAG' DNS='$DNS_FLAG'"
+          echo "Chosen networking: NET='$NET_FLAG' DNS='$DNS_FLAG' ADDHOST='$ADDHOST_FLAG'"
           {
             echo "CONTAINER_NET_FLAG=$NET_FLAG"
             echo "CONTAINER_DNS_FLAG=$DNS_FLAG"
+            echo "CONTAINER_ADDHOST_FLAG=$ADDHOST_FLAG"
           } >> "$GITHUB_ENV"
 
       - name: Prepare Termux build script
@@ -945,10 +1010,10 @@ jobs:
       - name: Build in Termux container (${{ matrix.termux_tag }})
         timeout-minutes: 300
         run: |
-          # $CONTAINER_NET_FLAG / $CONTAINER_DNS_FLAG: chosen by the probe
-          # step for THIS runner (unquoted expansion is intentional).
+          # Flags chosen by the probe step for THIS runner (unquoted
+          # expansion is intentional — see the i386 job).
           docker run --rm \
-            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG \
+            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG $CONTAINER_ADDHOST_FLAG \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/host-src:ro \
             -v "$PWD/dist-host":/host-dist \
