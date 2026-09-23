@@ -1,38 +1,40 @@
 # ============================================================================
 # Build Release (Nuitka) — multi-architecture CI/CD
 #
-# Архитектуры (все собираются НАТИВНО, без QEMU-эмуляции — Nuitka не умеет
-# кросс-компиляцию, поэтому каждая цель собирается на совместимом окружении):
+# Architectures (all built NATIVELY, without QEMU emulation — Nuitka cannot
+# cross-compile, so each target builds on a compatible environment):
 #   - Windows x64          -> windows-latest                          (native)
 #   - Windows x86 (32-bit) -> windows-latest + setup-python x86       (native, WoW64)
-#   - Linux   x64          -> ubuntu-latest                           (native)
-#   - Linux   arm64        -> ubuntu-24.04-arm (бесплатный ARM-раннер) (native,
-#                            baseline aarch64 = ARMv8-A; работает на ARMv8/ARMv9)
-#   - Linux   armv7        -> ubuntu-24.04-arm + docker linux/arm/v7   (native AArch32
-#                            на ARMv8-процессоре: 64-битные ARM-ядра исполняют
-#                            32-битный ARMv7-код напрямую — старые Raspberry Pi,
-#                            Android-устройства с armhf и т.п.)
-#   - Linux   i386         -> ubuntu-latest + docker linux/386        (native на
-#                            x86-64 CPU: старые 32-битные Linux-системы)
-#   - Android x86_64       -> ubuntu-latest + termux/termux-docker:x86_64
-#                            (Termux-окружение с bionic; Nuitka официально
-#                            поддерживает Android через Termux)
-#   - Android aarch64      -> ubuntu-24.04-arm + termux/termux-docker:aarch64
+#   - Linux   x64          -> ubuntu-26.04 (LTS, current GA image)     (native)
+#   - Linux   arm64        -> ubuntu-26.04-arm (LTS, GA ARM runner)    (native,
+#                            baseline aarch64 = ARMv8-A; runs on ARMv8/ARMv9)
+#   - Linux   armv7        -> ubuntu-26.04-arm + docker linux/arm/v7 (native AArch32
+#                            on an ARMv8 CPU: 64-bit ARM cores execute
+#                            32-bit ARMv7 code directly — older Raspberry Pi,
+#                            armhf Android devices, etc.)
+#   - Linux   i386         -> ubuntu-26.04 + docker linux/386        (native on
+#                            x86-64 CPU: older 32-bit Linux systems)
+#   - Android x86_64       -> ubuntu-26.04 + termux/termux-docker:x86_64
+#                            (Termux environment with bionic; Nuitka officially
+#                            supports Android via Termux)
+#   - Android aarch64      -> ubuntu-26.04-arm + termux/termux-docker:aarch64
 #
-# ИСКЛЮЧЕННЫЕ редкие ARM-цели (постоянные проблемы, непопулярные устройства):
-#   - armv5  (ARM9/ARM10): готовых wheel-ов почти нет, официальные python-теги
-#     Debian для arm32v5 отсутствуют — сборка почти всегда без QR/TOTP-модулей.
-#   - armv6  (Raspberry Pi 1/Zero): нет готового armv6-glibc Python 3.14 —
-#     требовалась сборка CPython из исходников в CI (десятки минут, хрупко).
-#   - armv9  (ARMv9-A тюнинг): специализированная сборка, не работающая на
-#     armv8-устройствах; универсальной остаётся linux-arm64.
+# EXCLUDED rare ARM targets (constant problems, unpopular devices):
+#   - armv5  (ARM9/ARM10): almost no prebuilt wheels exist, official Debian
+#     python tags for arm32v5 are missing — the build almost always ends up
+#     without the QR/TOTP modules.
+#   - armv6  (Raspberry Pi 1/Zero): no prebuilt armv6-glibc Python 3.14 —
+#     would require building CPython from source in CI (tens of minutes,
+#     fragile).
+#   - armv9  (ARMv9-A tuning): a specialized build that does not run on
+#     armv8 devices; the universal linux-arm64 build remains.
 #
-# ВАЖНО про зависимости: для «экзотических» целей (x86 win32, armv7, i386,
-# Android) готовых wheel-пакетов zxing-cpp / Pillow может не быть. Установка
-# сделана «best-effort»: pyotp (чистый Python) обязателен, остальные ставятся
-# по возможности, а флаги --include-package добавляются ТОЛЬКО для реально
-# импортируемых модулей — сборка не падает, бинарник просто собирается без
-# необязательных QR/TOTP-модулей (как у варианта mozvpn_no_externals.py).
+# IMPORTANT about dependencies: for "exotic" targets (x86 win32, armv7, i386,
+# Android), prebuilt wheels of zxing-cpp / Pillow may not exist. Installation
+# is best-effort: pyotp (pure Python) is mandatory, the rest are installed
+# when possible, and --include-package flags are added ONLY for modules that
+# are actually importable — the build does not fail, the binary is simply
+# built without the optional QR/TOTP modules (like mozvpn_no_externals.py).
 # ============================================================================
 
 name: Build Release (Nuitka)
@@ -45,30 +47,31 @@ on:
 permissions:
   contents: write
 
-# УСКОРЕНИЕ СБОРКИ БЕЗ ПОТЕРИ ОПТИМИЗАЦИИ (проверено по документации Nuitka):
-#   ПРИОРИТЕТ — максимальная оптимизация бинарника, поэтому:
-#   1) --lto=yes     — Link-Time Optimization («whole program optimization»)
-#                      ВКЛЮЧЕНА явно: лучший код в бинарнике (медленнее
-#                      собирается — сознательная цена; документация Nuitka).
+# BUILD SPEEDUP WITHOUT LOSING OPTIMIZATION (verified against Nuitka docs):
+#   PRIORITY — maximum binary optimization, therefore:
+#   1) --lto=yes     — Link-Time Optimization ("whole program optimization").
+#                      Enabled explicitly: best code in the binary (slower
+#                      builds — a deliberate tradeoff; Nuitka documentation).
 #   2) anti-bloat    — --enable-plugin=anti-bloat + --noinclude-*-mode=nofollow
-#                      отсекает бесполезные импорты (pytest/setuptools и т.п.):
-#                      бинарник меньше, компиляция БЫСТРЕЕ, рантайм не страдает
-#                      (официальная рекомендация Nuitka для ускорения сборки).
-#   3) ccache + actions/cache — кэш объектных файлов МЕЖДУ запусками
-#                      (при повторных тегах/хотфиксах пересобираются только
-#                      изменённые файлы; на оптимизации это не сказывается:
-#                      ccache кэширует результат компиляции, флаги те же).
-#   4) ordered-set + zstandard — рекомендованы самим Nuitka для скорости
-#                      компиляции (предупреждение "very slow fallback").
-#   5) concurrency  — не даёт двум релизным сборкам одного тега работать
-#                      параллельно впустую.
+#                      cuts useless imports (pytest/setuptools etc.):
+#                      smaller binary, FASTER compilation, runtime untouched
+#                      (official Nuitka recommendation for faster builds).
+#   3) ccache + actions/cache — object file cache ACROSS runs
+#                      (on repeated tags/hotfixes only changed files are
+#                      rebuilt; optimization is unaffected: ccache caches
+#                      compilation results, flags stay the same).
+#   4) ordered-set + zstandard — recommended by Nuitka itself for
+#                      compilation speed (avoids the "very slow fallback"
+#                      warning).
+#   5) concurrency  — prevents two release builds of the same tag from
+#                      running in parallel for no reason.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   # ==========================================================================
-  # 1. Нативные сборки: Windows x64/x86 + Linux x64/arm64
+  # 1. Native builds: Windows x64/x86 + Linux x64/arm64
   # ==========================================================================
   build:
     name: Build ${{ matrix.script }} (${{ matrix.label }})
@@ -77,11 +80,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, ubuntu-24.04-arm]
+        os: [windows-latest, ubuntu-26.04, ubuntu-26.04-arm]
         script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
         exclude:
-          # Без externals-скрипт не тянет zxing-cpp/Pillow — при желании уберите исключение
-          - os: ubuntu-latest
+          # The no-externals script does not pull zxing-cpp/Pillow — remove the exclusion if desired
+          - os: ubuntu-26.04
             script: mozvpn_no_externals.py
         include:
           # -------- Windows x64 --------
@@ -89,23 +92,23 @@ jobs:
             label: windows-x64
             py_arch: x64
             nuitka_extra: "--windows-console-mode=force"
-          # -------- Windows x86 (32-битные системы) --------
+          # -------- Windows x86 (32-bit systems) --------
           - os: windows-latest
             label: windows-x86
             py_arch: x86
             nuitka_extra: "--windows-console-mode=force"
           # -------- Linux x64 --------
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             label: linux-x64
             py_arch: x64
             nuitka_extra: ""
-          # -------- Linux arm64 (ARM-раннер GitHub, нативно) --------
-          - os: ubuntu-24.04-arm
+          # -------- Linux arm64 (GitHub ARM runner, native) --------
+          - os: ubuntu-26.04-arm
             label: linux-arm64
             py_arch: arm64
             nuitka_extra: ""
 
-          # -------- Правила именования артефактов --------
+          # -------- Artifact naming rules --------
           - os: windows-latest
             label: windows-x64
             script: mozvpn.py
@@ -130,27 +133,27 @@ jobs:
             label: windows-x86
             script: mozvpn_no_externals.py
             artifact_name: mozvpn-no-externals-windows-x86.exe
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             label: linux-x64
             script: mozvpn.py
             artifact_name: mozvpn-linux
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             label: linux-x64
             script: mozvpn_beta.py
             artifact_name: mozvpn-beta-linux
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             label: linux-x64
             script: mozvpn_no_externals.py
             artifact_name: mozvpn-no-externals-linux
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             label: linux-arm64
             script: mozvpn.py
             artifact_name: mozvpn-linux-arm64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             label: linux-arm64
             script: mozvpn_beta.py
             artifact_name: mozvpn-beta-linux-arm64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             label: linux-arm64
             script: mozvpn_no_externals.py
             artifact_name: mozvpn-no-externals-linux-arm64
@@ -159,7 +162,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Кэш ccache между запусками (только Linux: там ccache в PATH)
+      # ccache cache across runs (Linux only: ccache is in PATH there)
       - name: Cache ccache
         if: runner.os == 'Linux'
         uses: actions/cache@v6
@@ -173,12 +176,21 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: '3.14'
+          # check-latest: pull the latest 3.14.x patch release instead of
+          # the version cached on the runner (latest stable Python).
+          check-latest: true
           architecture: ${{ matrix.py_arch }}
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          export DEBIAN_FRONTEND=noninteractive
+          # apt-get is the stable CLI for scripts; Dpkg::Options disable
+          # interactive conffile prompts. upgrade updates ALL runner image
+          # packages to the latest stable — a fresh toolchain (gcc, libc).
           sudo apt-get update
+          sudo apt-get -y -o Dpkg::Options::="--force-confdef" \
+                      -o Dpkg::Options::="--force-confold" upgrade
           sudo apt-get install -y ccache patchelf build-essential
 
       - name: Install Python dependencies
@@ -187,10 +199,10 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install "Nuitka[app]" ordered-set zstandard
-          # pyotp — чистый Python, обязателен везде.
+          # pyotp is pure Python, mandatory everywhere.
           python -m pip install pyotp
-          # zxing-cpp / Pillow / proxy.py — best-effort: для x86/arm целей
-          # wheel-ов может не быть; сборка продолжится без них.
+          # zxing-cpp / Pillow / proxy.py are best-effort: wheels may not
+          # exist for x86/arm targets; the build continues without them.
           python -m pip install zxing-cpp Pillow proxy.py \
             || echo "::warning::optional deps (zxing-cpp/Pillow/proxy.py) failed on this arch — building without them"
 
@@ -210,15 +222,16 @@ jobs:
             --nofollow-import-to=tkinter
             --nofollow-import-to=unittest
             --nofollow-import-to=test
-            # anti-bloat: отсекает ненужные импорты (pytest/setuptools и др.)
-            # — МЕНЬШЕ бинарник И БЫСТРЕЕ компиляция, рантайм-оптимизации не тронуты
+            # anti-bloat: cuts unneeded imports (pytest/setuptools etc.)
+            # — SMALLER binary and FASTER compilation, runtime optimizations untouched
             --enable-plugin=anti-bloat
             --noinclude-pytest-mode=nofollow
             --noinclude-setuptools-mode=nofollow
           )
 
-          # --include-package добавляем ТОЛЬКО для реально импортируемых
-          # модулей (на целях без wheel-ов их просто нет в окружении).
+          # Add --include-package ONLY for modules that are actually
+          # importable (on targets without wheels they are simply absent
+          # from the environment).
           INCLUDES=( --include-package=pyotp )
           if python -c "import zxingcpp" 2>/dev/null; then
             INCLUDES+=( --include-package=zxingcpp )
@@ -252,12 +265,12 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # 2. Linux i386 (32-битный x86 Linux) — docker linux/386 на x64-раннере.
-  #    i386-код исполняется x86-64 CPU нативно (эмуляция не нужна).
+  # 2. Linux i386 (32-bit x86 Linux) — docker linux/386 on an x64 runner.
+  #    i386 code executes natively on x86-64 CPUs (no emulation needed).
   # ==========================================================================
   build-linux-i386:
     name: Build ${{ matrix.script }} (linux-i386)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -275,8 +288,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Кэш ccache между запусками: каталог монтируется в контейнер
-      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
+      # ccache cache across runs: the directory is mounted into the
+      # container (CCACHE_DIR=/ccache), so object files survive restarts.
       - name: Cache ccache (container)
         uses: actions/cache@v6
         with:
@@ -291,8 +304,18 @@ jobs:
           set -euo pipefail
           SCRIPT="$1"
           ARTIFACT="$2"
+          export DEBIAN_FRONTEND=noninteractive
+          # apt-get is the stable CLI for scripts (plain `apt` prints a
+          # WARNING "does not have a stable CLI interface"); Dpkg::Options
+          # disable interactive conffile prompts, --no-install-recommends
+          # avoids pulling extra packages. apt-get upgrade updates ALL
+          # base image packages to the latest stable (Debian
+          # security/point-updates).
+          APT_OPTS=(-y --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
           apt-get update
-          apt-get install -y ccache patchelf build-essential
+          apt-get "${APT_OPTS[@]}" upgrade
+          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential
           python -m pip install --upgrade pip
           python -m pip install "Nuitka[app]" ordered-set zstandard
           python -m pip install pyotp
@@ -326,7 +349,7 @@ jobs:
             --platform linux/386 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
-            python:3.14-bookworm \
+            python:3.14-trixie \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
@@ -338,14 +361,14 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # 3. Linux armv7 (32-битный ARM: старые Raspberry Pi, armhf-дистрибутивы,
-  #    старые Android с arm-Termux). Запускается на БЕСПЛАТНОМ arm64-раннере
-  #    GitHub (ubuntu-24.04-arm): процессоры ARMv8 исполняют 32-битный
-  #    ARMv7-код нативно — QEMU не нужен, сборка быстрая.
+  # 3. Linux armv7 (32-bit ARM: older Raspberry Pi, armhf distributions,
+  #    older Android with arm Termux). Runs on the FREE GitHub arm64 runner
+  #    (ubuntu-26.04-arm): ARMv8 CPUs execute 32-bit ARMv7 code natively —
+  #    no QEMU needed, the build is fast.
   # ==========================================================================
   build-linux-armv7:
     name: Build ${{ matrix.script }} (linux-armv7)
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -363,8 +386,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Кэш ccache между запусками: каталог монтируется в контейнер
-      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
+      # ccache cache across runs: the directory is mounted into the
+      # container (CCACHE_DIR=/ccache), so object files survive restarts.
       - name: Cache ccache (container)
         uses: actions/cache@v6
         with:
@@ -379,8 +402,18 @@ jobs:
           set -euo pipefail
           SCRIPT="$1"
           ARTIFACT="$2"
+          export DEBIAN_FRONTEND=noninteractive
+          # apt-get is the stable CLI for scripts (plain `apt` prints a
+          # WARNING "does not have a stable CLI interface"); Dpkg::Options
+          # disable interactive conffile prompts, --no-install-recommends
+          # avoids pulling extra packages. apt-get upgrade updates ALL
+          # base image packages to the latest stable (Debian
+          # security/point-updates).
+          APT_OPTS=(-y --no-install-recommends \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
           apt-get update
-          apt-get install -y ccache patchelf build-essential
+          apt-get "${APT_OPTS[@]}" upgrade
+          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential
           python -m pip install --upgrade pip
           python -m pip install "Nuitka[app]" ordered-set zstandard
           python -m pip install pyotp
@@ -414,7 +447,7 @@ jobs:
             --platform linux/arm/v7 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
-            python:3.14-bookworm \
+            python:3.14-trixie \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
@@ -426,16 +459,16 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # 4. Android (Termux / bionic) — Nuitka официально поддерживает Android
-  #    через Termux (user manual: "pkg install patchelf ccache binutils ldd
-  #    termux-elf-cleaner"). Собираем в официальном образе
-  #    termux/termux-docker — тот же пакетный набор, что и на реальном
-  #    устройстве, поэтому бинарник работает и в Termux на Android,
-  #    включая Android-x86 (тег x86_64).
-  #    aarch64-тег запускается нативно на ARM-раннере, x86_64 — на x64-раннере
-  #    (эмуляция не нужна).
-  #    Сборка экспериментальная: continue-on-error — фейл джобы Android
-  #    не ломает релиз остальных платформ.
+  # 4. Android (Termux / bionic) — Nuitka officially supports Android via
+  #    Termux (user manual: "pkg install patchelf ccache binutils ldd
+  #    termux-elf-cleaner"). We build inside the official
+  #    termux/termux-docker image — the same package set as on a real
+  #    device, so the binary also works in Termux on Android, including
+  #    Android-x86 (the x86_64 tag).
+  #    The aarch64 tag runs natively on the ARM runner, x86_64 on the x64
+  #    runner (no emulation needed).
+  #    The build is experimental: continue-on-error — an Android job failure
+  #    does not break the release of the other platforms.
   # ==========================================================================
   build-android:
     name: Build ${{ matrix.script }} (android-${{ matrix.termux_tag }})
@@ -448,12 +481,12 @@ jobs:
         script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
         termux_tag: [x86_64, aarch64]
         include:
-          # Какой раннер запускать для какого тега Termux (нативно, без QEMU)
+          # Which runner to use for each Termux tag (native, no QEMU)
           - termux_tag: x86_64
-            os: ubuntu-latest
+            os: ubuntu-26.04
           - termux_tag: aarch64
-            os: ubuntu-24.04-arm
-          # Правила именования артефактов
+            os: ubuntu-26.04-arm
+          # Artifact naming rules
           - script: mozvpn.py
             termux_tag: x86_64
             artifact_name: mozvpn-android-x86_64
@@ -477,7 +510,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Кэш ccache между запусками (монтируется в Termux-контейнер)
+      # ccache cache across runs (mounted into the Termux container)
       - name: Cache ccache (Termux)
         uses: actions/cache@v6
         with:
@@ -493,12 +526,31 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
 
-          # Termux-окружение: пакеты те же, что рекомендует
-          # документация Nuitka для Android.
-          # ВАЖНО: pip в Termux — это пакет python-pip; его самостоятельное
-          # обновление ЗАПРЕЩЕНО (ошибка "Installing pip is forbidden"),
-          # поэтому НИКАКОГО `pip install --upgrade pip` здесь быть не должно.
-          pkg install -y python patchelf ccache binutils ldd termux-elf-cleaner
+          # --- 1) THE CANONICAL TERMUX PACKAGE MANAGER -----------------------
+          # pkg is the native Termux interface: it is a wrapper over apt that
+          # refreshes repository/mirror indexes before each operation
+          # (Termux Wiki, Package Management). We do NOT pin a mirror — pkg
+          # picks an available mirror based on geolocation, which is
+          # universal for any CI.
+          # The Dpkg::Options flags disable interactive conffile prompts.
+          # The WARNING "apt does not have a stable CLI interface" is an
+          # internal notice of the pkg->apt wrapper — standard pkg behavior,
+          # NOT an error.
+          PKG_OPTS=(-o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+
+          # --- 2) FULL UPGRADE TO THE LATEST STABLE VERSIONS -----------------
+          # pkg upgrade updates ALL installed image packages to their latest
+          # stable versions.
+          pkg upgrade -y "${PKG_OPTS[@]}"
+
+          # --- 3) Termux environment: the same packages recommended by the ---
+          #    Nuitka documentation for Android (fresh versions from the
+          #    updated repository).
+          # IMPORTANT: pip in Termux is the python-pip package; upgrading it
+          # on your own is FORBIDDEN (the "Installing pip is forbidden"
+          # error), so there must be NO `pip install --upgrade pip` here.
+          pkg install -y "${PKG_OPTS[@]}" \
+            python patchelf ccache binutils ldd termux-elf-cleaner
 
           pip install "Nuitka[app]" ordered-set zstandard
           pip install pyotp
@@ -533,7 +585,7 @@ jobs:
           cp "dist/$ARTIFACT" /host-dist/
           EOS
 
-          # Каталоги, доступные контейнеру: исходники (чтение) и вывод (запись).
+          # Directories exposed to the container: sources (read) and output (write).
           mkdir -p dist-host
           chmod 777 dist-host
 
@@ -557,12 +609,12 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # 5. Release: собирает ВСЕ артефакты со ВСЕХ архитектур
+  # 5. Release: collects ALL artifacts from ALL architectures
   # ==========================================================================
   release:
     name: Create GitHub Release
     needs: [build, build-linux-i386, build-linux-armv7, build-android]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -591,19 +643,19 @@ jobs:
           cp artifacts/mozvpn-linux-arm64/mozvpn-linux-arm64 release/ || true
           cp artifacts/mozvpn-beta-linux-arm64/mozvpn-beta-linux-arm64 release/ || true
           cp artifacts/mozvpn-no-externals-linux-arm64/mozvpn-no-externals-linux-arm64 release/ || true
-          # ---- Linux armv7 (старые ARM-устройства) ----
+          # ---- Linux armv7 (older ARM devices) ----
           cp artifacts/mozvpn-linux-armv7/mozvpn-linux-armv7 release/ || true
           cp artifacts/mozvpn-beta-linux-armv7/mozvpn-beta-linux-armv7 release/ || true
           cp artifacts/mozvpn-no-externals-linux-armv7/mozvpn-no-externals-linux-armv7 release/ || true
-          # ---- Linux i386 (старые 32-битные x86) ----
+          # ---- Linux i386 (older 32-bit x86) ----
           cp artifacts/mozvpn-linux-i386/mozvpn-linux-i386 release/ || true
           cp artifacts/mozvpn-beta-linux-i386/mozvpn-beta-linux-i386 release/ || true
           cp artifacts/mozvpn-no-externals-linux-i386/mozvpn-no-externals-linux-i386 release/ || true
-          # ---- Android x86_64 (Android-x86 и Termux на x86) ----
+          # ---- Android x86_64 (Android-x86 and Termux on x86) ----
           cp artifacts/mozvpn-android-x86_64/mozvpn-android-x86_64 release/ || true
           cp artifacts/mozvpn-beta-android-x86_64/mozvpn-beta-android-x86_64 release/ || true
           cp artifacts/mozvpn-no-externals-android-x86_64/mozvpn-no-externals-android-x86_64 release/ || true
-          # ---- Android aarch64 (ARM-устройства) ----
+          # ---- Android aarch64 (ARM devices) ----
           cp artifacts/mozvpn-android-aarch64/mozvpn-android-aarch64 release/ || true
           cp artifacts/mozvpn-beta-android-aarch64/mozvpn-beta-android-aarch64 release/ || true
           cp artifacts/mozvpn-no-externals-android-aarch64/mozvpn-no-externals-android-aarch64 release/ || true
