@@ -29,12 +29,40 @@
 #   - armv9  (ARMv9-A tuning): a specialized build that does not run on
 #     armv8 devices; the universal linux-arm64 build remains.
 #
+# DOCKER NETWORKING (the fix for "Temporary failure resolving
+# 'deb.debian.org'" / "Unable to locate package ccache" on GitHub runners):
+#   Neither --network host NOR --dns 8.8.8.8 works on these runners:
+#   - --network host: container inherits the host resolv.conf with
+#     systemd-resolved on 127.0.0.53, unreachable/unusable from the container
+#     namespace (actions/runner#2036, runner-images#6013).
+#   - default bridge + --dns: the container's resolv.conf IS correctly set to
+#     8.8.8.8/1.1.1.1 (verified in a real failed run log), but direct UDP
+#     egress from the default bridge to external resolvers is blocked —
+#     resolution still fails.
+#   THE FIX: a user-defined bridge network (docker network create buildnet).
+#   On user-defined networks Docker runs its EMBEDDED DNS server
+#   (127.0.0.11) inside the container, and external queries are forwarded
+#   BY THE DAEMON ON THE HOST — i.e. through the host's own working resolver
+#   — bypassing both the unreachable 127.0.0.53 and the blocked direct
+#   egress. On the default bridge there is NO embedded DNS server, which is
+#   exactly why it kept failing.
+#
 # IMPORTANT about dependencies: for "exotic" targets (x86 win32, armv7, i386,
-# Android), prebuilt wheels of zxing-cpp / Pillow may not exist. Installation
-# is best-effort: pyotp (pure Python) is mandatory, the rest are installed
-# when possible, and --include-package flags are added ONLY for modules that
-# are actually importable — the build does not fail, the binary is simply
-# built without the optional QR/TOTP modules (like mozvpn_no_externals.py).
+# Android), prebuilt wheels of zxing-cpp / Pillow may not exist — pip then
+# builds them FROM SOURCE (sdist). That requires the native build chain of
+# each platform, which is installed explicitly below:
+#   - zxing-cpp (Python wrapper): CMake >= 3.18 + C++ compiler (official
+#     zxing-cpp build docs).
+#   - Pillow: zlib and libjpeg are REQUIRED by default; on Termux the
+#     documented prerequisites are clang/make/ndk-sysroot/libjpeg-turbo
+#     (official Pillow "Building from source" docs).
+# Each optional package is installed in its OWN pip transaction
+# (`pip install X || warning`): if one fails, the others are still attempted
+# and the build continues without the failed module — pyotp (pure Python)
+# is mandatory everywhere, --include-package flags are added ONLY for
+# modules that are actually importable, so the build never fails, the
+# binary is simply built without the optional QR/TOTP modules (like
+# mozvpn_no_externals.py).
 # ============================================================================
 
 name: Build Release (Nuitka)
@@ -197,7 +225,13 @@ jobs:
             -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confold"
           sudo apt-get -y -o Acquire::Retries=5 upgrade
-          sudo apt-get install -y ccache patchelf build-essential
+          # Build deps for sdist fallbacks (no wheel for Python 3.14 yet):
+          #   cmake           — zxing-cpp Python wrapper requires CMake >= 3.18
+          #   build-essential — C/C++ compiler for zxing-cpp sdist
+          #   libjpeg-dev zlib1g-dev — Pillow REQUIRED deps (jpeg/png)
+          #   git             — pip may need it to fetch build backend deps
+          sudo apt-get install -y ccache patchelf build-essential \
+            cmake git libjpeg-dev zlib1g-dev
 
       - name: Install Python dependencies
         shell: bash
@@ -207,10 +241,15 @@ jobs:
           python -m pip install "Nuitka[app]" ordered-set zstandard
           # pyotp is pure Python, mandatory everywhere.
           python -m pip install pyotp
-          # zxing-cpp / Pillow / proxy.py are best-effort: wheels may not
-          # exist for x86/arm targets; the build continues without them.
-          python -m pip install zxing-cpp Pillow proxy.py \
-            || echo "::warning::optional deps (zxing-cpp/Pillow/proxy.py) failed on this arch — building without them"
+          # Each optional dependency in its OWN pip transaction: if one
+          # fails (no wheel, sdist build impossible), the others are still
+          # attempted and the build continues without the failed module.
+          python -m pip install zxing-cpp \
+            || echo "::warning::zxing-cpp failed on this arch — building without QR support"
+          python -m pip install Pillow \
+            || echo "::warning::Pillow failed on this arch — building without image support"
+          python -m pip install proxy.py \
+            || echo "::warning::proxy.py failed on this arch — building without proxy support"
 
       - name: Build with Nuitka
         shell: bash
@@ -274,15 +313,15 @@ jobs:
   # 2. Linux i386 (32-bit x86 Linux) — docker linux/386 on an x64 runner.
   #    i386 code executes natively on x86-64 CPUs (no emulation needed).
   #
-  #    NETWORKING: --network host does NOT fix the known GitHub-runner
-  #    container DNS failure (actions/runner#2036, runner-images#6013). The
-  #    host's /etc/resolv.conf points to systemd-resolved on 127.0.0.53,
-  #    which is unreachable/unusable from the container, so apt inside the
-  #    container gets "Temporary failure resolving 'deb.debian.org'" and
-  #    then "Unable to locate package ccache". The fix: default bridge
-  #    network + public DNS servers via --dns — Docker writes them directly
-  #    into the container's /etc/resolv.conf, bypassing the broken host
-  #    resolver. Plus Acquire::Retries and APT::Update::Error-Mode=any.
+  #    NETWORKING: user-defined bridge network "buildnet" — see the big
+  #    comment block at the top of this file. Neither --network host nor
+  #    --dns public servers work on these runners; a user-defined network
+  #    gives the container Docker's embedded DNS (127.0.0.11), which
+  #    forwards external queries through the daemon on the host — where the
+  #    resolver actually works.
+  #
+  #    i386 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
+  #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
   # ==========================================================================
   build-linux-i386:
     name: Build ${{ matrix.script }} (linux-i386)
@@ -322,11 +361,14 @@ jobs:
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
           # ---- NETWORK SANITY CHECK -------------------------------------
-          # Fail fast with a clear message if DNS is still broken, instead
-          # of confusing "Unable to locate package" errors from apt.
+          # Fail fast with a clear message and diagnostics if DNS is still
+          # broken, instead of confusing "Unable to locate package" errors.
           # getent exists here: the container is glibc-based Debian.
+          # If this check ever fails again, the embedded DNS (127.0.0.11)
+          # did not answer — see the NETWORKING notes at the top of the file.
           if ! getent hosts deb.debian.org >/dev/null 2>&1; then
             echo "ERROR: DNS is not working inside the container (cannot resolve deb.debian.org)" >&2
+            echo "--- /etc/resolv.conf ---" >&2
             cat /etc/resolv.conf >&2 || true
             exit 1
           fi
@@ -348,12 +390,21 @@ jobs:
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
           apt-get update -o APT::Update::Error-Mode=any
           apt-get "${APT_OPTS[@]}" upgrade
-          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential
+          # Build deps for sdist fallbacks (i386 has no prebuilt wheels):
+          #   cmake           — zxing-cpp Python wrapper requires CMake >= 3.18
+          #   build-essential — C/C++ compiler for zxing-cpp sdist
+          #   libjpeg-dev zlib1g-dev — Pillow REQUIRED deps (jpeg/png)
+          #   git             — pip may need it to fetch build backend deps
+          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential \
+            cmake git libjpeg-dev zlib1g-dev
           python -m pip install --upgrade pip
           python -m pip install "Nuitka[app]" ordered-set zstandard
           python -m pip install pyotp
-          python -m pip install zxing-cpp Pillow proxy.py \
-            || echo "optional deps failed on i386 — building without them"
+          # Each optional dependency in its OWN pip transaction: if one
+          # fails, the others are still attempted and the build continues.
+          pip install zxing-cpp || echo "optional dep zxing-cpp failed on i386 — building without it"
+          pip install Pillow     || echo "optional dep Pillow failed on i386 — building without it"
+          pip install proxy.py   || echo "optional dep proxy.py failed on i386 — building without it"
           INCLUDES=( --include-package=pyotp )
           python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
           python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
@@ -378,14 +429,15 @@ jobs:
 
       - name: Build in linux/386 container
         run: |
-          # NO --network host: it does not fix the container DNS failure on
-          # GitHub runners (proven by this workflow's own failed run). With
-          # the default bridge network plus explicit --dns servers, Docker
-          # writes 8.8.8.8/1.1.1.1 directly into the container's
-          # /etc/resolv.conf, and apt/pip resolve correctly.
+          # User-defined bridge network: the container gets Docker's
+          # embedded DNS (127.0.0.11); external queries are forwarded BY
+          # THE DAEMON ON THE HOST through the host's working resolver.
+          # (Neither --network host nor --dns 8.8.8.8/1.1.1.1 worked —
+          # verified by real failed runs of this very workflow.)
+          docker network create buildnet
           docker run --rm \
+            --network buildnet \
             --platform linux/386 \
-            --dns 8.8.8.8 --dns 1.1.1.1 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.14-trixie \
@@ -404,8 +456,10 @@ jobs:
   #    older Android with arm Termux). Runs on the FREE GitHub arm64 runner
   #    (ubuntu-26.04-arm): ARMv8 CPUs execute 32-bit ARMv7 code natively —
   #    no QEMU needed, the build is fast.
-  #    NETWORKING: same DNS fix as the i386 job (see notes there):
-  #    --dns 8.8.8.8 --dns 1.1.1.1 instead of --network host.
+  #    NETWORKING: user-defined bridge network "buildnet" — see the notes at
+  #    the top of the file and in the i386 job.
+  #    armv7 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
+  #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
   # ==========================================================================
   build-linux-armv7:
     name: Build ${{ matrix.script }} (linux-armv7)
@@ -445,11 +499,12 @@ jobs:
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
           # ---- NETWORK SANITY CHECK -------------------------------------
-          # Fail fast with a clear message if DNS is still broken, instead
-          # of confusing "Unable to locate package" errors from apt.
+          # Fail fast with a clear message and diagnostics if DNS is still
+          # broken, instead of confusing "Unable to locate package" errors.
           # getent exists here: the container is glibc-based Debian.
           if ! getent hosts deb.debian.org >/dev/null 2>&1; then
             echo "ERROR: DNS is not working inside the container (cannot resolve deb.debian.org)" >&2
+            echo "--- /etc/resolv.conf ---" >&2
             cat /etc/resolv.conf >&2 || true
             exit 1
           fi
@@ -469,12 +524,21 @@ jobs:
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
           apt-get update -o APT::Update::Error-Mode=any
           apt-get "${APT_OPTS[@]}" upgrade
-          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential
+          # Build deps for sdist fallbacks (armv7 has no prebuilt wheels):
+          #   cmake           — zxing-cpp Python wrapper requires CMake >= 3.18
+          #   build-essential — C/C++ compiler for zxing-cpp sdist
+          #   libjpeg-dev zlib1g-dev — Pillow REQUIRED deps (jpeg/png)
+          #   git             — pip may need it to fetch build backend deps
+          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential \
+            cmake git libjpeg-dev zlib1g-dev
           python -m pip install --upgrade pip
           python -m pip install "Nuitka[app]" ordered-set zstandard
           python -m pip install pyotp
-          python -m pip install zxing-cpp Pillow proxy.py \
-            || echo "optional deps failed on armv7 — building without them"
+          # Each optional dependency in its OWN pip transaction: if one
+          # fails, the others are still attempted and the build continues.
+          pip install zxing-cpp || echo "optional dep zxing-cpp failed on armv7 — building without it"
+          pip install Pillow     || echo "optional dep Pillow failed on armv7 — building without it"
+          pip install proxy.py   || echo "optional dep proxy.py failed on armv7 — building without it"
           INCLUDES=( --include-package=pyotp )
           python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
           python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
@@ -499,12 +563,13 @@ jobs:
 
       - name: Build in linux/arm/v7 container
         run: |
-          # NO --network host: it does not fix the container DNS failure on
-          # GitHub runners. Default bridge network + explicit --dns servers
-          # makes apt/pip resolve correctly inside the container.
+          # User-defined bridge network: the container gets Docker's
+          # embedded DNS (127.0.0.11); external queries are forwarded BY
+          # THE DAEMON ON THE HOST through the host's working resolver.
+          docker network create buildnet
           docker run --rm \
+            --network buildnet \
             --platform linux/arm/v7 \
-            --dns 8.8.8.8 --dns 1.1.1.1 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.14-trixie \
@@ -526,8 +591,8 @@ jobs:
   #    The aarch64 tag runs natively on the ARM runner, x86_64 on the x64
   #    runner (no emulation needed).
   #
-  #    NETWORKING: same DNS fix as the docker Linux jobs — explicit
-  #    --dns servers instead of --network host.
+  #    NETWORKING: user-defined bridge network "buildnet" — same DNS fix as
+  #    the docker Linux jobs (see the notes at the top of the file).
   #
   #    PACKAGE MANAGER: apt-get (NOT pkg) — pkg is a wrapper over the
   #    `apt` command, which ALWAYS prints "WARNING: apt does not have a
@@ -537,6 +602,14 @@ jobs:
   #    exist in Termux (bionic libc); DNS health is enforced instead by
   #    apt-get update -o APT::Update::Error-Mode=any, which fails hard
   #    when the repository indexes cannot be fetched.
+  #
+  #    ANDROID HAS NO PREBUILT WHEELS: zxing-cpp and Pillow are built from
+  #    sdist. The REQUIRED build prerequisites are (official docs):
+  #      - zxing-cpp: CMake >= 3.18 + C++ compiler (Termux: cmake + clang)
+  #      - Pillow:   clang make ndk-sysroot libjpeg-turbo
+  #        (zlib and libjpeg are REQUIRED by default — Pillow docs)
+  #    Without them pip failed with: "ERROR: Failed to build 'zxing-cpp'
+  #    when installing backend dependencies for zxing-cpp".
   #
   #    The build is experimental: continue-on-error — an Android job failure
   #    does not break the release of the other platforms.
@@ -629,19 +702,35 @@ jobs:
           apt-get update -o APT::Update::Error-Mode=any
           apt-get "${APT_OPTS[@]}" full-upgrade
 
-          # --- 3) Termux environment: the same packages recommended by the ---
-          #    Nuitka documentation for Android (fresh versions from the
-          #    updated repository).
+          # --- 3) Termux environment: the Nuitka-recommended packages PLUS ---
+          #    the sdist build prerequisites for zxing-cpp/Pillow
+          #    (Android has no prebuilt wheels; without these pip failed
+          #    with "ERROR: Failed to build 'zxing-cpp' when installing
+          #    backend dependencies for zxing-cpp"):
+          #      - cmake, ninja, clang, make — CMake >= 3.18 + C/C++ toolchain
+          #        required by the zxing-cpp Python wrapper (official
+          #        zxing-cpp docs)
+          #      - ndk-sysroot, libjpeg-turbo, zlib — REQUIRED by Pillow
+          #        (zlib and libjpeg are mandatory by default; official
+          #        Pillow "Building from source" docs list exactly:
+          #        python ndk-sysroot clang make libjpeg-turbo)
+          #      - patchelf ccache binutils ldd termux-elf-cleaner —
+          #        the Nuitka Android documentation set
           # IMPORTANT: pip in Termux is the python-pip package; upgrading it
           # on your own is FORBIDDEN (the "Installing pip is forbidden"
           # error), so there must be NO `pip install --upgrade pip` here.
           apt-get "${APT_OPTS[@]}" install \
-            python patchelf ccache binutils ldd termux-elf-cleaner
+            python patchelf ccache binutils ldd termux-elf-cleaner \
+            cmake ninja clang make ndk-sysroot libjpeg-turbo zlib
 
           pip install "Nuitka[app]" ordered-set zstandard
           pip install pyotp
-          pip install zxing-cpp Pillow proxy.py \
-            || echo "optional deps failed in Termux — building without them"
+          # Each optional dependency in its OWN pip transaction: if one
+          # fails to build from sdist, the others are still attempted and
+          # the build continues without the failed module.
+          pip install zxing-cpp || echo "optional dep zxing-cpp failed in Termux — building without it"
+          pip install Pillow     || echo "optional dep Pillow failed in Termux — building without it"
+          pip install proxy.py   || echo "optional dep proxy.py failed in Termux — building without it"
 
           INCLUDES=( --include-package=pyotp )
           python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
@@ -678,12 +767,14 @@ jobs:
       - name: Build in Termux container (${{ matrix.termux_tag }})
         timeout-minutes: 300
         run: |
-          # NO --network host: it does not fix the container DNS failure on
-          # GitHub runners (the host resolver on 127.0.0.53 is unusable
-          # from the container). Default bridge network + explicit --dns
-          # servers makes apt/pip resolve correctly inside the container.
+          # User-defined bridge network: the container gets Docker's
+          # embedded DNS (127.0.0.11); external queries are forwarded BY
+          # THE DAEMON ON THE HOST through the host's working resolver.
+          # (Neither --network host nor --dns public servers worked —
+          # verified by real failed runs of this very workflow.)
+          docker network create buildnet
           docker run --rm \
-            --dns 8.8.8.8 --dns 1.1.1.1 \
+            --network buildnet \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/host-src:ro \
             -v "$PWD/dist-host":/host-dist \
