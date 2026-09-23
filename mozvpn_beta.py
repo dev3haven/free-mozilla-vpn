@@ -6,6 +6,28 @@ mozvpn.py — Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 
 VERSION 2026-09-23 (v4.7.1) — startup duplicate-line fix + full re-audit:
 
+VERSION 2026-09-23 (v4.7.3) — fix: --no-save crashed at startup:
+
+  FIX 1) ValueError: invalid option name '--no-save' for BooleanOptionalAction.
+     Python's argparse REJECTS BooleanOptionalAction for options whose name
+     already starts with '--no-' (the class auto-generates the '--no-'
+     negative form itself, so the declared name must be the POSITIVE form).
+     --no-save is therefore declared as TWO plain arguments sharing the
+     args.no_save attribute: '--save' (store_false, env-aware default ON
+     = do not save) and '--no-save' (store_true, default=argparse.SUPPRESS
+     so an absent flag never overwrites the default). --local-proxy is fine
+     as BooleanOptionalAction ('--local-proxy' / '--no-local-proxy').
+     Behavior is unchanged: by default nothing is saved and local proxies
+     are served; '--save' re-enables the JSON file.
+
+VERSION 2026-09-23 (v4.7.2) — DEFAULT-ON --local-proxy and --no-save:
+
+  NEW 1) Both flags are now ON BY DEFAULT: starting the script without any
+     arguments serves local proxies AND does not write the result JSON.
+     They stay fully toggleable: --no-local-proxy / --save turn each default
+     off (argparse.BooleanOptionalAction, Python >= 3.9); env overrides:
+     MOZVPN_LOCAL_PROXY=0 / MOZVPN_NO_SAVE=0. No other behavior changed.
+
   FIX 1) "Console window background FORCED" was printed TWICE at startup:
      main() called set_color() (which forced the background and logged
      the message) and then set_theme() (which forced the SAME background
@@ -4603,6 +4625,16 @@ def reinstall_singbox(interactive=True) -> bool:
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Env-aware boolean default (v4.7.2): unset/empty env -> the given
+    default; a set env is checked with the truthy words 1/true/yes/on.
+    Used for the now-DEFAULT-ON flags: MOZVPN_LOCAL_PROXY=0 disables the
+    local proxies, MOZVPN_NO_SAVE=0 re-enables saving the result JSON."""
+    v = os.environ.get(name)
+    if v is None or not v.strip():
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
 def print_config_files():
     """req: log which config/cache files on the user's system this run uses
     (cached session, credentials, the Fastly WAF cookie, sing-box configs)."""
@@ -4727,9 +4759,11 @@ def main():
                          "saved silently, the code is printed for review). --no-qr-verify disables")
     ap.add_argument("--watch", action="store_true",
                     help="Continuously refresh proxyPass --refresh-margin seconds before expiry")
-    ap.add_argument("--local-proxy", action="store_true",
-                    default=_truthy_env("MOZVPN_LOCAL_PROXY"),
-                    help="Serve local HTTP proxies (engine: --local-proxy-engine). Env: MOZVPN_LOCAL_PROXY=1")
+    ap.add_argument("--local-proxy", action=argparse.BooleanOptionalAction,
+                    default=_env_flag("MOZVPN_LOCAL_PROXY", True),
+                    help="Serve local HTTP proxies (engine: --local-proxy-engine). "
+                         "ON by DEFAULT; --no-local-proxy disables. "
+                         "Env: MOZVPN_LOCAL_PROXY=0/1")
     ap.add_argument("--local-proxy-engine", dest="local_proxy_engine",
                     choices=["builtin", "singbox"],
                     default=os.environ.get("MOZVPN_PROXY_ENGINE", "builtin").strip().lower() or "builtin",
@@ -4790,7 +4824,27 @@ def main():
                     help="Include entries/nodes marked as locked")
     ap.add_argument("--json", metavar="FILE",
                     help="Path for the result JSON (default: next to the script)")
-    ap.add_argument("--no-save", action="store_true", help="Do not save the JSON file")
+    # v4.7.3: argparse.BooleanOptionalAction REJECTS option names that
+    # already start with "--no-" (ValueError: invalid option name), so
+    # --no-save cannot be a BooleanOptionalAction. Instead it is declared
+    # as two plain arguments writing the SAME args.no_save attribute:
+    #   --save     -> store_false -> no_save = False (re-enable saving)
+    #   --no-save  -> store_true  -> no_save = True  (the default state)
+    # default=argparse.SUPPRESS on --no-save means: when the flag is NOT
+    # given, argparse adds NO attribute at all, so the env-aware default
+    # of the first argument survives untouched (SUPPRESS semantics per the
+    # argparse docs: "no attribute to be added if the command-line
+    # argument was not present").
+    ap.add_argument("--save", dest="no_save", action="store_false",
+                    default=_env_flag("MOZVPN_NO_SAVE", True),
+                    help="Save the result JSON file (saving is OFF by default "
+                         "since v4.7.2; --save re-enables it). "
+                         "Env: MOZVPN_NO_SAVE=0/1")
+    ap.add_argument("--no-save", dest="no_save", action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="Do not save the result JSON file (default: ON since "
+                         "v4.7.2; given together with --save the LAST flag "
+                         "on the command line wins)")
     ap.add_argument("--relogin", action="store_true", help="Ignore the cached session")
     ap.add_argument("--clear-cache", action="store_true",
                     help="Remove the whole config directory (~/.config/mozvpn) with all "
