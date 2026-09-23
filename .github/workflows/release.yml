@@ -185,15 +185,18 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          # apt-get is the stable CLI for scripts (the `apt` command prints
-          # "WARNING: apt does not have a stable CLI interface" when used
-          # non-interactively; apt-get does NOT print it — apt-get is the
-          # recommended tool for scripts and automation). Dpkg::Options
-          # disable interactive conffile prompts. upgrade updates ALL runner
-          # image packages to the latest stable — a fresh toolchain (gcc, libc).
-          sudo apt-get update
-          sudo apt-get -y -o Dpkg::Options::="--force-confdef" \
-                      -o Dpkg::Options::="--force-confold" upgrade
+          # apt-get is the stable CLI for scripts (apt prints "WARNING: apt
+          # does not have a stable CLI interface" — apt-get does NOT).
+          # APT::Update::Error-Mode=any: apt-get update returns non-zero on
+          # ANY index fetch failure (by default it returns 0 even when all
+          # downloads failed, which used to hide network breakage).
+          # Acquire::Retries=5: automatic retries on transient network failures.
+          sudo apt-get update \
+            -o APT::Update::Error-Mode=any \
+            -o Acquire::Retries=5 \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold"
+          sudo apt-get -y -o Acquire::Retries=5 upgrade
           sudo apt-get install -y ccache patchelf build-essential
 
       - name: Install Python dependencies
@@ -270,6 +273,16 @@ jobs:
   # ==========================================================================
   # 2. Linux i386 (32-bit x86 Linux) — docker linux/386 on an x64 runner.
   #    i386 code executes natively on x86-64 CPUs (no emulation needed).
+  #
+  #    NETWORKING: --network host does NOT fix the known GitHub-runner
+  #    container DNS failure (actions/runner#2036, runner-images#6013). The
+  #    host's /etc/resolv.conf points to systemd-resolved on 127.0.0.53,
+  #    which is unreachable/unusable from the container, so apt inside the
+  #    container gets "Temporary failure resolving 'deb.debian.org'" and
+  #    then "Unable to locate package ccache". The fix: default bridge
+  #    network + public DNS servers via --dns — Docker writes them directly
+  #    into the container's /etc/resolv.conf, bypassing the broken host
+  #    resolver. Plus Acquire::Retries and APT::Update::Error-Mode=any.
   # ==========================================================================
   build-linux-i386:
     name: Build ${{ matrix.script }} (linux-i386)
@@ -308,18 +321,32 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
+          # ---- NETWORK SANITY CHECK -------------------------------------
+          # Fail fast with a clear message if DNS is still broken, instead
+          # of confusing "Unable to locate package" errors from apt.
+          # getent exists here: the container is glibc-based Debian.
+          if ! getent hosts deb.debian.org >/dev/null 2>&1; then
+            echo "ERROR: DNS is not working inside the container (cannot resolve deb.debian.org)" >&2
+            cat /etc/resolv.conf >&2 || true
+            exit 1
+          fi
+          # ---- PACKAGE INSTALLATION -------------------------------------
           # apt-get is the stable CLI for scripts: the `apt` command prints
           # "WARNING: apt does not have a stable CLI interface. Use with
-          # caution in scripts." when used non-interactively, because apt is
-          # intended for interactive terminal use; apt-get does NOT print
-          # this warning and is the officially recommended tool for scripts,
-          # Dockerfiles and CI pipelines. Dpkg::Options disable interactive
-          # conffile prompts, --no-install-recommends avoids pulling extra
-          # packages. apt-get upgrade updates ALL base image packages to the
-          # latest stable (Debian security/point-updates).
+          # caution in scripts." when used non-interactively; apt-get does
+          # NOT print this warning and is the officially recommended tool
+          # for scripts, Dockerfiles and CI pipelines.
+          # APT::Update::Error-Mode=any: apt-get update fails hard on any
+          # index fetch error (default: exit 0 even if ALL downloads fail —
+          # that is how index loss went unnoticed before).
+          # Acquire::Retries=5: retry transient fetch failures (a known
+          # GitHub-runner/docker-bridge NAT hiccup).
+          # Dpkg::Options disable interactive conffile prompts,
+          # --no-install-recommends avoids pulling extra packages.
           APT_OPTS=(-y --no-install-recommends \
+            -o Acquire::Retries=5 \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
-          apt-get update
+          apt-get update -o APT::Update::Error-Mode=any
           apt-get "${APT_OPTS[@]}" upgrade
           apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential
           python -m pip install --upgrade pip
@@ -351,14 +378,14 @@ jobs:
 
       - name: Build in linux/386 container
         run: |
-          # --network host: a known issue on GitHub runners is that
-          # containers sometimes cannot resolve DNS (actions/runner#2036,
-          # runner-images#6013: "Temporary failure resolving 'deb.debian.org'").
-          # Host networking makes the container use the runner's network
-          # stack and DNS directly; volume mounts are unaffected by it.
+          # NO --network host: it does not fix the container DNS failure on
+          # GitHub runners (proven by this workflow's own failed run). With
+          # the default bridge network plus explicit --dns servers, Docker
+          # writes 8.8.8.8/1.1.1.1 directly into the container's
+          # /etc/resolv.conf, and apt/pip resolve correctly.
           docker run --rm \
-            --network host \
             --platform linux/386 \
+            --dns 8.8.8.8 --dns 1.1.1.1 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.14-trixie \
@@ -377,6 +404,8 @@ jobs:
   #    older Android with arm Termux). Runs on the FREE GitHub arm64 runner
   #    (ubuntu-26.04-arm): ARMv8 CPUs execute 32-bit ARMv7 code natively —
   #    no QEMU needed, the build is fast.
+  #    NETWORKING: same DNS fix as the i386 job (see notes there):
+  #    --dns 8.8.8.8 --dns 1.1.1.1 instead of --network host.
   # ==========================================================================
   build-linux-armv7:
     name: Build ${{ matrix.script }} (linux-armv7)
@@ -415,18 +444,30 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
+          # ---- NETWORK SANITY CHECK -------------------------------------
+          # Fail fast with a clear message if DNS is still broken, instead
+          # of confusing "Unable to locate package" errors from apt.
+          # getent exists here: the container is glibc-based Debian.
+          if ! getent hosts deb.debian.org >/dev/null 2>&1; then
+            echo "ERROR: DNS is not working inside the container (cannot resolve deb.debian.org)" >&2
+            cat /etc/resolv.conf >&2 || true
+            exit 1
+          fi
+          # ---- PACKAGE INSTALLATION -------------------------------------
           # apt-get is the stable CLI for scripts: the `apt` command prints
           # "WARNING: apt does not have a stable CLI interface. Use with
-          # caution in scripts." when used non-interactively, because apt is
-          # intended for interactive terminal use; apt-get does NOT print
-          # this warning and is the officially recommended tool for scripts,
-          # Dockerfiles and CI pipelines. Dpkg::Options disable interactive
-          # conffile prompts, --no-install-recommends avoids pulling extra
-          # packages. apt-get upgrade updates ALL base image packages to the
-          # latest stable (Debian security/point-updates).
+          # caution in scripts." when used non-interactively; apt-get does
+          # NOT print this warning and is the officially recommended tool
+          # for scripts, Dockerfiles and CI pipelines.
+          # APT::Update::Error-Mode=any: apt-get update fails hard on any
+          # index fetch error (default: exit 0 even if ALL downloads fail).
+          # Acquire::Retries=5: retry transient fetch failures.
+          # Dpkg::Options disable interactive conffile prompts,
+          # --no-install-recommends avoids pulling extra packages.
           APT_OPTS=(-y --no-install-recommends \
+            -o Acquire::Retries=5 \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
-          apt-get update
+          apt-get update -o APT::Update::Error-Mode=any
           apt-get "${APT_OPTS[@]}" upgrade
           apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential
           python -m pip install --upgrade pip
@@ -458,14 +499,12 @@ jobs:
 
       - name: Build in linux/arm/v7 container
         run: |
-          # --network host: a known issue on GitHub runners is that
-          # containers sometimes cannot resolve DNS (actions/runner#2036,
-          # runner-images#6013: "Temporary failure resolving 'deb.debian.org'").
-          # Host networking makes the container use the runner's network
-          # stack and DNS directly; volume mounts are unaffected by it.
+          # NO --network host: it does not fix the container DNS failure on
+          # GitHub runners. Default bridge network + explicit --dns servers
+          # makes apt/pip resolve correctly inside the container.
           docker run --rm \
-            --network host \
             --platform linux/arm/v7 \
+            --dns 8.8.8.8 --dns 1.1.1.1 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
             python:3.14-trixie \
@@ -481,13 +520,24 @@ jobs:
 
   # ==========================================================================
   # 4. Android (Termux / bionic) — Nuitka officially supports Android via
-  #    Termux (user manual: "pkg install patchelf ccache binutils ldd
-  #    termux-elf-cleaner"). We build inside the official
-  #    termux/termux-docker image — the same package set as on a real
-  #    device, so the binary also works in Termux on Android, including
-  #    Android-x86 (the x86_64 tag).
+  #    Termux. We build inside the official termux/termux-docker image —
+  #    the same package set as on a real device, so the binary also works
+  #    in Termux on Android, including Android-x86 (the x86_64 tag).
   #    The aarch64 tag runs natively on the ARM runner, x86_64 on the x64
   #    runner (no emulation needed).
+  #
+  #    NETWORKING: same DNS fix as the docker Linux jobs — explicit
+  #    --dns servers instead of --network host.
+  #
+  #    PACKAGE MANAGER: apt-get (NOT pkg) — pkg is a wrapper over the
+  #    `apt` command, which ALWAYS prints "WARNING: apt does not have a
+  #    stable CLI interface. Use with caution in scripts." when run
+  #    non-interactively; apt-get prints no warning (stable CLI for
+  #    scripts). NO getent here — getent is a glibc tool and does NOT
+  #    exist in Termux (bionic libc); DNS health is enforced instead by
+  #    apt-get update -o APT::Update::Error-Mode=any, which fails hard
+  #    when the repository indexes cannot be fetched.
+  #
   #    The build is experimental: continue-on-error — an Android job failure
   #    does not break the release of the other platforms.
   # ==========================================================================
@@ -555,13 +605,19 @@ jobs:
           # (apt is designed for interactive terminal use; there is no flag
           # to suppress the warning). The stable, script-safe CLI is
           # `apt-get`, which exists in Termux and prints NO warning.
-          # Therefore, in CI we call apt-get directly:
           #   - `pkg upgrade` == `apt update && apt full-upgrade`, so we
           #     explicitly run `apt-get update` + `apt-get full-upgrade` —
           #     the pkg wrapper only automates these two calls (plus mirror
           #     selection, which is already baked into the image).
-          # The Dpkg::Options flags disable interactive conffile prompts.
+          # Dpkg::Options disable interactive conffile prompts.
+          # Acquire::Retries=5: retry transient fetch failures.
+          # APT::Update::Error-Mode=any: apt-get update returns non-zero on
+          # ANY index fetch failure — this is the DNS health check here
+          # (getent is NOT available in Termux: bionic libc, not glibc), so
+          # a broken resolver fails immediately with a clear apt error
+          # instead of "Unable to locate package" later.
           APT_OPTS=(-y \
+            -o Acquire::Retries=5 \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
           # --- 2) FULL UPGRADE TO THE LATEST STABLE VERSIONS -----------------
@@ -570,7 +626,7 @@ jobs:
           # explicitly). apt-get full-upgrade updates ALL installed image
           # packages to their latest stable versions (the direct equivalent
           # of `pkg upgrade`).
-          apt-get update
+          apt-get update -o APT::Update::Error-Mode=any
           apt-get "${APT_OPTS[@]}" full-upgrade
 
           # --- 3) Termux environment: the same packages recommended by the ---
@@ -622,12 +678,12 @@ jobs:
       - name: Build in Termux container (${{ matrix.termux_tag }})
         timeout-minutes: 300
         run: |
-          # --network host: prevents the known GitHub-runner container DNS
-          # failure (actions/runner#2036: "Temporary failure resolving ...").
-          # Host networking uses the runner's network stack and DNS directly;
-          # volume mounts are unaffected by it.
+          # NO --network host: it does not fix the container DNS failure on
+          # GitHub runners (the host resolver on 127.0.0.53 is unusable
+          # from the container). Default bridge network + explicit --dns
+          # servers makes apt/pip resolve correctly inside the container.
           docker run --rm \
-            --network host \
+            --dns 8.8.8.8 --dns 1.1.1.1 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/host-src:ro \
             -v "$PWD/dist-host":/host-dist \
