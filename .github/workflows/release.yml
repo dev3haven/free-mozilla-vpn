@@ -29,23 +29,29 @@
 #   - armv9  (ARMv9-A tuning): a specialized build that does not run on
 #     armv8 devices; the universal linux-arm64 build remains.
 #
-# DOCKER NETWORKING (the fix for "Temporary failure resolving
-# 'deb.debian.org'" / "Unable to locate package ccache" on GitHub runners):
-#   Neither --network host NOR --dns 8.8.8.8 works on these runners:
-#   - --network host: container inherits the host resolv.conf with
-#     systemd-resolved on 127.0.0.53, unreachable/unusable from the container
-#     namespace (actions/runner#2036, runner-images#6013).
-#   - default bridge + --dns: the container's resolv.conf IS correctly set to
-#     8.8.8.8/1.1.1.1 (verified in a real failed run log), but direct UDP
-#     egress from the default bridge to external resolvers is blocked —
-#     resolution still fails.
-#   THE FIX: a user-defined bridge network (docker network create buildnet).
-#   On user-defined networks Docker runs its EMBEDDED DNS server
-#   (127.0.0.11) inside the container, and external queries are forwarded
-#   BY THE DAEMON ON THE HOST — i.e. through the host's own working resolver
-#   — bypassing both the unreachable 127.0.0.53 and the blocked direct
-#   egress. On the default bridge there is NO embedded DNS server, which is
-#   exactly why it kept failing.
+# DOCKER NETWORKING — THE ROOT CAUSE AND THE REAL FIX.
+# Failed attempts (all proven by real failed runs of this workflow):
+#   1) --network host:
+#      container inherits the host resolv.conf -> systemd-resolved stub on
+#      127.0.0.53, which is the CONTAINER'S OWN loopback inside the
+#      namespace -> no resolver there -> "Temporary failure resolving".
+#   2) default bridge + --dns 8.8.8.8 --dns 1.1.1.1:
+#      resolv.conf inside the container IS correct, but direct UDP egress
+#      from the runner's docker bridge to external resolvers is blocked
+#      (Azure/GitHub runner network policy) -> resolution still fails.
+#   3) user-defined bridge (embedded DNS 127.0.0.11):
+#      the embedded DNS starts, but its upstream is the host's loopback
+#      resolver: the container log literally showed
+#      "# ExtServers: [host(127.0.0.53)]" -> loopback is unreachable from
+#      the bridge namespace -> fails again.
+# THE FIX (documented pattern for systemd-resolved + Docker):
+#   make the HOST's systemd-resolved also listen on the docker0 gateway IP
+#   (172.17.0.1) via DNSStubListenerExtra=172.17.0.1, restart it, and give
+#   the containers --dns 172.17.0.1. 172.17.0.1 is the HOST's address on the
+#   docker0 bridge — routable from every container — and systemd-resolved
+#   answers there, resolving via the runner's own working upstream servers.
+#   Each docker job therefore has a "Fix container DNS (host resolver on
+#   docker0)" step + a pre-flight DNS check BEFORE the long build.
 #
 # IMPORTANT about dependencies: for "exotic" targets (x86 win32, armv7, i386,
 # Android), prebuilt wheels of zxing-cpp / Pillow may not exist — pip then
@@ -313,12 +319,10 @@ jobs:
   # 2. Linux i386 (32-bit x86 Linux) — docker linux/386 on an x64 runner.
   #    i386 code executes natively on x86-64 CPUs (no emulation needed).
   #
-  #    NETWORKING: user-defined bridge network "buildnet" — see the big
-  #    comment block at the top of this file. Neither --network host nor
-  #    --dns public servers work on these runners; a user-defined network
-  #    gives the container Docker's embedded DNS (127.0.0.11), which
-  #    forwards external queries through the daemon on the host — where the
-  #    resolver actually works.
+  #    NETWORKING: see the DOCKER NETWORKING block at the top of this file.
+  #    The host's systemd-resolved is exposed on the docker0 gateway
+  #    (172.17.0.1) and the container uses --dns 172.17.0.1.
+  #    A pre-flight check verifies DNS BEFORE the long build starts.
   #
   #    i386 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
   #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
@@ -353,6 +357,36 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.artifact_name }}-
 
+      - name: Fix container DNS (host resolver on docker0)
+        run: |
+          set -euo pipefail
+          # Make the HOST's systemd-resolved listen on the docker0 gateway
+          # IP as well. 172.17.0.1 is the host's own address on the docker0
+          # bridge — routable from every container on the default bridge —
+          # while the usual stub on 127.0.0.53 is loopback-only and is
+          # unreachable from a container's network namespace (the root cause
+          # of all previous "Temporary failure resolving" errors).
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
+            | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf
+          sudo systemctl restart systemd-resolved
+
+          # Pre-flight: verify containers can actually resolve BEFORE the
+          # long build. Retry a few times — resolved needs a moment to
+          # bind the new listener.
+          for i in 1 2 3 4 5; do
+            if docker run --rm --dns 172.17.0.1 \
+                 python:3.14-trixie \
+                 getent hosts deb.debian.org; then
+              echo "Container DNS OK"
+              exit 0
+            fi
+            echo "Pre-flight DNS check failed (attempt $i/5), retrying in 5s..."
+            sleep 5
+          done
+          echo "ERROR: containers still cannot resolve DNS" >&2
+          exit 1
+
       - name: Prepare container build script
         run: |
           cat > ci-build-in-docker.sh <<'EOS'
@@ -360,18 +394,6 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
-          # ---- NETWORK SANITY CHECK -------------------------------------
-          # Fail fast with a clear message and diagnostics if DNS is still
-          # broken, instead of confusing "Unable to locate package" errors.
-          # getent exists here: the container is glibc-based Debian.
-          # If this check ever fails again, the embedded DNS (127.0.0.11)
-          # did not answer — see the NETWORKING notes at the top of the file.
-          if ! getent hosts deb.debian.org >/dev/null 2>&1; then
-            echo "ERROR: DNS is not working inside the container (cannot resolve deb.debian.org)" >&2
-            echo "--- /etc/resolv.conf ---" >&2
-            cat /etc/resolv.conf >&2 || true
-            exit 1
-          fi
           # ---- PACKAGE INSTALLATION -------------------------------------
           # apt-get is the stable CLI for scripts: the `apt` command prints
           # "WARNING: apt does not have a stable CLI interface. Use with
@@ -381,8 +403,7 @@ jobs:
           # APT::Update::Error-Mode=any: apt-get update fails hard on any
           # index fetch error (default: exit 0 even if ALL downloads fail —
           # that is how index loss went unnoticed before).
-          # Acquire::Retries=5: retry transient fetch failures (a known
-          # GitHub-runner/docker-bridge NAT hiccup).
+          # Acquire::Retries=5: retry transient fetch failures.
           # Dpkg::Options disable interactive conffile prompts,
           # --no-install-recommends avoids pulling extra packages.
           APT_OPTS=(-y --no-install-recommends \
@@ -429,14 +450,12 @@ jobs:
 
       - name: Build in linux/386 container
         run: |
-          # User-defined bridge network: the container gets Docker's
-          # embedded DNS (127.0.0.11); external queries are forwarded BY
-          # THE DAEMON ON THE HOST through the host's working resolver.
-          # (Neither --network host nor --dns 8.8.8.8/1.1.1.1 worked —
-          # verified by real failed runs of this very workflow.)
-          docker network create buildnet
+          # --dns 172.17.0.1: the host's systemd-resolved, exposed on the
+          # docker0 gateway (see the "Fix container DNS" step). Directly
+          # routable from the container; resolves via the runner's own
+          # working upstream resolvers.
           docker run --rm \
-            --network buildnet \
+            --dns 172.17.0.1 \
             --platform linux/386 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
@@ -456,8 +475,8 @@ jobs:
   #    older Android with arm Termux). Runs on the FREE GitHub arm64 runner
   #    (ubuntu-26.04-arm): ARMv8 CPUs execute 32-bit ARMv7 code natively —
   #    no QEMU needed, the build is fast.
-  #    NETWORKING: user-defined bridge network "buildnet" — see the notes at
-  #    the top of the file and in the i386 job.
+  #    NETWORKING: same DNS fix as the i386 job — host systemd-resolved
+  #    exposed on the docker0 gateway (172.17.0.1), container --dns 172.17.0.1.
   #    armv7 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
   #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
   # ==========================================================================
@@ -491,6 +510,32 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.artifact_name }}-
 
+      - name: Fix container DNS (host resolver on docker0)
+        run: |
+          set -euo pipefail
+          # Same fix as the i386 job: expose the host's systemd-resolved on
+          # the docker0 gateway so containers can reach it (the loopback
+          # stub 127.0.0.53 is unreachable from a container namespace).
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
+            | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf
+          sudo systemctl restart systemd-resolved
+
+          # Pre-flight DNS check (with retries) BEFORE the long build.
+          for i in 1 2 3 4 5; do
+            if docker run --rm --dns 172.17.0.1 \
+                 --platform linux/arm/v7 \
+                 python:3.14-trixie \
+                 getent hosts deb.debian.org; then
+              echo "Container DNS OK"
+              exit 0
+            fi
+            echo "Pre-flight DNS check failed (attempt $i/5), retrying in 5s..."
+            sleep 5
+          done
+          echo "ERROR: containers still cannot resolve DNS" >&2
+          exit 1
+
       - name: Prepare container build script
         run: |
           cat > ci-build-in-docker.sh <<'EOS'
@@ -498,16 +543,6 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
-          # ---- NETWORK SANITY CHECK -------------------------------------
-          # Fail fast with a clear message and diagnostics if DNS is still
-          # broken, instead of confusing "Unable to locate package" errors.
-          # getent exists here: the container is glibc-based Debian.
-          if ! getent hosts deb.debian.org >/dev/null 2>&1; then
-            echo "ERROR: DNS is not working inside the container (cannot resolve deb.debian.org)" >&2
-            echo "--- /etc/resolv.conf ---" >&2
-            cat /etc/resolv.conf >&2 || true
-            exit 1
-          fi
           # ---- PACKAGE INSTALLATION -------------------------------------
           # apt-get is the stable CLI for scripts: the `apt` command prints
           # "WARNING: apt does not have a stable CLI interface. Use with
@@ -563,12 +598,10 @@ jobs:
 
       - name: Build in linux/arm/v7 container
         run: |
-          # User-defined bridge network: the container gets Docker's
-          # embedded DNS (127.0.0.11); external queries are forwarded BY
-          # THE DAEMON ON THE HOST through the host's working resolver.
-          docker network create buildnet
+          # --dns 172.17.0.1: the host's systemd-resolved, exposed on the
+          # docker0 gateway (see the "Fix container DNS" step).
           docker run --rm \
-            --network buildnet \
+            --dns 172.17.0.1 \
             --platform linux/arm/v7 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
@@ -591,16 +624,17 @@ jobs:
   #    The aarch64 tag runs natively on the ARM runner, x86_64 on the x64
   #    runner (no emulation needed).
   #
-  #    NETWORKING: user-defined bridge network "buildnet" — same DNS fix as
-  #    the docker Linux jobs (see the notes at the top of the file).
+  #    NETWORKING: same DNS fix as the docker Linux jobs — host
+  #    systemd-resolved exposed on the docker0 gateway (172.17.0.1),
+  #    container --dns 172.17.0.1, pre-flight check before the build.
   #
   #    PACKAGE MANAGER: apt-get (NOT pkg) — pkg is a wrapper over the
   #    `apt` command, which ALWAYS prints "WARNING: apt does not have a
   #    stable CLI interface. Use with caution in scripts." when run
   #    non-interactively; apt-get prints no warning (stable CLI for
-  #    scripts). NO getent here — getent is a glibc tool and does NOT
-  #    exist in Termux (bionic libc); DNS health is enforced instead by
-  #    apt-get update -o APT::Update::Error-Mode=any, which fails hard
+  #    scripts). NO getent in the pre-flight here — getent is a glibc tool
+  #    and does NOT exist in Termux (bionic libc); DNS health is enforced
+  #    by apt-get update -o APT::Update::Error-Mode=any, which fails hard
   #    when the repository indexes cannot be fetched.
   #
   #    ANDROID HAS NO PREBUILT WHEELS: zxing-cpp and Pillow are built from
@@ -662,6 +696,35 @@ jobs:
           key: ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-${{ github.sha }}
           restore-keys: |
             ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-
+
+      - name: Fix container DNS (host resolver on docker0)
+        run: |
+          set -euo pipefail
+          # Same fix as the docker Linux jobs: expose the host's
+          # systemd-resolved on the docker0 gateway so containers can
+          # reach it (the loopback stub 127.0.0.53 is unreachable from a
+          # container namespace).
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
+            | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf
+          sudo systemctl restart systemd-resolved
+
+          # Pre-flight DNS check (with retries) BEFORE the long build.
+          # Termux has no getent (bionic, not glibc), so we test with a
+          # Debian container on the same runner instead — the DNS path is
+          # identical for all containers on the default bridge.
+          for i in 1 2 3 4 5; do
+            if docker run --rm --dns 172.17.0.1 \
+                 python:3.14-trixie \
+                 getent hosts deb.debian.org; then
+              echo "Container DNS OK"
+              exit 0
+            fi
+            echo "Pre-flight DNS check failed (attempt $i/5), retrying in 5s..."
+            sleep 5
+          done
+          echo "ERROR: containers still cannot resolve DNS" >&2
+          exit 1
 
       - name: Prepare Termux build script
         run: |
@@ -764,17 +827,13 @@ jobs:
           mkdir -p dist-host
           chmod 777 dist-host
 
-      - name: Build in Termux container (${{ matrix.termux_tag }})
+      - name: Build in Termux container (${ matrix.termux_tag }})
         timeout-minutes: 300
         run: |
-          # User-defined bridge network: the container gets Docker's
-          # embedded DNS (127.0.0.11); external queries are forwarded BY
-          # THE DAEMON ON THE HOST through the host's working resolver.
-          # (Neither --network host nor --dns public servers worked —
-          # verified by real failed runs of this very workflow.)
-          docker network create buildnet
+          # --dns 172.17.0.1: the host's systemd-resolved, exposed on the
+          # docker0 gateway (see the "Fix container DNS" step).
           docker run --rm \
-            --network buildnet \
+            --dns 172.17.0.1 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/host-src:ro \
             -v "$PWD/dist-host":/host-dist \
