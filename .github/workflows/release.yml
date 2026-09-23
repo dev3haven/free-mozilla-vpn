@@ -154,12 +154,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Кэш ccache между запусками (только Linux: там ccache в PATH)
       - name: Cache ccache
         if: runner.os == 'Linux'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ccache
           key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.script }}-${{ github.sha }}
@@ -167,9 +167,9 @@ jobs:
             ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.script }}-
 
       - name: Set up Python (${{ matrix.py_arch }})
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: '3.14'
           architecture: ${{ matrix.py_arch }}
 
       - name: Install system dependencies (Linux)
@@ -241,7 +241,7 @@ jobs:
             "$SCRIPT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
@@ -270,12 +270,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Кэш ccache между запусками: каталог монтируется в контейнер
       # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
       - name: Cache ccache (container)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
@@ -323,11 +323,11 @@ jobs:
             --platform linux/386 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
-            python:3.12-bookworm \
+            python:3.14-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
@@ -358,12 +358,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Кэш ccache между запусками: каталог монтируется в контейнер
       # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
       - name: Cache ccache (container)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
@@ -411,11 +411,11 @@ jobs:
             --platform linux/arm/v7 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
-            python:3.12-bookworm \
+            python:3.14-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
@@ -423,7 +423,12 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # 3a. Linux armv5 (самые старые ARM: ARM9/ARM10, armv5te). Официальный
+  # 3a. Linux armv5 (самые старые ARM: ARM9/ARM10, armv5te). ВАЖНО: теги
+  #     python:*-bookworm НЕ публикуются для linux/arm/v5 (только amd64,
+  #     arm32v7, arm64v8, i386, ppc64le — официальный манифест
+  #     docker-library/official-images), поэтому используется тег
+  #     python:3.12-TRIXIE (и новее — сейчас python:3.14-trixie) — эти теги
+  #     публикуются с arm32v5. Официальный
   #     python-образ поддерживает arm32v5. armv5-код исполняется нативно на
   #     ARM64-раннере по цепочке обратной совместимости (armv5 -> armv6 ->
   #     armv7 -> armv8 AArch32). Цель МАКСИМАЛЬНО экспериментальная:
@@ -449,12 +454,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Кэш ccache между запусками: каталог монтируется в контейнер
       # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
       - name: Cache ccache (container)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
@@ -502,11 +507,11 @@ jobs:
             --platform linux/arm/v5 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
-            python:3.12-bookworm \
+            python:3.14-trixie \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
@@ -514,20 +519,25 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # 3b. Linux armv6 (ARM11: Raspberry Pi 1/Zero/Zero W, старые роутеры и
-  #     встраиваемые платы). НЕ совместим с armv7-кодом (armv6 = VFPv2 без
-  #     NEON; armv7-бинарник на нём НЕ работает, совместимость только в
-  #     обратную сторону), поэтому отдельная сборка обязательна для
-  #     максимального охвата старых устройств. Официальный python-образ
-  #     поддерживает arm32v6. Контейнер исполняется нативно на ARM64-раннере:
-  #     ARMv8 AArch32 полностью обратно совместим с ARMv7, а ARMv7 — с
-  #     ARMv6 (по цепочке совместимости armv6-код работает на новых ядрах).
+  # 3b. Linux armv6 (ARM11: Raspberry Pi 1/Zero/Zero W, старые роутеры).
+  #     ВАЖНО (проверено по манифесту docker-library/official-images): в
+  #     Debian-тегах python-образов arm32v6 НЕ существует ВООБЩЕ (bookworm/
+  #     trixie: только amd64/arm32v5/arm32v7/arm64v8/i386/...); arm32v6 есть
+  #     только в alpine-тегах — но musl-бинарник НЕ запускается на Raspbian
+  #     (glibc). Поэтому единственный корректный путь в официальном образном
+  #     экосистеме: запустить arm32v7-bookworm-контейнер (нативно на ARM64-
+  #     раннере) и собрать CPython 3.14 ИЗ ИСХОДНИКОВ с флагами
+  #     -march=armv6 -mfpu=vfp -mfloat-abi=hard (hard-float, как Raspbian),
+  #     а затем и вывод Nuitka компилировать теми же флагами (gcc-обёртка).
+  #     Результат — НАСТОЯЩИЙ armv6 glibc-бинарник для RPi1/Zero.
+  #     Сборка CPython кэшируется между запусками (actions/cache), поэтому
+  #     дорого она стоит только при смене версии Python.
   # ==========================================================================
   build-linux-armv6:
     name: Build ${{ matrix.script }} (linux-armv6)
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
-    timeout-minutes: 120
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -542,17 +552,19 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      # Кэш ccache между запусками: каталог монтируется в контейнер
-      # (CCACHE_DIR=/ccache), поэтому объектные файлы переживают перезапуски.
-      - name: Cache ccache (container)
-        uses: actions/cache@v4
+      # Кэш ccache + собранного armv6-CPython между запусками
+      - name: Cache ccache and armv6 CPython (container)
+        uses: actions/cache@v6
         with:
-          path: .ccache
-          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
+          path: |
+            .ccache
+            .cpython-armv6
+          key: armv6-cpython314-ccache-${{ matrix.script }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ matrix.artifact_name }}-
+            armv6-cpython314-ccache-${{ matrix.script }}-
+            armv6-cpython314-ccache-
 
       - name: Prepare container build script
         run: |
@@ -560,18 +572,55 @@ jobs:
           set -euo pipefail
           SCRIPT="$1"
           ARTIFACT="$2"
+          PYVER="3.14.7"
+          PREFIX="/opt/py-armv6"
+
           apt-get update
-          apt-get install -y ccache patchelf build-essential
-          python -m pip install --upgrade pip
-          python -m pip install "Nuitka[app]" ordered-set zstandard
-          python -m pip install pyotp
-          python -m pip install zxing-cpp Pillow proxy.py \
+          apt-get install -y ccache patchelf build-essential curl xz-utils
+
+          # --- 1) CPython из исходников с armv6-флагами (если нет в кэше) ---
+          if [ ! -x "$PREFIX/bin/python3" ]; then
+            cd /tmp
+            curl -fsSLO "https://www.python.org/ftp/python/$PYVER/Python-$PYVER.tar.xz"
+            tar xf "Python-$PYVER.tar.xz"
+            cd "Python-$PYVER"
+            # armv6 hard-float (ARM1176 = armv6zk + VFPv2) — как Raspbian armhf
+            CFLAGS="-march=armv6 -mfpu=vfp -mfloat-abi=hard -O3" \
+            ./configure --prefix="$PREFIX" --disable-test-modules
+            make -j"$(nproc)"
+            make install
+          fi
+          PY="$PREFIX/bin/python3"
+
+          # --- 2) gcc-обёртка: ВСЁ (CPython-зависимости уже собраны, теперь
+          #        C-код Nuitka и onefile-бутстрап) компилируется armv6-флагами.
+          #        SCons Nuitka не пробрасывает внешнее окружение, поэтому
+          #        обёртка ставится первой в PATH. ---
+          mkdir -p /tmp/gcc-armv6
+          for c in gcc g++ cc c++; do
+            p="$(command -v "$c")"
+            [ -n "$p" ] || continue
+            cat > "/tmp/gcc-armv6/$c" <<EOF
+          #!/bin/bash
+          exec $p "\$@" -march=armv6 -mfpu=vfp -mfloat-abi=hard -O3
+          EOF
+            chmod +x "/tmp/gcc-armv6/$c"
+          done
+          export PATH="/tmp/gcc-armv6:$PATH"
+
+          # --- 3) Зависимости и сборка Nuitka (armv6-Python) ---
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install "Nuitka[app]" ordered-set zstandard
+          "$PY" -m pip install pyotp
+          "$PY" -m pip install zxing-cpp Pillow proxy.py \
             || echo "optional deps failed on armv6 — building without them"
+
           INCLUDES=( --include-package=pyotp )
-          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
-          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
-          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
-          python -m nuitka \
+          "$PY" -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          "$PY" -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          "$PY" -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+
+          "$PY" -m nuitka \
             --onefile \
             --output-dir=dist \
             --remove-output \
@@ -586,20 +635,36 @@ jobs:
             "${INCLUDES[@]}" \
             --output-filename="$ARTIFACT" \
             "$SCRIPT"
+
+          # Сохраняем собранный armv6-CPython в кэшируемый каталог (/src = $PWD)
+          if [ ! -x /src/.cpython-armv6/bin/python3 ]; then
+            mkdir -p /src/.cpython-armv6
+            cp -a "$PREFIX/." /src/.cpython-armv6/ || true
+          fi
           EOS
           chmod +x ci-build-in-docker.sh
 
-      - name: Build in linux/arm/v6 container
+      - name: Build in linux/arm/v7 container (armv6 codegen)
         run: |
+          set -euo pipefail
+          mkdir -p .ccache .cpython-armv6
+          # armv6-CPython из кэша подмонтируем как префикс, если он есть
+          MOUNT_CPYTHON=""
+          if [ -x .cpython-armv6/bin/python3 ]; then
+            mkdir -p cpython-mount
+            cp -a .cpython-armv6 cpython-mount/py-armv6
+            MOUNT_CPYTHON="-v $PWD/cpython-mount/py-armv6:/opt/py-armv6"
+          fi
           docker run --rm \
-            --platform linux/arm/v6 \
+            --platform linux/arm/v7 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
-            python:3.12-bookworm \
+            $MOUNT_CPYTHON \
+            python:3.14-bookworm \
             bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
@@ -640,10 +705,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ccache
           key: ccache-armv9-${{ matrix.script }}-${{ github.sha }}
@@ -651,9 +716,9 @@ jobs:
             ccache-armv9-${{ matrix.script }}-
 
       - name: Set up Python (arm64)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.12'
+          python-version: '3.14'
           architecture: arm64
 
       - name: Install system dependencies
@@ -716,7 +781,7 @@ jobs:
             "$SCRIPT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
@@ -773,11 +838,11 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Кэш ccache между запусками (монтируется в Termux-контейнер)
       - name: Cache ccache (Termux)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .ccache
           key: ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-${{ github.sha }}
@@ -845,7 +910,7 @@ jobs:
               "${{ matrix.script }}" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist-host/${{ matrix.artifact_name }}
@@ -861,10 +926,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
