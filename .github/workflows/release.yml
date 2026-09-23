@@ -185,9 +185,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          # apt-get is the stable CLI for scripts; Dpkg::Options disable
-          # interactive conffile prompts. upgrade updates ALL runner image
-          # packages to the latest stable — a fresh toolchain (gcc, libc).
+          # apt-get is the stable CLI for scripts (the `apt` command prints
+          # "WARNING: apt does not have a stable CLI interface" when used
+          # non-interactively; apt-get does NOT print it — apt-get is the
+          # recommended tool for scripts and automation). Dpkg::Options
+          # disable interactive conffile prompts. upgrade updates ALL runner
+          # image packages to the latest stable — a fresh toolchain (gcc, libc).
           sudo apt-get update
           sudo apt-get -y -o Dpkg::Options::="--force-confdef" \
                       -o Dpkg::Options::="--force-confold" upgrade
@@ -305,12 +308,15 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
-          # apt-get is the stable CLI for scripts (plain `apt` prints a
-          # WARNING "does not have a stable CLI interface"); Dpkg::Options
-          # disable interactive conffile prompts, --no-install-recommends
-          # avoids pulling extra packages. apt-get upgrade updates ALL
-          # base image packages to the latest stable (Debian
-          # security/point-updates).
+          # apt-get is the stable CLI for scripts: the `apt` command prints
+          # "WARNING: apt does not have a stable CLI interface. Use with
+          # caution in scripts." when used non-interactively, because apt is
+          # intended for interactive terminal use; apt-get does NOT print
+          # this warning and is the officially recommended tool for scripts,
+          # Dockerfiles and CI pipelines. Dpkg::Options disable interactive
+          # conffile prompts, --no-install-recommends avoids pulling extra
+          # packages. apt-get upgrade updates ALL base image packages to the
+          # latest stable (Debian security/point-updates).
           APT_OPTS=(-y --no-install-recommends \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
           apt-get update
@@ -345,7 +351,13 @@ jobs:
 
       - name: Build in linux/386 container
         run: |
+          # --network host: a known issue on GitHub runners is that
+          # containers sometimes cannot resolve DNS (actions/runner#2036,
+          # runner-images#6013: "Temporary failure resolving 'deb.debian.org'").
+          # Host networking makes the container use the runner's network
+          # stack and DNS directly; volume mounts are unaffected by it.
           docker run --rm \
+            --network host \
             --platform linux/386 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
@@ -403,12 +415,15 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
           export DEBIAN_FRONTEND=noninteractive
-          # apt-get is the stable CLI for scripts (plain `apt` prints a
-          # WARNING "does not have a stable CLI interface"); Dpkg::Options
-          # disable interactive conffile prompts, --no-install-recommends
-          # avoids pulling extra packages. apt-get upgrade updates ALL
-          # base image packages to the latest stable (Debian
-          # security/point-updates).
+          # apt-get is the stable CLI for scripts: the `apt` command prints
+          # "WARNING: apt does not have a stable CLI interface. Use with
+          # caution in scripts." when used non-interactively, because apt is
+          # intended for interactive terminal use; apt-get does NOT print
+          # this warning and is the officially recommended tool for scripts,
+          # Dockerfiles and CI pipelines. Dpkg::Options disable interactive
+          # conffile prompts, --no-install-recommends avoids pulling extra
+          # packages. apt-get upgrade updates ALL base image packages to the
+          # latest stable (Debian security/point-updates).
           APT_OPTS=(-y --no-install-recommends \
             -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
           apt-get update
@@ -443,7 +458,13 @@ jobs:
 
       - name: Build in linux/arm/v7 container
         run: |
+          # --network host: a known issue on GitHub runners is that
+          # containers sometimes cannot resolve DNS (actions/runner#2036,
+          # runner-images#6013: "Temporary failure resolving 'deb.debian.org'").
+          # Host networking makes the container use the runner's network
+          # stack and DNS directly; volume mounts are unaffected by it.
           docker run --rm \
+            --network host \
             --platform linux/arm/v7 \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/src -w /src \
@@ -526,22 +547,31 @@ jobs:
           SCRIPT="$1"
           ARTIFACT="$2"
 
-          # --- 1) THE CANONICAL TERMUX PACKAGE MANAGER -----------------------
-          # pkg is the native Termux interface: it is a wrapper over apt that
-          # refreshes repository/mirror indexes before each operation
-          # (Termux Wiki, Package Management). We do NOT pin a mirror — pkg
-          # picks an available mirror based on geolocation, which is
-          # universal for any CI.
+          # --- 1) PACKAGE MANAGER: apt-get, NOT pkg --------------------------
+          # The "WARNING: apt does not have a stable CLI interface. Use with
+          # caution in scripts." warning was previously emitted here because
+          # `pkg` is a wrapper that internally calls the `apt` command, and
+          # `apt` ALWAYS prints this warning when used non-interactively
+          # (apt is designed for interactive terminal use; there is no flag
+          # to suppress the warning). The stable, script-safe CLI is
+          # `apt-get`, which exists in Termux and prints NO warning.
+          # Therefore, in CI we call apt-get directly:
+          #   - `pkg upgrade` == `apt update && apt full-upgrade`, so we
+          #     explicitly run `apt-get update` + `apt-get full-upgrade` —
+          #     the pkg wrapper only automates these two calls (plus mirror
+          #     selection, which is already baked into the image).
           # The Dpkg::Options flags disable interactive conffile prompts.
-          # The WARNING "apt does not have a stable CLI interface" is an
-          # internal notice of the pkg->apt wrapper — standard pkg behavior,
-          # NOT an error.
-          PKG_OPTS=(-o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+          APT_OPTS=(-y \
+            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
           # --- 2) FULL UPGRADE TO THE LATEST STABLE VERSIONS -----------------
-          # pkg upgrade updates ALL installed image packages to their latest
-          # stable versions.
-          pkg upgrade -y "${PKG_OPTS[@]}"
+          # apt-get update refreshes the repository/mirror indexes (pkg did
+          # this implicitly before upgrade — with apt-get it must be called
+          # explicitly). apt-get full-upgrade updates ALL installed image
+          # packages to their latest stable versions (the direct equivalent
+          # of `pkg upgrade`).
+          apt-get update
+          apt-get "${APT_OPTS[@]}" full-upgrade
 
           # --- 3) Termux environment: the same packages recommended by the ---
           #    Nuitka documentation for Android (fresh versions from the
@@ -549,7 +579,7 @@ jobs:
           # IMPORTANT: pip in Termux is the python-pip package; upgrading it
           # on your own is FORBIDDEN (the "Installing pip is forbidden"
           # error), so there must be NO `pip install --upgrade pip` here.
-          pkg install -y "${PKG_OPTS[@]}" \
+          apt-get "${APT_OPTS[@]}" install \
             python patchelf ccache binutils ldd termux-elf-cleaner
 
           pip install "Nuitka[app]" ordered-set zstandard
@@ -592,7 +622,12 @@ jobs:
       - name: Build in Termux container (${{ matrix.termux_tag }})
         timeout-minutes: 300
         run: |
+          # --network host: prevents the known GitHub-runner container DNS
+          # failure (actions/runner#2036: "Temporary failure resolving ...").
+          # Host networking uses the runner's network stack and DNS directly;
+          # volume mounts are unaffected by it.
           docker run --rm \
+            --network host \
             -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
             -v "$PWD":/host-src:ro \
             -v "$PWD/dist-host":/host-dist \
