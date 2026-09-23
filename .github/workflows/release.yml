@@ -10,22 +10,46 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build ${{ matrix.script }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            artifact_name: mozvpn-windows.exe
-            nuitka_extra: --windows-console-mode=force
+        os: [windows-latest, ubuntu-latest]
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        exclude:
+          # Без externals-скрипт не тянет zxing-cpp/Pillow — при желании уберите исключение
           - os: ubuntu-latest
+            script: mozvpn_no_externals.py
+        include:
+          # Правила именования артефактов
+          - os: windows-latest
+            script: mozvpn.py
+            artifact_name: mozvpn-windows.exe
+          - os: windows-latest
+            script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-windows.exe
+          - os: windows-latest
+            script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-windows.exe
+          - os: ubuntu-latest
+            script: mozvpn.py
             artifact_name: mozvpn-linux
+          - os: ubuntu-latest
+            script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux
+          - os: ubuntu-latest
+            script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux
+          # Платформо-зависимые флаги
+          - os: windows-latest
+            nuitka_extra: "--windows-console-mode=force"
+          - os: ubuntu-latest
             nuitka_extra: ""
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,10 +74,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Имя исходника (лежит в корне репозитория)
-          SCRIPT="mozvpn_no_externals.py"
+          SCRIPT="${{ matrix.script }}"
 
-          # Общие флаги, которые вы указали
           COMMON=(
             --onefile
             --output-dir=dist
@@ -69,7 +91,6 @@ jobs:
             --nofollow-import-to=test
           )
 
-          # Платформо-зависимые флаги
           EXTRA="${{ matrix.nuitka_extra }}"
 
           python -m nuitka \
@@ -92,7 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -104,12 +125,16 @@ jobs:
           mkdir -p release
           # Windows
           cp artifacts/mozvpn-windows.exe/mozvpn-windows.exe release/ || true
+          cp artifacts/mozvpn-beta-windows.exe/mozvpn-beta-windows.exe release/ || true
+          cp artifacts/mozvpn-no-externals-windows.exe/mozvpn-no-externals-windows.exe release/ || true
           # Linux
           cp artifacts/mozvpn-linux/mozvpn-linux release/ || true
+          cp artifacts/mozvpn-beta-linux/mozvpn-beta-linux release/ || true
+          cp artifacts/mozvpn-no-externals-linux/mozvpn-no-externals-linux release/ || true
           ls -la release/
 
       - name: Create Release & upload assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
@@ -118,6 +143,10 @@ jobs:
           generate_release_notes: true
           files: |
             release/mozvpn-windows.exe
+            release/mozvpn-beta-windows.exe
+            release/mozvpn-no-externals-windows.exe
             release/mozvpn-linux
+            release/mozvpn-beta-linux
+            release/mozvpn-no-externals-linux
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
