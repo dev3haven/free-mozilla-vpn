@@ -516,28 +516,36 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}
           if-no-files-found: error
-          retention-days: 7
 
   # ==========================================================================
   # 3b. Linux armv6 (ARM11: Raspberry Pi 1/Zero/Zero W, старые роутеры).
-  #     ВАЖНО (проверено по манифесту docker-library/official-images): в
-  #     Debian-тегах python-образов arm32v6 НЕ существует ВООБЩЕ (bookworm/
-  #     trixie: только amd64/arm32v5/arm32v7/arm64v8/i386/...); arm32v6 есть
-  #     только в alpine-тегах — но musl-бинарник НЕ запускается на Raspbian
-  #     (glibc). Поэтому единственный корректный путь в официальном образном
-  #     экосистеме: запустить arm32v7-bookworm-контейнер (нативно на ARM64-
-  #     раннере) и собрать CPython 3.14 ИЗ ИСХОДНИКОВ с флагами
-  #     -march=armv6 -mfpu=vfp -mfloat-abi=hard (hard-float, как Raspbian),
-  #     а затем и вывод Nuitka компилировать теми же флагами (gcc-обёртка).
-  #     Результат — НАСТОЯЩИЙ armv6 glibc-бинарник для RPi1/Zero.
-  #     Сборка CPython кэшируется между запусками (actions/cache), поэтому
-  #     дорого она стоит только при смене версии Python.
+  #     Образ НЕ фиксируется на alpine/debian — выбран по факту: готовой
+  #     armv6-glibc-сборки ПОСЛЕДНЕГО стабильного Python 3.14 не существует
+  #     (проверено 23.09.2026):
+  #     - официальный python-образ: arm32v6 есть ТОЛЬКО в alpine-тегах
+  #       (musl) — бинарник не запускается на Raspbian/Raspberry Pi OS
+  #       (glibc); в Debian-тегах arm32v6 нет вообще;
+  #     - astral python-build-standalone: armv6-таргета НЕТ (только
+  #       x86_64 / aarch64 / armv7 / riscv64);
+  #     - balenalib/raspberry-pi-python: максимум Python 3.10 (обновления
+  #       прекращены в 2025).
+  #     РПД-решение по правилу «исходники допустимы, если укладываются в
+  #     десятки минут»: CPython 3.14.7 собирается ИЗ ИСХОДНИКОВ в armv7-
+  #     контейнере (нативно на ARM64-раннере) с флагами
+  #     -march=armv6 -mfpu=vfp -mfloat-abi=hard (hard-float, как Raspbian).
+  #     С make -j$(nproc) и --disable-test-modules это десятки минут на
+  #     GitHub ARM-раннере, а actions/cache сохраняет собранный CPython
+  #     между запусками — дорого только при смене версии Python.
+  #     gcc-обёртка применяет те же armv6-флаги к C-коду Nuitka и
+  #     onefile-бутстрапу (SCons Nuitka не пробрасывает внешнее окружение).
+  #     Результат — НАСТОЯЩИЙ armv6 glibc-бинарник для RPi1/Zero
+  #     (Raspberry Pi OS 32-bit).
   # ==========================================================================
   build-linux-armv6:
     name: Build ${{ matrix.script }} (linux-armv6)
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
-    timeout-minutes: 240
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -561,10 +569,10 @@ jobs:
           path: |
             .ccache
             .cpython-armv6
-          key: armv6-cpython314-ccache-${{ matrix.script }}-${{ github.sha }}
+          key: armv6-cpython3147-ccache-${{ matrix.script }}-${{ github.sha }}
           restore-keys: |
-            armv6-cpython314-ccache-${{ matrix.script }}-
-            armv6-cpython314-ccache-
+            armv6-cpython3147-ccache-${{ matrix.script }}-
+            armv6-cpython3147-ccache-
 
       - name: Prepare container build script
         run: |
@@ -576,9 +584,12 @@ jobs:
           PREFIX="/opt/py-armv6"
 
           apt-get update
-          apt-get install -y ccache patchelf build-essential curl xz-utils
+          apt-get install -y --no-install-recommends ccache patchelf build-essential curl xz-utils
 
           # --- 1) CPython из исходников с armv6-флагами (если нет в кэше) ---
+          #     Готовой armv6-glibc-сборки 3.14 не существует (см. комментарий
+          #     джобы) — это ЕДИНСТВЕННАЯ сборка из исходников во всём workflow,
+          #     укладывающаяся в десятки минут и кэшируемая между запусками.
           if [ ! -x "$PREFIX/bin/python3" ]; then
             cd /tmp
             curl -fsSLO "https://www.python.org/ftp/python/$PYVER/Python-$PYVER.tar.xz"
@@ -592,10 +603,9 @@ jobs:
           fi
           PY="$PREFIX/bin/python3"
 
-          # --- 2) gcc-обёртка: ВСЁ (CPython-зависимости уже собраны, теперь
-          #        C-код Nuitka и onefile-бутстрап) компилируется armv6-флагами.
-          #        SCons Nuitka не пробрасывает внешнее окружение, поэтому
-          #        обёртка ставится первой в PATH. ---
+          # --- 2) gcc-обёртка: ВСЁ (C-код Nuitka и onefile-бутстрап)
+          #        компилируется armv6-флагами. SCons Nuitka не пробрасывает
+          #        внешнее окружение, поэтому обёртка ставится первой в PATH. ---
           mkdir -p /tmp/gcc-armv6
           for c in gcc g++ cc c++; do
             p="$(command -v "$c")"
@@ -608,11 +618,11 @@ jobs:
           done
           export PATH="/tmp/gcc-armv6:$PATH"
 
-          # --- 3) Зависимости и сборка Nuitka (armv6-Python) ---
-          "$PY" -m pip install --upgrade pip
-          "$PY" -m pip install "Nuitka[app]" ordered-set zstandard
-          "$PY" -m pip install pyotp
-          "$PY" -m pip install zxing-cpp Pillow proxy.py \
+          # --- 3) Зависимости (последние стабильные, unpinned) и сборка ---
+          "$PY" -m pip install --no-cache-dir --upgrade pip
+          "$PY" -m pip install --no-cache-dir "Nuitka[app]" ordered-set zstandard
+          "$PY" -m pip install --no-cache-dir pyotp
+          "$PY" -m pip install --no-cache-dir zxing-cpp Pillow proxy.py \
             || echo "optional deps failed on armv6 — building without them"
 
           INCLUDES=( --include-package=pyotp )
@@ -682,6 +692,16 @@ jobs:
   #     внешнее окружение, поэтому -march=armv9-a добавляется через
   #     GCC-обёртку в PATH (SCons находит gcc первым в PATH). GCC 12+
   #     поддерживает -march=armv9-a (на ubuntu-24.04 стоит GCC 13).
+  #     ВАЖНО про -mtune: aarch64-GCC принимает в -mtune ТОЛЬКО имена
+  #     конкретных ядер (neoverse-v2, cortex-x3, ...) или 'generic'
+  #     (значения вроде 'generic-armv9-a' НЕВАЛИДНЫ — это видно из
+  #     фактического вывода cc1: «valid arguments are: cortex-a34 ...
+  #     neoverse-v2 ... generic»). Поэтому тюнинг = -mtune=generic,
+  #     а архитектурные инструкции ARMv9-A задаёт -march=armv9-a.
+  #     static-libpython: Nuitka сам использует статический libpython,
+  #     когда это надёжно (default auto). Принудительное
+  #     --static-libpython=yes стабильно только с Anaconda/pyenv-сборками
+  #     (документация Nuitka, Tips) и может вызывать ошибки — НЕ включаем.
   #     Тюнятся только C-файлы, сгенерированные Nuitka; интерпретатор
   #     CPython и необязательные расширения остаются baseline-armv8 (это
   #     основная часть кода — ускорение честное, но ограниченное).
@@ -745,7 +765,7 @@ jobs:
             command -v "$c" >/dev/null 2>&1 || continue
             cat > "$HOME/gcc-armv9/$c" <<EOF
           #!/bin/bash
-          exec $(command -v $c) "\$@" -march=armv9-a -mtune=generic-armv9-a -O3
+          exec $(command -v $c) "\$@" -march=armv9-a -mtune=generic -O3
           EOF
             chmod +x "$HOME/gcc-armv9/$c"
           done
