@@ -6,7 +6,13 @@
 #   - Windows x64          -> windows-latest                          (native)
 #   - Windows x86 (32-bit) -> windows-latest + setup-python x86       (native, WoW64)
 #   - Linux   x64          -> ubuntu-latest                           (native)
-#   - Linux   arm64        -> ubuntu-24.04-arm (бесплатный ARM-раннер) (native)
+#   - Linux   arm64        -> ubuntu-24.04-arm (бесплатный ARM-раннер) (native,
+#                            baseline aarch64 = ARMv8-A; работает на ARMv8/ARMv9)
+#   - Linux   armv9        -> ubuntu-24.04-arm + armv9-тюнинг GCC       (native,
+#                            специализированная сборка: инструкции ARMv9-A,
+#                            НЕ работает на armv8 — см. комментарий джобы)
+#   - Linux   armv5        -> ubuntu-24.04-arm + docker linux/arm/v5    (native,
+#                            самые старые ARM9/ARM10, экспериментально)
 #   - Linux   armv7        -> ubuntu-24.04-arm + docker linux/arm/v7   (native AArch32
 #                            на ARMv8-процессоре: 64-битные ARM-ядра исполняют
 #                            32-битный ARMv7-код напрямую — старые Raspberry Pi,
@@ -350,6 +356,265 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
+  # 3a. Linux armv5 (самые старые ARM: ARM9/ARM10, armv5te). Официальный
+  #     python-образ поддерживает arm32v5. armv5-код исполняется нативно на
+  #     ARM64-раннере по цепочке обратной совместимости (armv5 -> armv6 ->
+  #     armv7 -> armv8 AArch32). Цель МАКСИМАЛЬНО экспериментальная:
+  #     wheels для armv5 почти не существует, GCC -march=armv5te валиден.
+  #     Продолжаем best-effort: без необязательных QR-зависимостей.
+  # ==========================================================================
+  build-linux-armv5:
+    name: Build ${{ matrix.script }} (linux-armv5)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        include:
+          - script: mozvpn.py
+            artifact_name: mozvpn-linux-armv5
+          - script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux-armv5
+          - script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux-armv5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare container build script
+        run: |
+          cat > ci-build-in-docker.sh <<'EOS'
+          set -euo pipefail
+          SCRIPT="$1"
+          ARTIFACT="$2"
+          apt-get update
+          apt-get install -y ccache patchelf build-essential
+          python -m pip install --upgrade pip
+          python -m pip install "Nuitka[app]" ordered-set zstandard
+          python -m pip install pyotp
+          python -m pip install zxing-cpp Pillow proxy.py \
+            || echo "optional deps failed on armv5 — building without them"
+          INCLUDES=( --include-package=pyotp )
+          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+          python -m nuitka \
+            --onefile \
+            --output-dir=dist \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --show-progress \
+            --nofollow-import-to=tkinter \
+            --nofollow-import-to=unittest \
+            --nofollow-import-to=test \
+            "${INCLUDES[@]}" \
+            --output-filename="$ARTIFACT" \
+            "$SCRIPT"
+          EOS
+          chmod +x ci-build-in-docker.sh
+
+      - name: Build in linux/arm/v5 container
+        run: |
+          docker run --rm \
+            --platform linux/arm/v5 \
+            -v "$PWD":/src -w /src \
+            python:3.12-bookworm \
+            bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
+  # 3b. Linux armv6 (ARM11: Raspberry Pi 1/Zero/Zero W, старые роутеры и
+  #     встраиваемые платы). НЕ совместим с armv7-кодом (armv6 = VFPv2 без
+  #     NEON; armv7-бинарник на нём НЕ работает, совместимость только в
+  #     обратную сторону), поэтому отдельная сборка обязательна для
+  #     максимального охвата старых устройств. Официальный python-образ
+  #     поддерживает arm32v6. Контейнер исполняется нативно на ARM64-раннере:
+  #     ARMv8 AArch32 полностью обратно совместим с ARMv7, а ARMv7 — с
+  #     ARMv6 (по цепочке совместимости armv6-код работает на новых ядрах).
+  # ==========================================================================
+  build-linux-armv6:
+    name: Build ${{ matrix.script }} (linux-armv6)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        include:
+          - script: mozvpn.py
+            artifact_name: mozvpn-linux-armv6
+          - script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux-armv6
+          - script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux-armv6
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Prepare container build script
+        run: |
+          cat > ci-build-in-docker.sh <<'EOS'
+          set -euo pipefail
+          SCRIPT="$1"
+          ARTIFACT="$2"
+          apt-get update
+          apt-get install -y ccache patchelf build-essential
+          python -m pip install --upgrade pip
+          python -m pip install "Nuitka[app]" ordered-set zstandard
+          python -m pip install pyotp
+          python -m pip install zxing-cpp Pillow proxy.py \
+            || echo "optional deps failed on armv6 — building without them"
+          INCLUDES=( --include-package=pyotp )
+          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+          python -m nuitka \
+            --onefile \
+            --output-dir=dist \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --show-progress \
+            --nofollow-import-to=tkinter \
+            --nofollow-import-to=unittest \
+            --nofollow-import-to=test \
+            "${INCLUDES[@]}" \
+            --output-filename="$ARTIFACT" \
+            "$SCRIPT"
+          EOS
+          chmod +x ci-build-in-docker.sh
+
+      - name: Build in linux/arm/v6 container
+        run: |
+          docker run --rm \
+            --platform linux/arm/v6 \
+            -v "$PWD":/src -w /src \
+            python:3.12-bookworm \
+            bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
+  # 3c. Linux armv9 (ARMv9-A: Snapdragon X / новейшие Cortex-A /
+  #     Neoverse V2-N3; 64-битный режим). ТЮНИНГОВАННАЯ сборка: armv6/armv7
+  #     бинарники работают на ARMv9, но не используют его инструкции
+  #     (SVE2, MTE, BTI, crypto) — эта сборка генерирует код под armv9-a.
+  #     ВАЖНО: результат НЕ запускается на armv8-устройствах — это цена
+  #     тюнинга; универсальной остаётся сборка linux-arm64 (baseline aarch64).
+  #     Nuitka не имеет опции передачи CFLAGS, а его SCons не пробрасывает
+  #     внешнее окружение, поэтому -march=armv9-a добавляется через
+  #     GCC-обёртку в PATH (SCons находит gcc первым в PATH). GCC 12+
+  #     поддерживает -march=armv9-a (на ubuntu-24.04 стоит GCC 13).
+  #     Тюнятся только C-файлы, сгенерированные Nuitka; интерпретатор
+  #     CPython и необязательные расширения остаются baseline-armv8 (это
+  #     основная часть кода — ускорение честное, но ограниченное).
+  # ==========================================================================
+  build-linux-armv9:
+    name: Build ${{ matrix.script }} (linux-armv9)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
+        include:
+          - script: mozvpn.py
+            artifact_name: mozvpn-linux-armv9
+          - script: mozvpn_beta.py
+            artifact_name: mozvpn-beta-linux-armv9
+          - script: mozvpn_no_externals.py
+            artifact_name: mozvpn-no-externals-linux-armv9
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python (arm64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache patchelf build-essential
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "Nuitka[app]" ordered-set zstandard
+          python -m pip install pyotp
+          python -m pip install zxing-cpp Pillow proxy.py \
+            || echo "::warning::optional deps failed — building without them"
+
+      - name: Prepare armv9-tuned gcc wrapper
+        run: |
+          set -euo pipefail
+          # Обёртки добавляют armv9-флаги КО ВСЕМ вызовам gcc/g++:
+          # Nuitka вызывает компилятор из PATH через SCons.
+          mkdir -p "$HOME/gcc-armv9"
+          for c in gcc g++ cc c++ gcc-13 g++-13; do
+            command -v "$c" >/dev/null 2>&1 || continue
+            cat > "$HOME/gcc-armv9/$c" <<EOF
+          #!/bin/bash
+          exec $(command -v $c) "\$@" -march=armv9-a -mtune=generic-armv9-a -O3
+          EOF
+            chmod +x "$HOME/gcc-armv9/$c"
+          done
+          echo "$HOME/gcc-armv9" >> "$GITHUB_PATH"
+          # Быстрая проверка, что флаги принимаются этим GCC:
+          echo 'int main(){return 0;}' > /tmp/t.c
+          gcc /tmp/t.c -o /tmp/t.out && /tmp/t.out
+          echo "armv9 gcc wrapper OK: $(gcc -dumpmachine)"
+
+      - name: Build with Nuitka (armv9-tuned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCRIPT="${{ matrix.script }}"
+          INCLUDES=( --include-package=pyotp )
+          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
+          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
+          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
+          python -m nuitka \
+            --onefile \
+            --output-dir=dist \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --show-progress \
+            --nofollow-import-to=tkinter \
+            --nofollow-import-to=unittest \
+            --nofollow-import-to=test \
+            "${INCLUDES[@]}" \
+            --output-filename="${{ matrix.artifact_name }}" \
+            "$SCRIPT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ==========================================================================
   # 4. Android (Termux / bionic) — Nuitka официально поддерживает Android
   #    через Termux (user manual: "pkg install patchelf ccache binutils ldd
   #    termux-elf-cleaner"). Собираем в официальном образе
@@ -469,7 +734,7 @@ jobs:
   # ==========================================================================
   release:
     name: Create GitHub Release
-    needs: [build, build-linux-i386, build-linux-armv7, build-android]
+    needs: [build, build-linux-i386, build-linux-armv5, build-linux-armv7, build-linux-armv6, build-linux-armv9, build-android]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -503,6 +768,18 @@ jobs:
           cp artifacts/mozvpn-linux-armv7/mozvpn-linux-armv7 release/ || true
           cp artifacts/mozvpn-beta-linux-armv7/mozvpn-beta-linux-armv7 release/ || true
           cp artifacts/mozvpn-no-externals-linux-armv7/mozvpn-no-externals-linux-armv7 release/ || true
+          # ---- Linux armv6 (ARM11: Raspberry Pi 1/Zero и т.п.) ----
+          cp artifacts/mozvpn-linux-armv6/mozvpn-linux-armv6 release/ || true
+          cp artifacts/mozvpn-beta-linux-armv6/mozvpn-beta-linux-armv6 release/ || true
+          cp artifacts/mozvpn-no-externals-linux-armv6/mozvpn-no-externals-linux-armv6 release/ || true
+          # ---- Linux armv5 (самые старые ARM: ARM9/ARM10) ----
+          cp artifacts/mozvpn-linux-armv5/mozvpn-linux-armv5 release/ || true
+          cp artifacts/mozvpn-beta-linux-armv5/mozvpn-beta-linux-armv5 release/ || true
+          cp artifacts/mozvpn-no-externals-linux-armv5/mozvpn-no-externals-linux-armv5 release/ || true
+          # ---- Linux armv9 (тюнингованная сборка, только ARMv9-A CPU) ----
+          cp artifacts/mozvpn-linux-armv9/mozvpn-linux-armv9 release/ || true
+          cp artifacts/mozvpn-beta-linux-armv9/mozvpn-beta-linux-armv9 release/ || true
+          cp artifacts/mozvpn-no-externals-linux-armv9/mozvpn-no-externals-linux-armv9 release/ || true
           # ---- Linux i386 (старые 32-битные x86) ----
           cp artifacts/mozvpn-linux-i386/mozvpn-linux-i386 release/ || true
           cp artifacts/mozvpn-beta-linux-i386/mozvpn-beta-linux-i386 release/ || true
