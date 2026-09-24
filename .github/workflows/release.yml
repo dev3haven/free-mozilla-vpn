@@ -5,16 +5,19 @@
 #   linux-x86_64   — 64-bit Intel/AMD Linux (a.k.a. x64 / amd64)
 #   linux-x86      — 32-bit Linux (i386/i686)
 #   linux-arm64    — 64-bit ARM Linux (= ARMv8-A, aarch64)
-#   linux-armv7    — 32-bit ARM Linux (armhf / armv7)
 #   windows-x86_64 — 64-bit Intel/AMD Windows (a.k.a. x64)
 #   windows-x86    — 32-bit Windows (i386/i686)
 #   windows-arm64  — 64-bit ARM Windows (= ARMv8; Windows 11 on Arm)
 #
-# Naming convention note:
-#   * x86_64 = x64 = amd64 — three names for the same 64-bit Intel/AMD
-#     architecture; x86 alone means 32-bit.
-#   * arm64 = aarch64 = ARMv8-A (64-bit).
-#   * armv7 — 32-bit ARM (armhf).
+# NOTE: linux-armv7 (32-bit ARM / armhf) is intentionally NOT built in this
+# variant: it requires QEMU emulation on the x86_64 runner, which makes the
+# Nuitka build extremely slow and unreliable within the 360-minute
+# hosted-runner job limit. 32-bit ARM users can run the arm64 binary on
+# most armv8 hardware; if armv7 support is ever needed, re-add the
+# emulated container job (docker/setup-qemu-action + `docker run
+# --platform linux/arm/v7`), with `make` and `ccache` apt-installed
+# (gcc LTO links SERIALLY without make — Nuitka#3238) and an explicit
+# `timeout-minutes: 350`.
 #
 # ---------------------------------------------------------------------------
 # FIXES IN THIS REVISION (audited 2026-09-24, all facts verified online):
@@ -24,31 +27,32 @@
 #      include."  Root cause: since Python 3.12 the CPython distributions
 #      installed by actions/setup-python (and the official python Docker
 #      images) NO LONGER BUNDLE setuptools — ensurepip/venv install only
-#     pip (python/cpython#95299, python-build-standalone#300). Nuitka's
+#      pip (python/cpython#95299, python-build-standalone#300). Nuitka's
 #      --include-package=setuptools therefore fails whenever setuptools
 #      is not explicitly pip-installed into the BUILD environment. On some
 #      x86_64 images setuptools happened to still be present (leftover /
 #      preinstalled by other tooling), which is why only windows-arm64
 #      blew up first — but the same crash could hit any matrix cell.
 #      Fix: `pip install --upgrade pip setuptools wheel` is now run in
-#      EVERY build job (matrix job + both container jobs), BEFORE nuitka.
+#      EVERY build job (matrix job + the i386 container job), BEFORE nuitka.
 #
-# FIX 5 (linux-armv7 FATAL, and the same latent bomb in linux-x86):
+# FIX 5 (linux-x86 FATAL):
 #     "error: failed-wheel-build-for-install ... cffi ... ffi.h: No such
 #      file or directory". Chain: on CPython 3.14 zstandard has no
-#      prebuilt wheel for armv7/i386, so pip builds it from source; per
+#      prebuilt wheel for i386, so pip builds it from source; per
 #      the python-zstandard documentation, on Python 3.14 the package
 #      uses the CFFI backend/bindings, i.e. its build requires
 #      cffi>=2.0.0b; cffi compiles its _cffi_backend C extension, which
 #      #includes <ffi.h> — the header lives in the libffi-dev system
 #      package, which python:*-slim images do NOT contain. Fix:
-#      `libffi-dev` is now installed via apt in BOTH container jobs
-#      (armv7 and i386 — the i386 cell has the identical risk, there are
-#      no cp314 i386 wheels either), plus a fallback: if
-#      `pip install zstandard` still fails, the build continues WITHOUT
-#      zstandard; per the Nuitka user manual the onefile payload is then
-#      packed UNCOMPRESSED (compression applies only when
-#      zstandard is available); zstandard is optional build tooling.
+#      `libffi-dev` is now installed via apt in the i386 container job,
+#      plus a fallback: if `pip install zstandard` still fails, the
+#      build continues WITHOUT zstandard; per the Nuitka user manual the
+#      onefile payload is then packed UNCOMPRESSED (compression applies
+#      only when zstandard is available); zstandard is optional build
+#      tooling. `make` is installed as well: gcc LTO requires it for
+#      parallel LTRANS linking (Nuitka#3238) — on native x86 it is only
+#      a speedup, but it also silences the Nuitka warning.
 #
 # FIX 2: generate_release_notes had a corrupted value ("truedeep-research"
 #      paste artifact) — restored to `true`.
@@ -56,11 +60,7 @@
 # FIX 3: the release-bundle job used `always()` in its `if`, so it also ran
 #      after FAILED builds (producing a broken/empty release zip and a
 #      failing download-artifact step). Now the bundle is built only when
-#      all `needs` jobs succeeded (the experimental armv7 job is
-#      continue-on-error, so its failure does not block the release).
-#
-# FIX 4: docker/setup-qemu-action bumped v3 -> v4 (current major, see the
-#      official action README); v3 still works, v4 is the maintained line.
+#      all `needs` jobs succeeded.
 #
 # Everything else verified and kept as-is:
 #   * actions/checkout@v5, actions/setup-python@v6,
@@ -76,19 +76,16 @@
 #   * No requirements.txt/pyproject.toml exists in this repo, so
 #     `cache: pip` in setup-python is NOT used (it hard-fails when the
 #     dependency glob matches nothing — actions/setup-python#807).
-#   * jobs.<id>.container CANNOT be used for the 32-bit/emulated builds:
+#   * jobs.<id>.container CANNOT be used for the 32-bit build:
 #     the runner mounts only 64-bit node binaries into /__e/, so in an
-#     i386/armv7 job container every action dies with
+#     i386 job container every action dies with
 #     "exec /__e/node24/bin/node: no such file or directory"
 #     (actions/runner#2115). All actions therefore run on the host and
-#     the builds run via plain `docker run` with the workspace bind-mounted.
-#   * linux-x86 runs natively on the x86_64 kernel (no emulation);
-#     linux-armv7 runs under QEMU user emulation — slow, experimental,
-#     continue-on-error so a timeout can never break a release.
+#     the build runs via plain `docker run` with the workspace bind-mounted.
+#   * linux-x86 runs natively on the x86_64 kernel — no emulation needed.
 #   * Nuitka officially supports Python 3.4–3.14 and does NOT
-#     cross-compile; every target is built natively (or emulated) on a
-#     hosted runner with a PRE-BUILT CPython — nothing is compiled from
-#     source.
+#     cross-compile; every target is built natively on a hosted runner
+#     with a PRE-BUILT CPython — nothing is compiled from source.
 #   * For 32-bit Python on Windows, Nuitka requires MSVC (NOT MinGW);
 #     MSVC is preinstalled on windows-latest, and the windows-11-arm image
 #     ships Visual Studio with ARM64 build tools.
@@ -196,8 +193,8 @@ jobs:
           # zstandard: optional onefile compressor. Prebuilt wheels cover
           # the common matrix targets, but if a cell has no wheel (e.g.
           # Windows arm64), do NOT fail the build: the onefile payload
-          # is just packed UNCOMPRESSED, per the Nuitka user manual: compression
-          # applies only when zstandard is available).
+          # is just packed UNCOMPRESSED, per the Nuitka user manual.
+          python -m pip install --upgrade zstandard || \
             echo "WARNING: zstandard install failed — continuing without it (Nuitka will pack the onefile payload uncompressed)."
 
       - name: Install C compiler cache (Linux)
@@ -363,10 +360,13 @@ jobs:
               # Pre-built packages only — nothing compiled from sources.
               # FIX: libffi-dev provides <ffi.h> — required to build cffi,
               # which is required to build zstandard on Python 3.14
-              # (CFFI backend, no prebuilt i386/armv7 cp314 wheels).
+              # (CFFI backend, no prebuilt i386 cp314 wheels).
+              # make: gcc LTO requires it for parallel LTRANS linking
+              # (Nuitka#3238); x86 runs natively so it is only a speedup
+              # here, but it also silences the Nuitka warning.
               apt-get update
               apt-get install -y --no-install-recommends \
-                gcc g++ patchelf file libffi-dev
+                gcc g++ make ccache patchelf file libffi-dev
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               # Install project dependencies only if a requirements file exists.
@@ -422,122 +422,17 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
-  # Linux armv7 (32-bit ARM, a.k.a. armhf): there is no armv7 hosted runner
-  # and setup-python does not provide 32-bit ARM CPython, but nothing is
-  # built from source. The official python Docker image is multi-arch and
-  # publishes pre-built arm32v7 CPython builds, so this job pulls that
-  # image with QEMU user-mode emulation on the x86_64 ubuntu-latest
-  # runner (docker/setup-qemu-action registers the binfmt handlers).
-  # QEMU emulation makes the Nuitka build slow — hence experimental
-  # (continue-on-error) so a timeout cannot break the release.
-  # --------------------------------------------------------------------------
-  build-linux-armv7:
-    name: Build linux-armv7 (32-bit ARM, experimental)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      # Registers QEMU static binaries with binfmt_misc so an armv7
-      # container can run on the x86_64 runner (official Docker action).
-      # v4 is the current major line of the action.
-      - name: Set up QEMU for armv7 emulation
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm
-
-      # The build runs inside the arm32v7 container via plain `docker run`
-      # (QEMU must be registered before the container starts, so a
-      # jobs.container is not usable here). The workspace is bind-mounted
-      # so the resulting binary is directly visible to the runner for
-      # the artifact upload step.
-      - name: Compile with Nuitka (armv7 Linux, inside emulated container)
-        run: |
-          set -euo pipefail
-          docker run --rm \
-            --platform linux/arm/v7 \
-            -v "$GITHUB_WORKSPACE:/src" \
-            -w /src \
-            "python:${PYTHON_VERSION}-slim" \
-            bash -euo pipefail -c '
-              # Pre-built packages only — nothing compiled from sources.
-              # FIX: libffi-dev provides <ffi.h> — required to build cffi,
-              # which is required to build zstandard on Python 3.14
-              # (CFFI backend; no prebuilt armv7 cp314 wheels exist, so
-              # both cffi and zstandard compile from source under QEMU).
-              apt-get update
-              apt-get install -y --no-install-recommends \
-                gcc g++ patchelf file libffi-dev
-              python --version
-              python -c "import platform; print(\"arch:\", platform.machine())"
-              # Install project dependencies only if a requirements file exists.
-              if [ -f requirements.txt ]; then
-                python -m pip install --upgrade pip
-                python -m pip install -r requirements.txt
-              else
-                echo "No requirements.txt found — installing only build tooling."
-              fi
-              # FIX: Python 3.12+ images do not bundle setuptools any more;
-              # Nuitka --include-package=setuptools requires it in the build env.
-              python -m pip install --upgrade pip setuptools wheel
-              # Build tooling: Nuitka compiler + onefile compression helpers.
-              python -m pip install --upgrade nuitka ordered-set
-              # zstandard: optional onefile compressor. On Python 3.14 it may
-              # have to build from source via cffi (no wheel for this arch) —
-              # libffi-dev (installed above) makes that succeed. If it still
-              # fails (e.g. a QEMU build timeout), continue WITHOUT it:
-              # the onefile payload is packed UNCOMPRESSED (per the Nuitka
-              # user manual); the binary stays fully functional.
-              python -m pip install --upgrade zstandard || \
-                echo "WARNING: zstandard install failed — continuing without it (Nuitka will pack the onefile payload uncompressed)."
-              # Prove pip/setuptools are importable (precondition for the
-              # --include-package options below).
-              python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
-              python -m nuitka \
-                --standalone \
-                --onefile \
-                --lto=yes \
-                --include-package=pip \
-                --include-package=setuptools \
-                --jobs=4 \
-                --output-dir=build \
-                --output-filename="mozvpn_beta-linux-armv7" \
-                --company-name="Free Mozilla VPN" \
-                --product-name="Free Mozilla VPN" \
-                --file-description="Free Mozilla VPN (mozvpn_beta)" \
-                --file-version="1.0.0.0" \
-                --product-version="1.0.0.0" \
-                --remove-output \
-                --assume-yes-for-downloads \
-                "mozvpn_beta.py"
-              # Smoke test: --help/-h works because the script uses argparse.
-              file build/mozvpn_beta-linux-armv7
-              ./build/mozvpn_beta-linux-armv7 --help || true
-            '
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: mozvpn_beta-linux-armv7
-          path: build/mozvpn_beta-linux-armv7*
-          if-no-files-found: error
-          retention-days: 14
-
-  # --------------------------------------------------------------------------
   # Release: collects all binaries into a single zip (for v* tags,
   # release/** tags, or a published GitHub Release).
   #
   # NOTE: no `always()` here on purpose. With `always()` the job also ran
   # after FAILED builds and then either packed an incomplete bundle or
   # died inside download-artifact. The default (success of `needs`) is
-  # correct: build-linux-armv7 is continue-on-error, so its failure does
-  # NOT block the release, while a real failure of any required job does.
+  # correct: any real failure of a required job blocks the release.
   # --------------------------------------------------------------------------
   release-bundle:
     name: Bundle all binaries
-    needs: [build, build-linux-x86, build-linux-armv7]
+    needs: [build, build-linux-x86]
     # Runs for version-like tags (v*), hierarchical release tags
     # (release/1.2.20), or when a GitHub Release is published. Note that
     # for the release event github.ref still points at the tag ref.
