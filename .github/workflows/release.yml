@@ -658,6 +658,15 @@ jobs:
   # baseline по умолчанию (запускается на ВСЕХ aarch64 Android).
   # Сборка ЭКСПЕРИМЕНТАЛЬНАЯ: continue-on-error: true — сбой Termux job
   # не должен блокировать релиз остальных целей.
+  #
+  # FIX 11 (TARGET: unbound variable, живой прогон 2026-09-24): entrypoint
+  # termux-docker передаёт в Termux-окружение (proot, su до UID 1000)
+  # ТОЛЬКО аргументы командной строки — переменные из `docker run -e`
+  # внутрь proot-сессии НЕ попадают, поэтому ${TARGET} была unbound при
+  # set -u. Fix: значения TARGET/MARCH вшиты в текст скрипта подстановкой
+  # выражений GitHub Actions (${{ matrix.* }} заменяется ДО запуска
+  # shell — внутренний скрипт видит обычные литералы), а
+  # PIP_BREAK_SYSTEM_PACKAGES экспортируется ВНУТРИ скрипта.
   # --------------------------------------------------------------------------
   build-termux:
     name: Build termux-${{ matrix.target }} (Bionic, Android)
@@ -680,16 +689,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p termux-out
+          # NOTE: termux-docker's entrypoint passes COMMAND-LINE ARGUMENTS
+          # into the Termux environment (through a privilege-dropping su,
+          # UID 1000) — Docker `-e` env vars do NOT survive into the proot
+          # session, which caused "TARGET: unbound variable" under set -u
+          # in the live run (2026-09-24). Therefore TARGET/MARCH are baked
+          # into the script text by the GitHub Actions expression
+          # substitution (${{ matrix.* }} is replaced BEFORE the shell
+          # runs — the inner script sees plain literals), and
+          # PIP_BREAK_SYSTEM_PACKAGES is exported INSIDE the script.
           docker run --rm \
             --privileged \
-            -e TARGET="${{ matrix.target }}" \
-            -e MARCH="${{ matrix.march }}" \
-            -e PIP_BREAK_SYSTEM_PACKAGES=1 \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
             termux/termux-docker:aarch64 \
             bash -euo pipefail -c '
               set -euo pipefail
+              TARGET="${{ matrix.target }}"
+              MARCH="${{ matrix.march }}"
+              export PIP_BREAK_SYSTEM_PACKAGES=1
               echo "=== Termux arch: $(uname -m) | target: ${TARGET} | march: [${MARCH}]"
               pkg update -y || true
               pkg install -y \
