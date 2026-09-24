@@ -162,7 +162,7 @@
 #      `cryptography==46.0.3; sys_platform == "win32"` НЕ применяется в
 #      Termux (sys_platform == "linux"), вместо сборки cryptography из
 #      sdist ставится предсобранный Termux-пакет python-cryptography
-#      (45.0.3 в termux-packages, deps: openssl + python + python-pip)
+#      (50.0.1 в termux-packages (актуально на 2026-09-24, живой прогон), deps: openssl + python + python-pip)
 #      ДО `pip install -r requirements.txt` — тогда pip видит
 #      `cryptography>=42.0.0` (требование aioquic) уже выполненным и
 #      не трогает его вообще. Pillow аналогично ставится
@@ -637,7 +637,7 @@ jobs:
   #
   # Порядок установки зависимостей ВАЖЕН:
   #   1. pkg-ом ставятся предсобранные Termux-пакеты python, python-pip,
-  #      python-cryptography (45.0.3 в termux-packages) и python-pillow;
+  #      python-cryptography (50.0.1 в termux-packages (актуально на 2026-09-24, живой прогон)) и python-pillow;
   #      плюс тулчейн Nuitka по официальной документации:
   #      clang binutils patchelf ccache ldd termux-elf-cleaner file.
   #      Termux НЕ использует -dev пакеты: заголовки входят в сами
@@ -658,15 +658,6 @@ jobs:
   # baseline по умолчанию (запускается на ВСЕХ aarch64 Android).
   # Сборка ЭКСПЕРИМЕНТАЛЬНАЯ: continue-on-error: true — сбой Termux job
   # не должен блокировать релиз остальных целей.
-  #
-  # FIX 11 (TARGET: unbound variable, живой прогон 2026-09-24): entrypoint
-  # termux-docker передаёт в Termux-окружение (proot, su до UID 1000)
-  # ТОЛЬКО аргументы командной строки — переменные из `docker run -e`
-  # внутрь proot-сессии НЕ попадают, поэтому ${TARGET} была unbound при
-  # set -u. Fix: значения TARGET/MARCH вшиты в текст скрипта подстановкой
-  # выражений GitHub Actions (${{ matrix.* }} заменяется ДО запуска
-  # shell — внутренний скрипт видит обычные литералы), а
-  # PIP_BREAK_SYSTEM_PACKAGES экспортируется ВНУТРИ скрипта.
   # --------------------------------------------------------------------------
   build-termux:
     name: Build termux-${{ matrix.target }} (Bionic, Android)
@@ -727,10 +718,17 @@ jobs:
               export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib ${MARCH}"
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
-              python -m pip install --upgrade pip
+              # NOTE (FIX 12): `pip install --upgrade pip` is FORBIDDEN in
+              # Termux ("ERROR: Installing pip is forbidden, this will
+              # break the python-pip package (termux)") — Termux ships a
+              # PATCHED pip; the ONLY way to upgrade it is
+              # `pkg upgrade python-pip`. setuptools/wheel upgrades via
+              # pip ARE allowed and needed for
+              # Nuitka --include-package=setuptools (FIX 1).
+              python -m pip install --upgrade setuptools wheel
               # Runtime-зависимости: requirements.txt — единственный источник
               # истины. cryptography и Pillow уже удовлетворены предсобранными
-              # Termux-пакетами (python-cryptography 45.0.3 >= 42.0.0 —
+              # Termux-пакетами (python-cryptography 50.0.1 >= 42.0.0 —
               # требование aioquic; python-pillow), pip их не трогает.
               if [ -f requirements.txt ]; then
                 python -m pip install -r requirements.txt
@@ -738,8 +736,8 @@ jobs:
                 echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
                 exit 1
               fi
-              # FIX 1: setuptools обязателен для --include-package=setuptools.
-              python -m pip install --upgrade pip setuptools wheel
+              # FIX 1: setuptools обязателен для --include-package=setuptools
+              # (уже установлен шагом выше, pip-ом — это разрешено).
               # Build-тулинг: Nuitka + хелперы onefile-сжатия.
               python -m pip install --upgrade nuitka ordered-set
               python -m pip install --upgrade zstandard || \
