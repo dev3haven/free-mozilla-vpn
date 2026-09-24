@@ -13,9 +13,25 @@
 # Naming convention note:
 #   * x86_64 = x64 = amd64 — three names for the same 64-bit Intel/AMD
 #     architecture; x86 alone means 32-bit.
-#   * arm64 = aarch64 = ARMv8-A (64-bit). Windows 11 on Arm requires
-#     ARMv8.1+ hardware, so the windows-11-arm runner is ARMv8.
-#   * armv7 — 32-bit ARM (armhf), e.g. Raspberry Pi 3/4 in 32-bit mode.
+#   * arm64 = aarch64 = ARMv8-A (64-bit).
+#   * armv7 — 32-bit ARM (armhf).
+#
+# IMPORTANT trigger notes (verified, 2026-09-24):
+#   * In on.push.tags filters the single "*" does NOT match "/" — the
+#     tag "release/1.2.20" does NOT match "release/*". The correct
+#     pattern is "release/**" (documented in Workflow syntax; "**"
+#     matches hierarchical tags like v1.0/beta).
+#   * A tag push runs the workflow file version FROM THE COMMIT the
+#     tag points to. If the tag was created on a commit that predates
+#     this updated workflow file, the OLD trigger filters apply and
+#     nothing starts. Tags must point to a commit that already
+#     contains this file.
+#   * The `on: release` trigger uses the workflow file version from
+#     the DEFAULT branch, and the release event cannot be filtered by
+#     tag name — filtering is done by the release-bundle job's `if`.
+#   * Tag names with slashes (release/1.2.20) are valid git refs, but
+#     GITHUB_REF_NAME then contains a slash — sanitized below before
+#     it is used in file names.
 #
 # Verified facts (2026-09-24):
 #   * Python 3.14 is a stable release (released 2025-10-07).
@@ -34,8 +50,8 @@
 #       - linux-armv7 runs in an arm32v7 container of the same official
 #         multi-arch python image (pre-built 32-bit ARM CPython),
 #         executed via QEMU user-mode emulation registered by
-#         docker/setup-qemu-action (official Docker action). No CPython
-#         build from sources, but emulation is slow — experimental.
+#         docker/setup-qemu-action. No CPython build from sources, but
+#         emulation is slow — experimental.
 #   * For 32-bit Python on Windows, Nuitka requires MSVC as the C compiler
 #     (NOT MinGW). MSVC is preinstalled on windows-latest runners.
 #   * No requirements.txt / pyproject.toml exists in this repo (the project
@@ -45,11 +61,6 @@
 #   * ARM runners on GitHub are free for public repositories; for a
 #     private repository you need a paid larger runner or a self-hosted
 #     runner.
-#   * Publishing a GitHub Release (e.g. release/1.2.20) creates a tag
-#     and fires a push event for that tag; the release/* tag filter and
-#     the on: release trigger below both start the build for it.
-#     Note: pre-releases published from drafts do not fire the
-#     "published" release type — use a regular publish.
 # ============================================================================
 
 name: Build Free Mozilla VPN
@@ -57,15 +68,16 @@ name: Build Free Mozilla VPN
 on:
   push:
     # Main branch plus release branches (e.g. release/1.2.20).
+    # NOTE: for branches a single "*" already matches slashes, but
+    # "release/**" is used for clarity and symmetry with the tag filter.
     branches: ["main", "release/**"]
-    # Tags that look like versions: v* (e.g. v1.2.0) and release/*
-    # (e.g. release/1.2.20, the tag GitHub creates when you publish
-    # a release with that name).
-    tags: ["v*", "release/*"]
+    # "**" DOES match "/" in these filters; "release/*" would NOT match
+    # the hierarchical tag "release/1.2.20". Keep "release/**" here.
+    tags: ["v*", "release/**"]
   pull_request:
-  # Runs when a GitHub Release is published (any tag name). Note: this
-  # event cannot be filtered by tag name — it fires for every published
-  # release; the release-bundle job below handles the bundling logic.
+  # Fires when a GitHub Release is published (uses the workflow file
+  # from the DEFAULT branch; cannot be filtered by tag name — the
+  # release-bundle job's `if` handles that).
   release:
     types: [published]
   workflow_dispatch:
@@ -413,13 +425,14 @@ jobs:
 
   # --------------------------------------------------------------------------
   # Release: collects all binaries into a single zip (for v* tags,
-  # release/* tags, or a published GitHub Release).
+  # release/** tags, or a published GitHub Release).
   # --------------------------------------------------------------------------
   release-bundle:
     name: Bundle all binaries
     needs: [build, build-linux-x86, build-linux-armv7]
-    # Runs for version-like tags (v*) and release/* tags
-    # (e.g. release/1.2.20), or when a GitHub Release is published.
+    # Runs for version-like tags (v*), hierarchical release tags
+    # (release/1.2.20), or when a GitHub Release is published. Note that
+    # for the release event github.ref still points at the tag ref.
     if: >
       always() && (
         startsWith(github.ref, 'refs/tags/v') ||
@@ -437,6 +450,16 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # GITHUB_REF_NAME for the tag "release/1.2.20" contains a slash,
+      # which would create an invalid zip file path — sanitize it.
+      - name: Sanitize release name
+        id: relname
+        run: |
+          set -euo pipefail
+          SAFE="${GITHUB_REF_NAME//\//-}"
+          echo "ref_name=${GITHUB_REF_NAME} -> safe=${SAFE}"
+          echo "safe=${SAFE}" >> "$GITHUB_OUTPUT"
+
       - name: List and pack binaries
         run: |
           set -euo pipefail
@@ -445,18 +468,18 @@ jobs:
           cp -v dist/mozvpn_beta-* bundle/ 2>/dev/null || true
           ls -la bundle
           cd bundle
-          zip -9 "../mozvpn_beta-${GITHUB_REF_NAME}.zip" ./*
+          zip -9 "../mozvpn_beta-${{ steps.relname.outputs.safe }}.zip" ./*
 
       - name: Upload release bundle artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn_beta-${{ github.ref_name }}-all
-          path: mozvpn_beta-${{ github.ref_name }}.zip
+          name: mozvpn_beta-${{ steps.relname.outputs.safe }}-all
+          path: mozvpn_beta-${{ steps.relname.outputs.safe }}.zip
           if-no-files-found: error
           retention-days: 30
 
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: mozvpn_beta-${{ github.ref_name }}.zip
+          files: mozvpn_beta-${{ steps.relname.outputs.safe }}.zip
           generate_release_notes: true
