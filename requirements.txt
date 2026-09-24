@@ -1,0 +1,16 @@
+# Runtime dependencies of mozvpn_beta.py — ALL REQUIRED.
+# Nuitka embeds into the binary exactly what is importable at COMPILE
+# time: the script imports these packages behind try/except ImportError,
+# so they MUST be installed in the build environment, otherwise the
+# compiled binary ships with <pkg> = None fallbacks and reports
+# "NOT installed" at startup.
+#
+# pip name     -> module imported by mozvpn_beta.py
+# pyotp        -> pyotp     (TOTP generation)
+# zxing-cpp    -> zxingcpp  (QR decoding)
+# Pillow       -> PIL       (image opening for QR)
+# aioquic      -> aioquic   (real MASQUE / HTTP-3 CONNECT-UDP probing)
+pyotp
+zxing-cpp
+Pillow
+aioquic
