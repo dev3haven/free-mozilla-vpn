@@ -1,1096 +1,347 @@
-# ============================================================================
-# Build Release (Nuitka) — multi-architecture CI/CD
-#
-# Architectures (all built NATIVELY, without QEMU emulation — Nuitka cannot
-# cross-compile, so each target builds on a compatible environment):
-#   - Windows x64          -> windows-latest                          (native)
-#   - Windows x86 (32-bit) -> windows-latest + setup-python x86       (native, WoW64)
-#   - Linux   x64          -> ubuntu-26.04 (LTS, current GA image)     (native)
-#   - Linux   arm64        -> ubuntu-26.04-arm (LTS, GA ARM runner)    (native,
-#                            baseline aarch64 = ARMv8-A; runs on ARMv8/ARMv9)
-#   - Linux   armv7        -> ubuntu-26.04-arm + docker linux/arm/v7 (native AArch32
-#                            on an ARMv8 CPU: 64-bit ARM cores execute
-#                            32-bit ARMv7 code directly — older Raspberry Pi,
-#                            armhf Android devices, etc.)
-#   - Linux   i386         -> ubuntu-26.04 + docker linux/386        (native on
-#                            x86-64 CPU: older 32-bit Linux systems)
-#   - Android x86_64       -> ubuntu-26.04 + termux/termux-docker:x86_64
-#                            (Termux environment with bionic; Nuitka officially
-#                            supports Android via Termux)
-#   - Android aarch64      -> ubuntu-26.04-arm + termux/termux-docker:aarch64
-#
-# EXCLUDED rare ARM targets (constant problems, unpopular devices):
-#   - armv5  (ARM9/ARM10): almost no prebuilt wheels exist, official Debian
-#     python tags for arm32v5 are missing — the build almost always ends up
-#     without the QR/TOTP modules.
-#   - armv6  (Raspberry Pi 1/Zero): no prebuilt armv6-glibc Python 3.14 —
-#     would require building CPython from source in CI (tens of minutes,
-#     fragile).
-#   - armv9  (ARMv9-A tuning): a specialized build that does not run on
-#     armv8 devices; the universal linux-arm64 build remains.
-#
-# DOCKER NETWORKING — FINAL DESIGN (evidence-based).
-# In-container DNS on GitHub-hosted runners is unreliable: actions/runner-
-# images#6526 confirms that container networking/DNS is broken on a subset
-# of the Azure-hosted runner fleet and behavior differs per machine. Real
-# failed runs of this very workflow confirmed it: --network host fails,
-# --dns 8.8.8.8/1.1.1.1 fails (egress to external resolvers blocked), the
-# user-defined bridge embedded DNS fails (its upstream is the loopback
-# 127.0.0.53 stub, unreachable from a container namespace), --dns 172.17.0.1
-# with DNSStubListenerExtra fails on some machines.
-# THEREFORE the workflow no longer RELIES on in-container DNS:
-#   1) First it probes DNS candidates (host upstream resolvers from
-#      /run/systemd/resolve/resolv.conf, Azure virtual DNS 168.63.129.16,
-#      1.1.1.1, 8.8.8.8, 172.17.0.1 with the resolved listener exposed on
-#      the docker0 gateway, then --network host). If one works — great.
-#   2) If NOTHING works, it switches to a DNS-FREE path: all hostnames the
-#      build needs (Debian mirrors, PyPI, Nuitka downloads; for Termux also
-#      the repository domains extracted from the image's apt sources) are
-#      resolved ON THE HOST — where DNS always works — and injected into
-#      the container via `docker run --add-host host:IP` (official docker
-#      run flag; the entries land in /etc/hosts). HTTPS still works: SNI
-#      and certificate validation use the hostname, not the IP.
-# The chosen flags are exported via GITHUB_ENV and applied to the build
-# container. If even the --add-host verification fails, the job aborts in
-# ~1 minute with full diagnostics instead of wasting a long build.
-#
-# IMPORTANT about dependencies: for "exotic" targets (x86 win32, armv7, i386,
-# Android), prebuilt wheels of zxing-cpp / Pillow may not exist — pip then
-# builds them FROM SOURCE (sdist). That requires the native build chain of
-# each platform, which is installed explicitly below:
-#   - zxing-cpp (Python wrapper): CMake >= 3.18 + C++ compiler (official
-#     zxing-cpp build docs).
-#   - Pillow: zlib and libjpeg are REQUIRED by default; on Termux the
-#     documented prerequisites are clang/make/ndk-sysroot/libjpeg-turbo
-#     (official Pillow "Building from source" docs).
-# Each optional package is installed in its OWN pip transaction
-# (`pip install X || warning`): if one fails, the others are still attempted
-# and the build continues without the failed module — pyotp (pure Python)
-# is mandatory everywhere, --include-package flags are added ONLY for
-# modules that are actually importable, so the build never fails, the
-# binary is simply built without the optional QR/TOTP modules (like
-# mozvpn_no_externals.py).
-# ============================================================================
-
-name: Build Release (Nuitka)
+name: Build mozvpn_beta with Nuitka
 
 on:
   push:
-    tags:
-      - 'release/*'
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Prebuilt (never built from source) CPython 3.14.x - latest stable:
+#   Linux      - already inside official python.org Docker images
+#                  x86_64: python:3.14-slim-trixie (multi-arch official image)
+#                  arm64 : arm64v8/python:3.14-slim-trixie (official per-arch image)
+#                  armv7 : arm32v7/python:3.14-slim-trixie (official per-arch image)
+#   Windows    - official python.org installers via actions/setup-python
+# All Python packages (nuitka, zstandard, project deps) - latest stable from PyPI.
+# C compiler on Linux - latest stable Clang from the official LLVM apt
+# repository (apt.llvm.org), branch 22, wired up by the official llvm.sh script.
+env:
+  PYTHON_VERSION: '3.14'
+  LLVM_VERSION: '22'
+  DEBIAN_FRONTEND: noninteractive
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
-# BUILD SPEEDUP WITHOUT LOSING OPTIMIZATION (verified against Nuitka docs):
-#   PRIORITY — maximum binary optimization, therefore:
-#   1) --lto=yes     — Link-Time Optimization ("whole program optimization").
-#                      Enabled explicitly: best code in the binary (slower
-#                      builds — a deliberate tradeoff; Nuitka documentation).
-#   2) anti-bloat    — --enable-plugin=anti-bloat + --noinclude-*-mode=nofollow
-#                      cuts useless imports (pytest/setuptools etc.):
-#                      smaller binary, FASTER compilation, runtime untouched
-#                      (official Nuitka recommendation for faster builds).
-#   3) ccache + actions/cache — object file cache ACROSS runs
-#                      (on repeated tags/hotfixes only changed files are
-#                      rebuilt; optimization is unaffected: ccache caches
-#                      compilation results, flags stay the same).
-#   4) ordered-set + zstandard — recommended by Nuitka itself for
-#                      compilation speed (avoids the "very slow fallback"
-#                      warning).
-#   5) concurrency  — prevents two release builds of the same tag from
-#                      running in parallel for no reason.
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  # ==========================================================================
-  # 1. Native builds: Windows x64/x86 + Linux x64/arm64
-  # ==========================================================================
-  build:
-    name: Build ${{ matrix.script }} (${{ matrix.label }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+  # -----------------------------------------------------------------
+  # Linux (native runners, container jobs):
+  # Official python:3.14-slim-trixie image (Debian 13 "trixie" - current
+  # stable Debian; Python 3.14.x is the prebuilt python.org build).
+  # System packages: apt (native Debian package manager).
+  # C compiler: official LLVM apt repository (apt.llvm.org), branch 22,
+  # connected by the official llvm.sh script from apt.llvm.org.
+  # -----------------------------------------------------------------
+  build-linux:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-26.04, ubuntu-26.04-arm]
-        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
-        exclude:
-          # The no-externals script does not pull zxing-cpp/Pillow — remove the exclusion if desired
-          - os: ubuntu-26.04
-            script: mozvpn_no_externals.py
         include:
-          # -------- Windows x64 --------
-          - os: windows-latest
-            label: windows-x64
-            py_arch: x64
-            nuitka_extra: "--windows-console-mode=force"
-          # -------- Windows x86 (32-bit systems) --------
-          - os: windows-latest
-            label: windows-x86
-            py_arch: x86
-            nuitka_extra: "--windows-console-mode=force"
-          # -------- Linux x64 --------
-          - os: ubuntu-26.04
-            label: linux-x64
-            py_arch: x64
-            nuitka_extra: ""
-          # -------- Linux arm64 (GitHub ARM runner, native) --------
-          - os: ubuntu-26.04-arm
-            label: linux-arm64
-            py_arch: arm64
-            nuitka_extra: ""
-
-          # -------- Artifact naming rules --------
-          - os: windows-latest
-            label: windows-x64
-            script: mozvpn.py
-            artifact_name: mozvpn-windows.exe
-          - os: windows-latest
-            label: windows-x64
-            script: mozvpn_beta.py
-            artifact_name: mozvpn-beta-windows.exe
-          - os: windows-latest
-            label: windows-x64
-            script: mozvpn_no_externals.py
-            artifact_name: mozvpn-no-externals-windows.exe
-          - os: windows-latest
-            label: windows-x86
-            script: mozvpn.py
-            artifact_name: mozvpn-windows-x86.exe
-          - os: windows-latest
-            label: windows-x86
-            script: mozvpn_beta.py
-            artifact_name: mozvpn-beta-windows-x86.exe
-          - os: windows-latest
-            label: windows-x86
-            script: mozvpn_no_externals.py
-            artifact_name: mozvpn-no-externals-windows-x86.exe
-          - os: ubuntu-26.04
-            label: linux-x64
-            script: mozvpn.py
-            artifact_name: mozvpn-linux
-          - os: ubuntu-26.04
-            label: linux-x64
-            script: mozvpn_beta.py
-            artifact_name: mozvpn-beta-linux
-          - os: ubuntu-26.04
-            label: linux-x64
-            script: mozvpn_no_externals.py
-            artifact_name: mozvpn-no-externals-linux
-          - os: ubuntu-26.04-arm
-            label: linux-arm64
-            script: mozvpn.py
-            artifact_name: mozvpn-linux-arm64
-          - os: ubuntu-26.04-arm
-            label: linux-arm64
-            script: mozvpn_beta.py
-            artifact_name: mozvpn-beta-linux-arm64
-          - os: ubuntu-26.04-arm
-            label: linux-arm64
-            script: mozvpn_no_externals.py
-            artifact_name: mozvpn-no-externals-linux-arm64
+          # Linux x86_64 - official multi-arch python image
+          - name: linux-x64
+            runner: ubuntu-26.04
+            image: python:3.14-slim-trixie
+            platform: linux-x64
+            artifact: mozvpn_beta-linux-x64
+          # Linux ARMv8 (aarch64) - official per-arch arm64v8 image
+          # on the native arm64 runner (free for public repositories)
+          - name: linux-arm64
+            runner: ubuntu-26.04-arm
+            image: arm64v8/python:3.14-slim-trixie
+            platform: linux-arm64
+            artifact: mozvpn_beta-linux-arm64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      # ccache cache across runs (Linux only: ccache is in PATH there)
+      - name: Update system and install base tools via apt (native Debian package manager)
+        run: |
+          set -euxo pipefail
+          apt-get update
+          # Upgrade all system packages to the latest stable versions of the release
+          apt-get upgrade -y
+          # Base build tools for Nuitka: C toolchain, ccache, patchelf
+          apt-get install -y --no-install-recommends \
+            build-essential ccache patchelf ca-certificates curl gnupg lsb-release git
+
+      - name: Verify preinstalled Python 3.14
+        run: |
+          python3 --version
+          python3 -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
+          python3 -m pip --version
+
+      - name: Install latest stable Clang from the official LLVM apt repository
+        run: |
+          set -euxo pipefail
+          # Official LLVM repository bootstrap script (apt.llvm.org)
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          /tmp/llvm.sh ${{ env.LLVM_VERSION }} all
+          # Make sure clang is available
+          clang-${{ env.LLVM_VERSION }} --version
+          ln -sf "$(command -v clang-${{ env.LLVM_VERSION }})" /usr/local/bin/clang
+          ln -sf "$(command -v clang++-${{ env.LLVM_VERSION }})" /usr/local/bin/clang++
+          clang --version
+
       - name: Cache ccache
-        if: runner.os == 'Linux'
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
-          path: ~/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.script }}-${{ github.sha }}
+          path: /root/.cache/ccache
+          key: ccache-${{ matrix.platform }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.script }}-
+            ccache-${{ matrix.platform }}-
 
-      - name: Set up Python (${{ matrix.py_arch }})
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.14'
-          # check-latest: pull the latest 3.14.x patch release instead of
-          # the version cached on the runner (latest stable Python).
-          check-latest: true
-          architecture: ${{ matrix.py_arch }}
-
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install Python dependencies (latest stable from PyPI)
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          # apt-get is the stable CLI for scripts (apt prints "WARNING: apt
-          # does not have a stable CLI interface" — apt-get does NOT).
-          # APT::Update::Error-Mode=any: apt-get update returns non-zero on
-          # ANY index fetch failure (by default it returns 0 even when all
-          # downloads failed, which used to hide network breakage).
-          # Acquire::Retries=5: automatic retries on transient network failures.
-          sudo apt-get update \
-            -o APT::Update::Error-Mode=any \
-            -o Acquire::Retries=5 \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold"
-          sudo apt-get -y -o Acquire::Retries=5 upgrade
-          # Build deps for sdist fallbacks (no wheel for Python 3.14 yet):
-          #   cmake           — zxing-cpp Python wrapper requires CMake >= 3.18
-          #   build-essential — C/C++ compiler for zxing-cpp sdist
-          #   libjpeg-dev zlib1g-dev — Pillow REQUIRED deps (jpeg/png)
-          #   git             — pip may need it to fetch build backend deps
-          sudo apt-get install -y ccache patchelf build-essential \
-            cmake git libjpeg-dev zlib1g-dev
-
-      - name: Install Python dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "Nuitka[app]" ordered-set zstandard
-          # pyotp is pure Python, mandatory everywhere.
-          python -m pip install pyotp
-          # Each optional dependency in its OWN pip transaction: if one
-          # fails (no wheel, sdist build impossible), the others are still
-          # attempted and the build continues without the failed module.
-          python -m pip install zxing-cpp \
-            || echo "::warning::zxing-cpp failed on this arch — building without QR support"
-          python -m pip install Pillow \
-            || echo "::warning::Pillow failed on this arch — building without image support"
-          python -m pip install proxy.py \
-            || echo "::warning::proxy.py failed on this arch — building without proxy support"
-
-      - name: Build with Nuitka
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SCRIPT="${{ matrix.script }}"
-
-          COMMON=(
-            --onefile
-            --output-dir=dist
-            --remove-output
-            --assume-yes-for-downloads
-            --lto=yes
-            --nofollow-import-to=tkinter
-            --nofollow-import-to=unittest
-            --nofollow-import-to=test
-            # anti-bloat: cuts unneeded imports (pytest/setuptools etc.)
-            # — SMALLER binary and FASTER compilation, runtime optimizations untouched
-            --enable-plugin=anti-bloat
-            --noinclude-pytest-mode=nofollow
-            --noinclude-setuptools-mode=nofollow
-          )
-
-          # Add --include-package ONLY for modules that are actually
-          # importable (on targets without wheels they are simply absent
-          # from the environment).
-          INCLUDES=( --include-package=pyotp )
-          if python -c "import zxingcpp" 2>/dev/null; then
-            INCLUDES+=( --include-package=zxingcpp )
-          else
-            echo "::notice::zxingcpp not importable — building without QR support"
+          set -euxo pipefail
+          python3 -m pip install --no-cache-dir --upgrade pip
+          if [ -f requirements.txt ]; then
+            python3 -m pip install --no-cache-dir --upgrade -r requirements.txt
           fi
-          if python -c "import PIL" 2>/dev/null; then
-            INCLUDES+=( --include-package=PIL )
-          else
-            echo "::notice::PIL not importable — building without image support"
-          fi
-          if python -c "import proxy" 2>/dev/null; then
-            INCLUDES+=( --include-package=proxy )
-          fi
+          # Nuitka and helper packages - latest stable from PyPI
+          python3 -m pip install --no-cache-dir --upgrade nuitka ordered-set zstandard
 
-          EXTRA="${{ matrix.nuitka_extra }}"
-
-          python -m nuitka \
-            "${COMMON[@]}" \
-            "${INCLUDES[@]}" \
-            ${EXTRA} \
-            --output-filename="${{ matrix.artifact_name }}" \
-            "$SCRIPT"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}
-          if-no-files-found: error
-          retention-days: 7
-
-  # ==========================================================================
-  # 2. Linux i386 (32-bit x86 Linux) — docker linux/386 on an x64 runner.
-  #    i386 code executes natively on x86-64 CPUs (no emulation needed).
-  #    NETWORKING: adaptive — see the DOCKER NETWORKING block at the top.
-  #    i386 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
-  #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
-  # ==========================================================================
-  build-linux-i386:
-    name: Build ${{ matrix.script }} (linux-i386)
-    runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
-        include:
-          - script: mozvpn.py
-            artifact_name: mozvpn-linux-i386
-          - script: mozvpn_beta.py
-            artifact_name: mozvpn-beta-linux-i386
-          - script: mozvpn_no_externals.py
-            artifact_name: mozvpn-no-externals-linux-i386
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # ccache cache across runs: the directory is mounted into the
-      # container (CCACHE_DIR=/ccache), so object files survive restarts.
-      - name: Cache ccache (container)
-        uses: actions/cache@v6
-        with:
-          path: .ccache
-          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ matrix.artifact_name }}-
-
-      - name: Probe container networking (adaptive)
+      - name: Compile with Nuitka (optimized onefile, Clang + LTO)
         run: |
-          set -uo pipefail
-          # Probe in the SAME platform as the build so the result is valid.
-          PROBE_PLATFORM="--platform linux/386"
-          PROBE_IMAGE="python:3.14-trixie"
-          VERIFY_HOSTS="deb.debian.org pypi.org"
-
-          # dns_works <resolver>: does a real container resolve via this --dns?
-          dns_works() {
-            timeout 90 docker run --rm ${PROBE_PLATFORM} --dns "$1" \
-              -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-              sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done' \
-              >/dev/null 2>&1
-          }
-
-          # --- Candidate 172.17.0.1 preparation: expose the host's
-          # systemd-resolved on the docker0 gateway (loopback stub is
-          # unreachable from containers).
-          sudo mkdir -p /etc/systemd/resolved.conf.d
-          printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
-            | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf >/dev/null
-          sudo systemctl restart systemd-resolved || true
-
-          NET_FLAG=""; DNS_FLAG=""; ADDHOST_FLAG=""
-
-          # --- 1) DNS candidates (host upstreams first, then Azure,
-          #        public, docker0 gateway) ---
-          CANDS="$( { grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'; \
-                      echo 168.63.129.16; echo 1.1.1.1; echo 8.8.8.8; echo 172.17.0.1; } )"
-          WORKING=(); SEEN=" "
-          while IFS= read -r c; do
-            [ -z "$c" ] && continue
-            case "$SEEN" in *" $c "*) continue ;; esac
-            SEEN="$SEEN $c "
-            echo "Probing DNS candidate: $c ..."
-            if dns_works "$c"; then
-              echo "  -> WORKS"
-              WORKING+=("$c")
-              [ "${#WORKING[@]}" -ge 2 ] && break
-            else
-              echo "  -> failed"
-            fi
-          done <<< "$CANDS"
-
-          if [ "${#WORKING[@]}" -gt 0 ]; then
-            DNS_FLAG="--dns ${WORKING[0]}"
-            [ "${#WORKING[@]}" -gt 1 ] && DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
-          else
-            echo "No --dns candidate worked; probing --network host ..."
-            if timeout 90 docker run --rm --network host \
-                 -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-                 sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
-              NET_FLAG="--network host"
-            else
-              # --- 3) DNS-FREE fallback: resolve everything on the HOST and
-              #        inject host:IP into the container's /etc/hosts.
-              echo "Falling back to --add-host (host-resolved IPs) ..."
-              HOSTS="deb.debian.org security.debian.org pypi.org files.pythonhosted.org nuitka.net"
-              ADDHOST_FLAG=""
-              for h in $HOSTS; do
-                ip="$(getent ahostsv4 "$h" | awk '{print $1; exit}' || true)"
-                if [ -n "$ip" ]; then
-                  ADDHOST_FLAG="$ADDHOST_FLAG --add-host $h:$ip"
-                else
-                  echo "WARNING: could not resolve '$h' on the host" >&2
-                fi
-              done
-              if [ -z "$ADDHOST_FLAG" ]; then
-                echo "ERROR: host-side resolution failed entirely" >&2
-                cat /etc/resolv.conf >&2 || true
-                exit 1
-              fi
-              # Verify the /etc/hosts path in a real container.
-              if ! timeout 90 docker run --rm ${PROBE_PLATFORM} ${ADDHOST_FLAG} \
-                    -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-                    sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
-                echo "ERROR: no working container networking on this runner (even --add-host)" >&2
-                echo "--- host /etc/resolv.conf ---"; cat /etc/resolv.conf >&2 || true
-                echo "--- /run/systemd/resolve/resolv.conf ---"; cat /run/systemd/resolve/resolv.conf >&2 || true
-                exit 1
-              fi
-            fi
-          fi
-
-          echo "Chosen networking: NET='$NET_FLAG' DNS='$DNS_FLAG' ADDHOST='$ADDHOST_FLAG'"
-          {
-            echo "CONTAINER_NET_FLAG=$NET_FLAG"
-            echo "CONTAINER_DNS_FLAG=$DNS_FLAG"
-            echo "CONTAINER_ADDHOST_FLAG=$ADDHOST_FLAG"
-          } >> "$GITHUB_ENV"
-
-      - name: Prepare container build script
-        run: |
-          cat > ci-build-in-docker.sh <<'EOS'
-          set -euo pipefail
-          SCRIPT="$1"
-          ARTIFACT="$2"
-          export DEBIAN_FRONTEND=noninteractive
-          # ---- PACKAGE INSTALLATION -------------------------------------
-          # apt-get is the stable CLI for scripts: the `apt` command prints
-          # "WARNING: apt does not have a stable CLI interface. Use with
-          # caution in scripts." when used non-interactively; apt-get does
-          # NOT print this warning and is the officially recommended tool
-          # for scripts, Dockerfiles and CI pipelines.
-          # APT::Update::Error-Mode=any: apt-get update fails hard on any
-          # index fetch error (default: exit 0 even if ALL downloads fail —
-          # that is how index loss went unnoticed before).
-          # Acquire::Retries=5: retry transient fetch failures.
-          # Dpkg::Options disable interactive conffile prompts,
-          # --no-install-recommends avoids pulling extra packages.
-          APT_OPTS=(-y --no-install-recommends \
-            -o Acquire::Retries=5 \
-            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
-          apt-get update -o APT::Update::Error-Mode=any
-          apt-get "${APT_OPTS[@]}" upgrade
-          # Build deps for sdist fallbacks (i386 has no prebuilt wheels):
-          #   cmake           — zxing-cpp Python wrapper requires CMake >= 3.18
-          #   build-essential — C/C++ compiler for zxing-cpp sdist
-          #   libjpeg-dev zlib1g-dev — Pillow REQUIRED deps (jpeg/png)
-          #   git             — pip may need it to fetch build backend deps
-          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential \
-            cmake git libjpeg-dev zlib1g-dev
-          python -m pip install --upgrade pip
-          python -m pip install "Nuitka[app]" ordered-set zstandard
-          python -m pip install pyotp
-          # Each optional dependency in its OWN pip transaction: if one
-          # fails, the others are still attempted and the build continues.
-          pip install zxing-cpp || echo "optional dep zxing-cpp failed on i386 — building without it"
-          pip install Pillow     || echo "optional dep Pillow failed on i386 — building without it"
-          pip install proxy.py   || echo "optional dep proxy.py failed on i386 — building without it"
-          INCLUDES=( --include-package=pyotp )
-          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
-          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
-          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
-          python -m nuitka \
-            --onefile \
-            --output-dir=dist \
-            --remove-output \
-            --assume-yes-for-downloads \
+          set -euxo pipefail
+          mkdir -p build
+          python3 -m nuitka \
+            --clang \
+            --mode=onefile \
             --lto=yes \
-            --nofollow-import-to=tkinter \
-            --nofollow-import-to=unittest \
-            --nofollow-import-to=test \
-            --enable-plugin=anti-bloat \
-            --noinclude-pytest-mode=nofollow \
-            --noinclude-setuptools-mode=nofollow \
-            "${INCLUDES[@]}" \
-            --output-filename="$ARTIFACT" \
-            "$SCRIPT"
-          EOS
-          chmod +x ci-build-in-docker.sh
+            --onefile-compression=zstd \
+            --assume-yes-for-downloads \
+            --output-dir=build \
+            --output-filename=mozvpn_beta-${{ matrix.platform }} \
+            --product-name="mozvpn_beta" \
+            --file-version=1.0.0 \
+            --product-version=1.0.0 \
+            --report=build/compilation-report.xml \
+            mozvpn_beta.py
 
-      - name: Build in linux/386 container
+      - name: Smoke test (run the binary with --help, if supported)
         run: |
-          # Flags chosen by the probe step for THIS runner. Unquoted
-          # expansion is intentional: each variable holds 0..N
-          # space-separated docker flags (or is empty).
-          docker run --rm \
-            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG $CONTAINER_ADDHOST_FLAG \
-            --platform linux/386 \
-            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
-            -v "$PWD":/src -w /src \
-            python:3.14-trixie \
-            bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
+          chmod +x "build/mozvpn_beta-${{ matrix.platform }}"
+          "build/mozvpn_beta-${{ matrix.platform }}" --help || true
+        continue-on-error: true
+
+      - name: Verify output
+        run: |
+          file "build/mozvpn_beta-${{ matrix.platform }}"
+          ls -lh "build/mozvpn_beta-${{ matrix.platform }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact }}
+          path: build/mozvpn_beta-${{ matrix.platform }}
           if-no-files-found: error
-          retention-days: 7
 
-  # ==========================================================================
-  # 3. Linux armv7 (32-bit ARM: older Raspberry Pi, armhf distributions,
-  #    older Android with arm Termux). Runs on the FREE GitHub arm64 runner
-  #    (ubuntu-26.04-arm): ARMv8 CPUs execute 32-bit ARMv7 code natively —
-  #    no QEMU needed, the build is fast.
-  #    NETWORKING: adaptive — see the DOCKER NETWORKING block at the top.
-  #    armv7 has NO prebuilt wheels: zxing-cpp/Pillow are built from sdist —
-  #    cmake + C/C++ toolchain + libjpeg/zlib headers are installed for that.
-  # ==========================================================================
+  # -----------------------------------------------------------------
+  # Linux ARMv7 (32-bit ARM):
+  # There is no native armv7 GitHub-hosted runner, and Nuitka cannot
+  # cross-compile, so this job runs the official arm32v7/python image
+  # (Debian 13 trixie, prebuilt python.org CPython 3.14.7) under QEMU
+  # emulation on an x64 runner via Docker.
+  # System packages: apt (native Debian package manager).
+  # C compiler: official LLVM apt repository (apt.llvm.org), branch 22.
+  # -----------------------------------------------------------------
   build-linux-armv7:
-    name: Build ${{ matrix.script }} (linux-armv7)
-    runs-on: ubuntu-26.04-arm
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
-        include:
-          - script: mozvpn.py
-            artifact_name: mozvpn-linux-armv7
-          - script: mozvpn_beta.py
-            artifact_name: mozvpn-beta-linux-armv7
-          - script: mozvpn_no_externals.py
-            artifact_name: mozvpn-no-externals-linux-armv7
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # ccache cache across runs: the directory is mounted into the
-      # container (CCACHE_DIR=/ccache), so object files survive restarts.
-      - name: Cache ccache (container)
-        uses: actions/cache@v6
-        with:
-          path: .ccache
-          key: ccache-${{ matrix.artifact_name }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ matrix.artifact_name }}-
-
-      - name: Probe container networking (adaptive)
-        run: |
-          set -uo pipefail
-          # Probe in the SAME platform as the build. python:3.14-trixie has
-          # no guaranteed arm/v7 tag, so probe on debian:trixie-slim
-          # (multi-arch incl. armhf); DNS behavior is identical for all
-          # containers on the same daemon.
-          PROBE_PLATFORM="--platform linux/arm/v7"
-          PROBE_IMAGE="debian:trixie-slim"
-          VERIFY_HOSTS="deb.debian.org pypi.org"
-
-          dns_works() {
-            timeout 90 docker run --rm ${PROBE_PLATFORM} --dns "$1" \
-              -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-              sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done' \
-              >/dev/null 2>&1
-          }
-
-          # --- Candidate 172.17.0.1 preparation (expose resolved on docker0)
-          sudo mkdir -p /etc/systemd/resolved.conf.d
-          printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
-            | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf >/dev/null
-          sudo systemctl restart systemd-resolved || true
-
-          NET_FLAG=""; DNS_FLAG=""; ADDHOST_FLAG=""
-
-          # --- 1) DNS candidates ---
-          CANDS="$( { grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'; \
-                      echo 168.63.129.16; echo 1.1.1.1; echo 8.8.8.8; echo 172.17.0.1; } )"
-          WORKING=(); SEEN=" "
-          while IFS= read -r c; do
-            [ -z "$c" ] && continue
-            case "$SEEN" in *" $c "*) continue ;; esac
-            SEEN="$SEEN $c "
-            echo "Probing DNS candidate: $c ..."
-            if dns_works "$c"; then
-              echo "  -> WORKS"
-              WORKING+=("$c")
-              [ "${#WORKING[@]}" -ge 2 ] && break
-            else
-              echo "  -> failed"
-            fi
-          done <<< "$CANDS"
-
-          if [ "${#WORKING[@]}" -gt 0 ]; then
-            DNS_FLAG="--dns ${WORKING[0]}"
-            [ "${#WORKING[@]}" -gt 1 ] && DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
-          else
-            echo "No --dns candidate worked; probing --network host ..."
-            if timeout 90 docker run --rm --network host \
-                 -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-                 sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
-              NET_FLAG="--network host"
-            else
-              # --- 3) DNS-FREE fallback: --add-host with host-resolved IPs
-              echo "Falling back to --add-host (host-resolved IPs) ..."
-              HOSTS="deb.debian.org security.debian.org pypi.org files.pythonhosted.org nuitka.net"
-              ADDHOST_FLAG=""
-              for h in $HOSTS; do
-                ip="$(getent ahostsv4 "$h" | awk '{print $1; exit}' || true)"
-                if [ -n "$ip" ]; then
-                  ADDHOST_FLAG="$ADDHOST_FLAG --add-host $h:$ip"
-                else
-                  echo "WARNING: could not resolve '$h' on the host" >&2
-                fi
-              done
-              if [ -z "$ADDHOST_FLAG" ]; then
-                echo "ERROR: host-side resolution failed entirely" >&2
-                cat /etc/resolv.conf >&2 || true
-                exit 1
-              fi
-              if ! timeout 90 docker run --rm ${PROBE_PLATFORM} ${ADDHOST_FLAG} \
-                    -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-                    sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
-                echo "ERROR: no working container networking on this runner (even --add-host)" >&2
-                echo "--- host /etc/resolv.conf ---"; cat /etc/resolv.conf >&2 || true
-                echo "--- /run/systemd/resolve/resolv.conf ---"; cat /run/systemd/resolve/resolv.conf >&2 || true
-                exit 1
-              fi
-            fi
-          fi
-
-          echo "Chosen networking: NET='$NET_FLAG' DNS='$DNS_FLAG' ADDHOST='$ADDHOST_FLAG'"
-          {
-            echo "CONTAINER_NET_FLAG=$NET_FLAG"
-            echo "CONTAINER_DNS_FLAG=$DNS_FLAG"
-            echo "CONTAINER_ADDHOST_FLAG=$ADDHOST_FLAG"
-          } >> "$GITHUB_ENV"
-
-      - name: Prepare container build script
-        run: |
-          cat > ci-build-in-docker.sh <<'EOS'
-          set -euo pipefail
-          SCRIPT="$1"
-          ARTIFACT="$2"
-          export DEBIAN_FRONTEND=noninteractive
-          # ---- PACKAGE INSTALLATION -------------------------------------
-          # apt-get is the stable CLI for scripts: the `apt` command prints
-          # "WARNING: apt does not have a stable CLI interface. Use with
-          # caution in scripts." when used non-interactively; apt-get does
-          # NOT print this warning and is the officially recommended tool
-          # for scripts, Dockerfiles and CI pipelines.
-          # APT::Update::Error-Mode=any: apt-get update fails hard on any
-          # index fetch error (default: exit 0 even if ALL downloads fail).
-          # Acquire::Retries=5: retry transient fetch failures.
-          # Dpkg::Options disable interactive conffile prompts,
-          # --no-install-recommends avoids pulling extra packages.
-          APT_OPTS=(-y --no-install-recommends \
-            -o Acquire::Retries=5 \
-            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
-          apt-get update -o APT::Update::Error-Mode=any
-          apt-get "${APT_OPTS[@]}" upgrade
-          # Build deps for sdist fallbacks (armv7 has no prebuilt wheels):
-          #   cmake           — zxing-cpp Python wrapper requires CMake >= 3.18
-          #   build-essential — C/C++ compiler for zxing-cpp sdist
-          #   libjpeg-dev zlib1g-dev — Pillow REQUIRED deps (jpeg/png)
-          #   git             — pip may need it to fetch build backend deps
-          apt-get "${APT_OPTS[@]}" install ccache patchelf build-essential \
-            cmake git libjpeg-dev zlib1g-dev
-          python -m pip install --upgrade pip
-          python -m pip install "Nuitka[app]" ordered-set zstandard
-          python -m pip install pyotp
-          # Each optional dependency in its OWN pip transaction: if one
-          # fails, the others are still attempted and the build continues.
-          pip install zxing-cpp || echo "optional dep zxing-cpp failed on armv7 — building without it"
-          pip install Pillow     || echo "optional dep Pillow failed on armv7 — building without it"
-          pip install proxy.py   || echo "optional dep proxy.py failed on armv7 — building without it"
-          INCLUDES=( --include-package=pyotp )
-          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
-          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
-          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
-          python -m nuitka \
-            --onefile \
-            --output-dir=dist \
-            --remove-output \
-            --assume-yes-for-downloads \
-            --lto=yes \
-            --nofollow-import-to=tkinter \
-            --nofollow-import-to=unittest \
-            --nofollow-import-to=test \
-            --enable-plugin=anti-bloat \
-            --noinclude-pytest-mode=nofollow \
-            --noinclude-setuptools-mode=nofollow \
-            "${INCLUDES[@]}" \
-            --output-filename="$ARTIFACT" \
-            "$SCRIPT"
-          EOS
-          chmod +x ci-build-in-docker.sh
-
-      - name: Build in linux/arm/v7 container
-        run: |
-          # Flags chosen by the probe step for THIS runner (unquoted
-          # expansion is intentional — see the i386 job).
-          docker run --rm \
-            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG $CONTAINER_ADDHOST_FLAG \
-            --platform linux/arm/v7 \
-            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
-            -v "$PWD":/src -w /src \
-            python:3.14-trixie \
-            bash ci-build-in-docker.sh "${{ matrix.script }}" "${{ matrix.artifact_name }}"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}
-          if-no-files-found: error
-          retention-days: 7
-
-  # ==========================================================================
-  # 4. Android (Termux / bionic) — Nuitka officially supports Android via
-  #    Termux. We build inside the official termux/termux-docker image —
-  #    the same package set as on a real device, so the binary also works
-  #    in Termux on Android, including Android-x86 (the x86_64 tag).
-  #    The aarch64 tag runs natively on the ARM runner, x86_64 on the x64
-  #    runner (no emulation needed).
-  #    NETWORKING: adaptive — see the DOCKER NETWORKING block at the top.
-  #    In the --add-host fallback the Termux repository domains are
-  #    extracted from the image's own apt sources (no network needed for
-  #    that), so every host the build contacts is covered.
-  #    PACKAGE MANAGER: apt-get (NOT pkg) — pkg is a wrapper over the
-  #    `apt` command, which ALWAYS prints "WARNING: apt does not have a
-  #    stable CLI interface. Use with caution in scripts." when run
-  #    non-interactively; apt-get prints no warning (stable CLI for
-  #    scripts).
-  #    ANDROID HAS NO PREBUILT WHEELS: zxing-cpp and Pillow are built from
-  #    sdist. The REQUIRED build prerequisites are (official docs):
-  #      - zxing-cpp: CMake >= 3.18 + C++ compiler (Termux: cmake + clang)
-  #      - Pillow:   clang make ndk-sysroot libjpeg-turbo
-  #        (zlib and libjpeg are REQUIRED by default — Pillow docs)
-  #    Without them pip failed with: "ERROR: Failed to build 'zxing-cpp'
-  #    when installing backend dependencies for zxing-cpp".
-  #    The build is experimental: continue-on-error — an Android job failure
-  #    does not break the release of the other platforms.
-  # ==========================================================================
-  build-android:
-    name: Build ${{ matrix.script }} (android-${{ matrix.termux_tag }})
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix:
-        script: [mozvpn.py, mozvpn_beta.py, mozvpn_no_externals.py]
-        termux_tag: [x86_64, aarch64]
-        include:
-          # Which runner to use for each Termux tag (native, no QEMU)
-          - termux_tag: x86_64
-            os: ubuntu-26.04
-          - termux_tag: aarch64
-            os: ubuntu-26.04-arm
-          # Artifact naming rules
-          - script: mozvpn.py
-            termux_tag: x86_64
-            artifact_name: mozvpn-android-x86_64
-          - script: mozvpn.py
-            termux_tag: aarch64
-            artifact_name: mozvpn-android-aarch64
-          - script: mozvpn_beta.py
-            termux_tag: x86_64
-            artifact_name: mozvpn-beta-android-x86_64
-          - script: mozvpn_beta.py
-            termux_tag: aarch64
-            artifact_name: mozvpn-beta-android-aarch64
-          - script: mozvpn_no_externals.py
-            termux_tag: x86_64
-            artifact_name: mozvpn-no-externals-android-x86_64
-          - script: mozvpn_no_externals.py
-            termux_tag: aarch64
-            artifact_name: mozvpn-no-externals-android-aarch64
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # ccache cache across runs (mounted into the Termux container)
-      - name: Cache ccache (Termux)
-        uses: actions/cache@v6
-        with:
-          path: .ccache
-          key: ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-${{ github.sha }}
-          restore-keys: |
-            ccache-termux-${{ matrix.termux_tag }}-${{ matrix.script }}-
-
-      - name: Probe container networking (adaptive)
-        run: |
-          set -uo pipefail
-          # Probe on a Debian container: Termux has no getent (bionic
-          # libc, not glibc), but DNS behavior is identical for all
-          # containers on the same daemon.
-          PROBE_PLATFORM=""
-          PROBE_IMAGE="debian:trixie-slim"
-          VERIFY_HOSTS="pypi.org packages.termux.dev"
-
-          dns_works() {
-            timeout 90 docker run --rm ${PROBE_PLATFORM} --dns "$1" \
-              -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-              sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done' \
-              >/dev/null 2>&1
-          }
-
-          # --- Candidate 172.17.0.1 preparation (expose resolved on docker0)
-          sudo mkdir -p /etc/systemd/resolved.conf.d
-          printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' \
-            | sudo tee /etc/systemd/resolved.conf.d/docker-containers.conf >/dev/null
-          sudo systemctl restart systemd-resolved || true
-
-          NET_FLAG=""; DNS_FLAG=""; ADDHOST_FLAG=""
-
-          # --- 1) DNS candidates ---
-          CANDS="$( { grep '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null | awk '{print $2}'; \
-                      echo 168.63.129.16; echo 1.1.1.1; echo 8.8.8.8; echo 172.17.0.1; } )"
-          WORKING=(); SEEN=" "
-          while IFS= read -r c; do
-            [ -z "$c" ] && continue
-            case "$SEEN" in *" $c "*) continue ;; esac
-            SEEN="$SEEN $c "
-            echo "Probing DNS candidate: $c ..."
-            if dns_works "$c"; then
-              echo "  -> WORKS"
-              WORKING+=("$c")
-              [ "${#WORKING[@]}" -ge 2 ] && break
-            else
-              echo "  -> failed"
-            fi
-          done <<< "$CANDS"
-
-          if [ "${#WORKING[@]}" -gt 0 ]; then
-            DNS_FLAG="--dns ${WORKING[0]}"
-            [ "${#WORKING[@]}" -gt 1 ] && DNS_FLAG="$DNS_FLAG --dns ${WORKING[1]}"
-          else
-            echo "No --dns candidate worked; probing --network host ..."
-            if timeout 90 docker run --rm --network host \
-                 -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-                 sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
-              NET_FLAG="--network host"
-            else
-              # --- 3) DNS-FREE fallback: --add-host with host-resolved IPs.
-              # The Termux repository domains are extracted from the
-              # image's own apt sources (reading files needs no network).
-              echo "Falling back to --add-host (host-resolved IPs) ..."
-              TERMUX_PREFIX="/data/data/com.termux/files/usr"
-              TERMUX_HOSTS="$(docker run --rm \
-                termux/termux-docker:${{ matrix.termux_tag }} \
-                sh -c "cat ${TERMUX_PREFIX}/etc/apt/sources.list ${TERMUX_PREFIX}/etc/apt/sources.list.d/* 2>/dev/null || true" \
-                | grep -oE 'https?://[^/[:space:]]+' | sed -E 's#https?://##' | sort -u || true)"
-              HOSTS="$TERMUX_HOSTS packages.termux.dev pypi.org files.pythonhosted.org nuitka.net"
-              ADDHOST_FLAG=""
-              for h in $HOSTS; do
-                [ -z "$h" ] && continue
-                ip="$(getent ahostsv4 "$h" | awk '{print $1; exit}' || true)"
-                if [ -n "$ip" ]; then
-                  ADDHOST_FLAG="$ADDHOST_FLAG --add-host $h:$ip"
-                else
-                  echo "WARNING: could not resolve '$h' on the host" >&2
-                fi
-              done
-              if [ -z "$ADDHOST_FLAG" ]; then
-                echo "ERROR: host-side resolution failed entirely" >&2
-                cat /etc/resolv.conf >&2 || true
-                exit 1
-              fi
-              if ! timeout 90 docker run --rm ${PROBE_PLATFORM} ${ADDHOST_FLAG} \
-                    -e VERIFY_HOSTS="$VERIFY_HOSTS" "$PROBE_IMAGE" \
-                    sh -c 'for h in $VERIFY_HOSTS; do getent hosts "$h" >/dev/null || exit 1; done'; then
-                echo "ERROR: no working container networking on this runner (even --add-host)" >&2
-                echo "--- host /etc/resolv.conf ---"; cat /etc/resolv.conf >&2 || true
-                echo "--- /run/systemd/resolve/resolv.conf ---"; cat /run/systemd/resolve/resolv.conf >&2 || true
-                exit 1
-              fi
-            fi
-          fi
-
-          echo "Chosen networking: NET='$NET_FLAG' DNS='$DNS_FLAG' ADDHOST='$ADDHOST_FLAG'"
-          {
-            echo "CONTAINER_NET_FLAG=$NET_FLAG"
-            echo "CONTAINER_DNS_FLAG=$DNS_FLAG"
-            echo "CONTAINER_ADDHOST_FLAG=$ADDHOST_FLAG"
-          } >> "$GITHUB_ENV"
-
-      - name: Prepare Termux build script
-        run: |
-          cat > termux-build.sh <<'EOS'
-          set -euo pipefail
-          SCRIPT="$1"
-          ARTIFACT="$2"
-
-          # --- 1) PACKAGE MANAGER: apt-get, NOT pkg --------------------------
-          # The "WARNING: apt does not have a stable CLI interface. Use with
-          # caution in scripts." warning was previously emitted here because
-          # `pkg` is a wrapper that internally calls the `apt` command, and
-          # `apt` ALWAYS prints this warning when used non-interactively
-          # (apt is designed for interactive terminal use; there is no flag
-          # to suppress the warning). The stable, script-safe CLI is
-          # `apt-get`, which exists in Termux and prints NO warning.
-          #   - `pkg upgrade` == `apt update && apt full-upgrade`, so we
-          #     explicitly run `apt-get update` + `apt-get full-upgrade` —
-          #     the pkg wrapper only automates these two calls (plus mirror
-          #     selection, which is already baked into the image).
-          # Dpkg::Options disable interactive conffile prompts.
-          # Acquire::Retries=5: retry transient fetch failures.
-          # APT::Update::Error-Mode=any: apt-get update returns non-zero on
-          # ANY index fetch failure — this is the DNS health check here
-          # (getent is NOT available in Termux: bionic libc, not glibc), so
-          # a broken resolver fails immediately with a clear apt error
-          # instead of "Unable to locate package" later.
-          APT_OPTS=(-y \
-            -o Acquire::Retries=5 \
-            -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
-
-          # --- 2) FULL UPGRADE TO THE LATEST STABLE VERSIONS -----------------
-          # apt-get update refreshes the repository/mirror indexes (pkg did
-          # this implicitly before upgrade — with apt-get it must be called
-          # explicitly). apt-get full-upgrade updates ALL installed image
-          # packages to their latest stable versions (the direct equivalent
-          # of `pkg upgrade`).
-          apt-get update -o APT::Update::Error-Mode=any
-          apt-get "${APT_OPTS[@]}" full-upgrade
-
-          # --- 3) Termux environment: the Nuitka-recommended packages PLUS ---
-          #    the sdist build prerequisites for zxing-cpp/Pillow
-          #    (Android has no prebuilt wheels; without these pip failed
-          #    with "ERROR: Failed to build 'zxing-cpp' when installing
-          #    backend dependencies for zxing-cpp"):
-          #      - cmake, ninja, clang, make — CMake >= 3.18 + C/C++ toolchain
-          #        required by the zxing-cpp Python wrapper (official
-          #        zxing-cpp docs)
-          #      - ndk-sysroot, libjpeg-turbo, zlib — REQUIRED by Pillow
-          #        (zlib and libjpeg are mandatory by default; official
-          #        Pillow "Building from source" docs list exactly:
-          #        python ndk-sysroot clang make libjpeg-turbo)
-          #      - patchelf ccache binutils ldd termux-elf-cleaner —
-          #        the Nuitka Android documentation set
-          # IMPORTANT: pip in Termux is the python-pip package; upgrading it
-          # on your own is FORBIDDEN (the "Installing pip is forbidden"
-          # error), so there must be NO `pip install --upgrade pip` here.
-          apt-get "${APT_OPTS[@]}" install \
-            python patchelf ccache binutils ldd termux-elf-cleaner \
-            cmake ninja clang make ndk-sysroot libjpeg-turbo zlib
-
-          pip install "Nuitka[app]" ordered-set zstandard
-          pip install pyotp
-          # Each optional dependency in its OWN pip transaction: if one
-          # fails to build from sdist, the others are still attempted and
-          # the build continues without the failed module.
-          pip install zxing-cpp || echo "optional dep zxing-cpp failed in Termux — building without it"
-          pip install Pillow     || echo "optional dep Pillow failed in Termux — building without it"
-          pip install proxy.py   || echo "optional dep proxy.py failed in Termux — building without it"
-
-          INCLUDES=( --include-package=pyotp )
-          python -c "import zxingcpp" 2>/dev/null && INCLUDES+=( --include-package=zxingcpp ) || true
-          python -c "import PIL"       2>/dev/null && INCLUDES+=( --include-package=PIL )       || true
-          python -c "import proxy"     2>/dev/null && INCLUDES+=( --include-package=proxy )     || true
-
-          mkdir -p ~/work
-          cp "/host-src/$SCRIPT" ~/work/
-          cd ~/work
-
-          python -m nuitka \
-            --onefile \
-            --output-dir=dist \
-            --remove-output \
-            --assume-yes-for-downloads \
-            --lto=yes \
-            --nofollow-import-to=tkinter \
-            --nofollow-import-to=unittest \
-            --nofollow-import-to=test \
-            --enable-plugin=anti-bloat \
-            --noinclude-pytest-mode=nofollow \
-            --noinclude-setuptools-mode=nofollow \
-            "${INCLUDES[@]}" \
-            --output-filename="$ARTIFACT" \
-            "$SCRIPT"
-
-          cp "dist/$ARTIFACT" /host-dist/
-          EOS
-
-          # Directories exposed to the container: sources (read) and output (write).
-          mkdir -p dist-host
-          chmod 777 dist-host
-
-      - name: Build in Termux container (${{ matrix.termux_tag }})
-        timeout-minutes: 300
-        run: |
-          # Flags chosen by the probe step for THIS runner (unquoted
-          # expansion is intentional — see the i386 job).
-          docker run --rm \
-            $CONTAINER_NET_FLAG $CONTAINER_DNS_FLAG $CONTAINER_ADDHOST_FLAG \
-            -e CCACHE_DIR=/ccache -v "$PWD/.ccache":/ccache \
-            -v "$PWD":/host-src:ro \
-            -v "$PWD/dist-host":/host-dist \
-            termux/termux-docker:${{ matrix.termux_tag }} \
-            bash /host-src/termux-build.sh \
-              "${{ matrix.script }}" "${{ matrix.artifact_name }}"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist-host/${{ matrix.artifact_name }}
-          if-no-files-found: warn
-          retention-days: 7
-
-  # ==========================================================================
-  # 5. Release: collects ALL artifacts from ALL architectures
-  # ==========================================================================
-  release:
-    name: Create GitHub Release
-    needs: [build, build-linux-i386, build-linux-armv7, build-android]
+    name: linux-armv7
     runs-on: ubuntu-26.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
         with:
-          path: artifacts
+          platforms: linux/arm/v7
 
-      - name: Prepare release files
+      - name: Build inside the official arm32v7/python container
         run: |
-          mkdir -p release
-          # ---- Windows x64 ----
-          cp artifacts/mozvpn-windows.exe/mozvpn-windows.exe release/ || true
-          cp artifacts/mozvpn-beta-windows.exe/mozvpn-beta-windows.exe release/ || true
-          cp artifacts/mozvpn-no-externals-windows.exe/mozvpn-no-externals-windows.exe release/ || true
-          # ---- Windows x86 (32-bit) ----
-          cp artifacts/mozvpn-windows-x86.exe/mozvpn-windows-x86.exe release/ || true
-          cp artifacts/mozvpn-beta-windows-x86.exe/mozvpn-beta-windows-x86.exe release/ || true
-          cp artifacts/mozvpn-no-externals-windows-x86.exe/mozvpn-no-externals-windows-x86.exe release/ || true
-          # ---- Linux x64 ----
-          cp artifacts/mozvpn-linux/mozvpn-linux release/ || true
-          cp artifacts/mozvpn-beta-linux/mozvpn-beta-linux release/ || true
-          cp artifacts/mozvpn-no-externals-linux/mozvpn-no-externals-linux release/ || true
-          # ---- Linux arm64 ----
-          cp artifacts/mozvpn-linux-arm64/mozvpn-linux-arm64 release/ || true
-          cp artifacts/mozvpn-beta-linux-arm64/mozvpn-beta-linux-arm64 release/ || true
-          cp artifacts/mozvpn-no-externals-linux-arm64/mozvpn-no-externals-linux-arm64 release/ || true
-          # ---- Linux armv7 (older ARM devices) ----
-          cp artifacts/mozvpn-linux-armv7/mozvpn-linux-armv7 release/ || true
-          cp artifacts/mozvpn-beta-linux-armv7/mozvpn-beta-linux-armv7 release/ || true
-          cp artifacts/mozvpn-no-externals-linux-armv7/mozvpn-no-externals-linux-armv7 release/ || true
-          # ---- Linux i386 (older 32-bit x86) ----
-          cp artifacts/mozvpn-linux-i386/mozvpn-linux-i386 release/ || true
-          cp artifacts/mozvpn-beta-linux-i386/mozvpn-beta-linux-i386 release/ || true
-          cp artifacts/mozvpn-no-externals-linux-i386/mozvpn-no-externals-linux-i386 release/ || true
-          # ---- Android x86_64 (Android-x86 and Termux on x86) ----
-          cp artifacts/mozvpn-android-x86_64/mozvpn-android-x86_64 release/ || true
-          cp artifacts/mozvpn-beta-android-x86_64/mozvpn-beta-android-x86_64 release/ || true
-          cp artifacts/mozvpn-no-externals-android-x86_64/mozvpn-no-externals-android-x86_64 release/ || true
-          # ---- Android aarch64 (ARM devices) ----
-          cp artifacts/mozvpn-android-aarch64/mozvpn-android-aarch64 release/ || true
-          cp artifacts/mozvpn-beta-android-aarch64/mozvpn-beta-android-aarch64 release/ || true
-          cp artifacts/mozvpn-no-externals-android-aarch64/mozvpn-no-externals-android-aarch64 release/ || true
-          ls -la release/
-
-      - name: Create Release & upload assets
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            release/*
+          set -euxo pipefail
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e LLVM_VERSION="${LLVM_VERSION}" \
+            -v "$PWD:/src" \
+            -w /src \
+            arm32v7/python:3.14-slim-trixie \
+            bash -c '
+              set -euxo pipefail
+              # Update system packages with apt (native Debian package manager)
+              apt-get update
+              apt-get upgrade -y
+              apt-get install -y --no-install-recommends \
+                build-essential ccache patchelf ca-certificates curl gnupg lsb-release git
+              # Verify the prebuilt Python 3.14
+              python3 --version
+              python3 -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
+              # Latest stable Clang from the official LLVM apt repository
+              curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+              chmod +x /tmp/llvm.sh
+              /tmp/llvm.sh "${LLVM_VERSION}" all
+              ln -sf "$(command -v clang-${LLVM_VERSION})" /usr/local/bin/clang
+              ln -sf "$(command -v clang++-${LLVM_VERSION})" /usr/local/bin/clang++
+              clang --version
+              # Python dependencies - latest stable from PyPI
+              python3 -m pip install --no-cache-dir --upgrade pip
+              if [ -f requirements.txt ]; then
+                python3 -m pip install --no-cache-dir --upgrade -r requirements.txt
+              fi
+              python3 -m pip install --no-cache-dir --upgrade nuitka ordered-set zstandard
+              # Compile with Nuitka (optimized onefile, Clang + LTO)
+              mkdir -p /src/build
+              python3 -m nuitka \
+                --clang \
+                --mode=onefile \
+                --lto=yes \
+                --onefile-compression=zstd \
+                --assume-yes-for-downloads \
+                --output-dir=/src/build \
+                --output-filename=mozvpn_beta-linux-armv7 \
+                --product-name="mozvpn_beta" \
+                --file-version=1.0.0 \
+                --product-version=1.0.0 \
+                --report=/src/build/compilation-report.xml \
+                mozvpn_beta.py
+            '
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLVM_VERSION: ${{ env.LLVM_VERSION }}
+
+      - name: Smoke test (run the binary with --help, if supported)
+        run: |
+          chmod +x build/mozvpn_beta-linux-armv7
+          docker run --rm --platform linux/arm/v7 \
+            -v "$PWD:/src" -w /src \
+            arm32v7/python:3.14-slim-trixie \
+            ./build/mozvpn_beta-linux-armv7 --help || true
+        continue-on-error: true
+
+      - name: Verify output
+        run: |
+          file build/mozvpn_beta-linux-armv7
+          ls -lh build/mozvpn_beta-linux-armv7
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mozvpn_beta-linux-armv7
+          path: build/mozvpn_beta-linux-armv7
+          if-no-files-found: error
+
+  # -----------------------------------------------------------------
+  # Windows: prebuilt python.org CPython installers via
+  # actions/setup-python. x86 (32-bit) builds on windows-latest with the
+  # 32-bit CPython + MSVC (32-bit VS tools are part of the VS install on
+  # the runner). arm64 - native windows-11-arm runner (free for public
+  # repositories only). Compiler: MSVC; Nuitka downloads ccache/clcache
+  # from an official source by itself (--assume-yes-for-downloads).
+  # -----------------------------------------------------------------
+  build-windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            python-arch: x64
+            platform: windows-x64
+            artifact: mozvpn_beta-windows-x64
+          - name: windows-x86
+            os: windows-latest
+            python-arch: x86
+            platform: windows-x86
+            artifact: mozvpn_beta-windows-x86
+          - name: windows-arm64
+            os: windows-11-arm
+            python-arch: arm64
+            platform: windows-arm64
+            artifact: mozvpn_beta-windows-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python-arch }})
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.python-arch }}
+          cache: 'pip'
+
+      - name: Install Python dependencies (latest stable from PyPI)
+        shell: pwsh
+        run: |
+          python -m pip install --no-cache-dir --upgrade pip
+          if (Test-Path requirements.txt) {
+            pip install --no-cache-dir --upgrade -r requirements.txt
+          }
+          pip install --no-cache-dir --upgrade nuitka ordered-set zstandard
+
+      - name: Compile with Nuitka (optimized onefile, MSVC + LTO)
+        shell: pwsh
+        run: |
+          python -m nuitka `
+            --mode=onefile `
+            --lto=yes `
+            --onefile-compression=zstd `
+            --assume-yes-for-downloads `
+            --output-dir=build `
+            --output-filename=mozvpn_beta-${{ matrix.platform }}.exe `
+            --product-name="mozvpn_beta" `
+            --file-version=1.0.0 `
+            --product-version=1.0.0 `
+            --company-name="hdjsndjdkjshznkajs1255" `
+            --report=build/compilation-report.xml `
+            mozvpn_beta.py
+
+      - name: Smoke test (run the binary with --help, if supported)
+        shell: pwsh
+        run: |
+          $bin = "build/mozvpn_beta-${{ matrix.platform }}.exe"
+          if (Test-Path $bin) { & $bin --help }
+        continue-on-error: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/mozvpn_beta-${{ matrix.platform }}.exe
+          if-no-files-found: error
+
+  # -----------------------------------------------------------------
+  # Release: all artifacts are published to a GitHub Release when a v* tag is pushed
+  # -----------------------------------------------------------------
+  release:
+    name: Publish release (tags only)
+    needs: [build-linux, build-linux-armv7, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
