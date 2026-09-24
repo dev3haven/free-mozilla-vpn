@@ -33,6 +33,23 @@
 #      Fix: `pip install --upgrade pip setuptools wheel` is now run in
 #      EVERY build job (matrix job + both container jobs), BEFORE nuitka.
 #
+# FIX 5 (linux-armv7 FATAL, and the same latent bomb in linux-x86):
+#     "error: failed-wheel-build-for-install ... cffi ... ffi.h: No such
+#      file or directory". Chain: on CPython 3.14 zstandard has no
+#      prebuilt wheel for armv7/i386, so pip builds it from source; per
+#      the python-zstandard documentation, on Python 3.14 the package
+#      uses the CFFI backend/bindings, i.e. its build requires
+#      cffi>=2.0.0b; cffi compiles its _cffi_backend C extension, which
+#      #includes <ffi.h> — the header lives in the libffi-dev system
+#      package, which python:*-slim images do NOT contain. Fix:
+#      `libffi-dev` is now installed via apt in BOTH container jobs
+#      (armv7 and i386 — the i386 cell has the identical risk, there are
+#      no cp314 i386 wheels either), plus a fallback: if
+#      `pip install zstandard` still fails, the build continues WITHOUT
+#      zstandard; per the Nuitka user manual the onefile payload is then
+#      packed UNCOMPRESSED (compression applies only when
+#      zstandard is available); zstandard is optional build tooling.
+#
 # FIX 2: generate_release_notes had a corrupted value ("truedeep-research"
 #      paste artifact) — restored to `true`.
 #
@@ -175,7 +192,13 @@ jobs:
           # -----------------------------------------------------------------
           python -m pip install --upgrade pip setuptools wheel
           # Build tooling: Nuitka compiler + helpers for onefile compression.
-          python -m pip install --upgrade nuitka ordered-set zstandard
+          python -m pip install --upgrade nuitka ordered-set
+          # zstandard: optional onefile compressor. Prebuilt wheels cover
+          # the common matrix targets, but if a cell has no wheel (e.g.
+          # Windows arm64), do NOT fail the build: the onefile payload
+          # is just packed UNCOMPRESSED, per the Nuitka user manual: compression
+          # applies only when zstandard is available).
+            echo "WARNING: zstandard install failed — continuing without it (Nuitka will pack the onefile payload uncompressed)."
 
       - name: Install C compiler cache (Linux)
         if: runner.os == 'Linux'
@@ -338,9 +361,12 @@ jobs:
             "python:${PYTHON_VERSION}-slim" \
             bash -euo pipefail -c '
               # Pre-built packages only — nothing compiled from sources.
+              # FIX: libffi-dev provides <ffi.h> — required to build cffi,
+              # which is required to build zstandard on Python 3.14
+              # (CFFI backend, no prebuilt i386/armv7 cp314 wheels).
               apt-get update
               apt-get install -y --no-install-recommends \
-                gcc g++ patchelf file
+                gcc g++ patchelf file libffi-dev
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               # Install project dependencies only if a requirements file exists.
@@ -354,7 +380,14 @@ jobs:
               # Nuitka --include-package=setuptools requires it in the build env.
               python -m pip install --upgrade pip setuptools wheel
               # Build tooling: Nuitka compiler + onefile compression helpers.
-              python -m pip install --upgrade nuitka ordered-set zstandard
+              python -m pip install --upgrade nuitka ordered-set
+              # zstandard: optional onefile compressor. On Python 3.14 it may
+              # have to build from source via cffi (no wheel for this arch) —
+              # libffi-dev (installed above) makes that succeed. If it still
+              # fails, continue WITHOUT it: the onefile payload is packed
+              # UNCOMPRESSED; the binary stays fully functional.
+              python -m pip install --upgrade zstandard || \
+                echo "WARNING: zstandard install failed — continuing without it (Nuitka will pack the onefile payload uncompressed)."
               # Prove pip/setuptools are importable (precondition for the
               # --include-package options below).
               python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
@@ -430,9 +463,13 @@ jobs:
             "python:${PYTHON_VERSION}-slim" \
             bash -euo pipefail -c '
               # Pre-built packages only — nothing compiled from sources.
+              # FIX: libffi-dev provides <ffi.h> — required to build cffi,
+              # which is required to build zstandard on Python 3.14
+              # (CFFI backend; no prebuilt armv7 cp314 wheels exist, so
+              # both cffi and zstandard compile from source under QEMU).
               apt-get update
               apt-get install -y --no-install-recommends \
-                gcc g++ patchelf file
+                gcc g++ patchelf file libffi-dev
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               # Install project dependencies only if a requirements file exists.
@@ -446,7 +483,15 @@ jobs:
               # Nuitka --include-package=setuptools requires it in the build env.
               python -m pip install --upgrade pip setuptools wheel
               # Build tooling: Nuitka compiler + onefile compression helpers.
-              python -m pip install --upgrade nuitka ordered-set zstandard
+              python -m pip install --upgrade nuitka ordered-set
+              # zstandard: optional onefile compressor. On Python 3.14 it may
+              # have to build from source via cffi (no wheel for this arch) —
+              # libffi-dev (installed above) makes that succeed. If it still
+              # fails (e.g. a QEMU build timeout), continue WITHOUT it:
+              # the onefile payload is packed UNCOMPRESSED (per the Nuitka
+              # user manual); the binary stays fully functional.
+              python -m pip install --upgrade zstandard || \
+                echo "WARNING: zstandard install failed — continuing without it (Nuitka will pack the onefile payload uncompressed)."
               # Prove pip/setuptools are importable (precondition for the
               # --include-package options below).
               python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
