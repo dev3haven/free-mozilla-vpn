@@ -14,21 +14,40 @@
 #                without it every upstream falls back to HTTP CONNECT)
 #
 # Transitive dependency of aioquic that needs an explicit constraint:
-#   cryptography — aioquic requires `cryptography>=42.0.0`. The current
-#                 release line (50.x, Aug 2026) publishes NO wheel for
-#                 Windows on ARM64 (pyca dropped win_arm64 wheels after
-#                 46.0.3), so on that platform pip falls back to the
-#                 sdist and tries a Rust/maturin build, which dies with
-#                 "Could not find directory of OpenSSL installation"
-#                 (pyca/cryptography#14249). 46.0.3 is the last release
-#                 that ships a cp38-abi3 win_arm64 wheel; abi3 wheels are
-#                 forward-compatible across Python 3.x, so it works on
-#                 3.14 and still satisfies `cryptography>=42.0.0`.
-#                 The pin is applied ONLY where it is needed, via a PEP
-#                 508 environment marker (Windows + ARM64); every other
-#                 platform (win x64/x86, linux x86_64/arm64/x86/armv7,
-#                 macOS) keeps resolving to the latest release, which
-#                 has prebuilt wheels there.
+#   cryptography — aioquic requires `cryptography>=42.0.0`. Two problem
+#                 platforms in the CURRENT release line (50.x, Aug 2026):
+#                   * win_arm64: no wheel at all — pyca dropped them
+#                     after 46.0.3 (pyca/cryptography#14249,
+#                     crossbario/autobahn-python#1945);
+#                   * win32 (32-bit Windows): support REMOVED — the
+#                     changelog deprecated 32-bit Windows in the 46.x
+#                     line ("will be removed in two releases") and 50.0.1
+#                     states "BACKWARDS INCOMPATIBLE: Support for 32-bit
+#                     Windows has been removed".
+#                 On both platforms pip falls back to the sdist and tries
+#                 a Rust/maturin build, which dies with "Could not find
+#                 directory of OpenSSL installation". 46.0.3 is the last
+#                 release line that ships wheels for win32, win_amd64 AND
+#                 win_arm64; the abi3 wheels are forward-compatible
+#                 across Python 3.x (so 3.14 is fine) and still satisfy
+#                 aioquic's `cryptography>=42.0.0`.
+#                 The pin is applied to ALL Windows via the PEP 508
+#                 marker `sys_platform == "win32"` — uniform and immune
+#                 to the platform_machine() ambiguity of 32-bit Python
+#                 under WOW64. Linux and macOS keep resolving to the
+#                 latest release, which has prebuilt wheels there (on
+#                 i686 Linux the workflow apt-installs pkg-config +
+#                 libssl-dev so the sdist build succeeds).
+#                 TERMUX (Android): the marker does NOT apply there
+#                 (sys_platform == "linux"), so pip would resolve the
+#                 latest release and try a Rust/maturin sdist build —
+#                 instead the workflow pre-installs Termux's own
+#                 prebuilt package `python-cryptography` (45.0.3 in
+#                 termux-packages) BEFORE `pip install -r
+#                 requirements.txt`; pip then sees the requirement
+#                 `cryptography>=42.0.0` already satisfied and never
+#                 rebuilds it. Same trick for Pillow (`python-pillow`
+#                 Termux package).
 # ============================================================================
 
 pyotp
@@ -36,8 +55,8 @@ zxing-cpp
 Pillow
 aioquic
 
-# Last release line with a win_arm64 wheel (cp38-abi3). Remove this
-# marker line when pyca ships win_arm64 wheels again — verify with:
+# Last release line with win32 + win_arm64 wheels (abi3). Remove this
+# marker line when pyca ships those wheels again — verify with:
 #   pip index versions cryptography
 #   https://pypi.org/pypi/cryptography/<version>/json  (urls -> *.whl)
-cryptography==46.0.3; sys_platform == "win32" and platform_machine == "ARM64"
+cryptography==46.0.3; sys_platform == "win32"
