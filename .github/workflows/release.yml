@@ -45,15 +45,29 @@
 #   * ARM runners on GitHub are free for public repositories; for a
 #     private repository you need a paid larger runner or a self-hosted
 #     runner.
+#   * Publishing a GitHub Release (e.g. release/1.2.20) creates a tag
+#     and fires a push event for that tag; the release/* tag filter and
+#     the on: release trigger below both start the build for it.
+#     Note: pre-releases published from drafts do not fire the
+#     "published" release type — use a regular publish.
 # ============================================================================
 
 name: Build Free Mozilla VPN
 
 on:
   push:
-    branches: ["main"]
-    tags: ["v*"]
+    # Main branch plus release branches (e.g. release/1.2.20).
+    branches: ["main", "release/**"]
+    # Tags that look like versions: v* (e.g. v1.2.0) and release/*
+    # (e.g. release/1.2.20, the tag GitHub creates when you publish
+    # a release with that name).
+    tags: ["v*", "release/*"]
   pull_request:
+  # Runs when a GitHub Release is published (any tag name). Note: this
+  # event cannot be filtered by tag name — it fires for every published
+  # release; the release-bundle job below handles the bundling logic.
+  release:
+    types: [published]
   workflow_dispatch:
 
 env:
@@ -398,12 +412,20 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
-  # Release: collects all binaries into a single zip (for v* tags).
+  # Release: collects all binaries into a single zip (for v* tags,
+  # release/* tags, or a published GitHub Release).
   # --------------------------------------------------------------------------
   release-bundle:
     name: Bundle all binaries
     needs: [build, build-linux-x86, build-linux-armv7]
-    if: always() && startsWith(github.ref, 'refs/tags/v')
+    # Runs for version-like tags (v*) and release/* tags
+    # (e.g. release/1.2.20), or when a GitHub Release is published.
+    if: >
+      always() && (
+        startsWith(github.ref, 'refs/tags/v') ||
+        startsWith(github.ref, 'refs/tags/release/') ||
+        github.event_name == 'release'
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
