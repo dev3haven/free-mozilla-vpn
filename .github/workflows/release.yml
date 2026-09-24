@@ -26,13 +26,20 @@
 #   startup dependency report then shows "installed" instead of
 #   "NOT installed".
 #
-#   Why --include-package is still passed at compile time: --standalone
-#   follows STATIC imports, but the script's imports sit in try/except
-#   blocks and some packages use dynamic submodule loading — the explicit
-#   --include-package=pyotp / =zxingcpp / =PIL / =aioquic forces Nuitka to
-#   follow every sub-module of these packages. Each flag is added only
-#   when the package imports OK in the build env (Nuitka aborts with
-#   "failed to locate package" for an include of a missing package).
+#   --include-package=pyotp / =zxingcpp / =PIL / =aioquic is passed at
+#   compile time in every build job: the script's imports sit in
+#   try/except blocks and some packages load submodules dynamically —
+#   the explicit include forces Nuitka to follow every sub-module.
+#
+# RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
+# job downloads all build artifacts into one folder (merge-multiple:
+# true) and attaches every mozvpn_beta-* file to the GitHub Release as a
+# SEPARATE asset (softprops/action-gh-release supports multi-line file
+# lists and glob patterns in `files`). Each asset keeps its OS-specific
+# name: mozvpn_beta-windows-x86_64.exe, mozvpn_beta-linux-x86_64, etc.
+# Per GitHub documentation, an asset filename must be unique within one
+# release — the unified target naming guarantees that (one file per
+# target). Nothing is zipped anywhere in this workflow anymore.
 #
 # FIX 1 (the historical windows-arm64 FATAL): since Python 3.12 the
 #     CPython distributions from setup-python and the official python
@@ -60,14 +67,17 @@
 #     360-minute hosted-runner job limit. Fix: `make` and `ccache` are
 #     apt-installed in BOTH container jobs, and the armv7 job gets an
 #     explicit `timeout-minutes: 350` so an overrun fails fast and
-#     clearly instead of being killed at the wall. LTO is kept: with
-#     make the parallel LTRANS linking works again.
+#     clearly instead of being killed at the wall.
 #
-# FIX 2: generate_release_notes restored to `true` (was a corrupted
+# FIX 8 (release assets): the release used to be one zip archive with
+#      all binaries inside. Now every built binary is attached to the
+#      GitHub Release as its own asset — no zip step exists at all.
+#
+# FIX 2: generate_release_notes = `true` (restored from a corrupted
 #      paste artifact).
 #
-# FIX 3: the release-bundle job no longer uses `always()` — the bundle
-#      is built only when all `needs` jobs succeeded. build-linux-armv7
+# FIX 3: the release job no longer uses `always()` — assets are
+#      attached only when all `needs` jobs succeeded. build-linux-armv7
 #      is continue-on-error: an emulated-build failure/timeout does NOT
 #      block the release, but any real failure of a required job does.
 #
@@ -82,7 +92,7 @@
 #   * Tag filter "release/**" ("*" alone does NOT match "/" in tag
 #     filters); a tag push uses the workflow file FROM THE COMMIT the
 #     tag points at; the `release` event uses the DEFAULT branch's file
-#     and cannot be filtered by tag (handled via release-bundle's `if`).
+#     and cannot be filtered by tag (handled via the release job's `if`).
 #   * `cache: pip` in setup-python is NOT used: it hard-fails when the
 #     dependency glob matches nothing (actions/setup-python#807); the
 #     container jobs do not go through setup-python either.
@@ -91,15 +101,12 @@
 #     so every action dies in an i386/armv7 container with
 #     "exec /__e/node24/bin/node: no such file or directory"
 #     (actions/runner#2115). Actions run on the host; the builds run
-#     via plain `docker run` with the workspace bind-mounted
-#     (requirements.txt is visible inside via the bind mount).
+#     via plain `docker run` with the workspace bind-mounted.
 #   * linux-x86 runs natively on the x86_64 kernel — no emulation;
 #     linux-armv7 runs under QEMU user emulation — slow, experimental,
 #     continue-on-error so a timeout can never break a release.
 #   * Nuitka supports Python 3.4–3.14 and does NOT cross-compile; every
-#     target is built natively (or emulated) with a PRE-BUILT CPython —
-#     nothing is compiled from source except pip packages that lack a
-#     wheel for that arch (aioquic/zstandard on i386/armv7).
+#     target is built natively (or emulated) with a PRE-BUILT CPython.
 #   * For 32-bit Python on Windows, Nuitka requires MSVC (NOT MinGW);
 #     MSVC is preinstalled on windows-latest; windows-11-arm ships
 #     Visual Studio with ARM64 build tools.
@@ -160,8 +167,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # NOTE: no cache: pip here — the container jobs do not go through
-      # setup-python, so a partial cache would only help this matrix job.
       - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python_arch }})
         uses: actions/setup-python@v6
         with:
@@ -542,13 +547,21 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
-  # Release: collects all binaries into a single zip (for v* tags,
-  # release/** tags, or a published GitHub Release). Built only when all
-  # `needs` jobs succeeded (no `always()`); build-linux-armv7 is
-  # continue-on-error, so its failure does NOT block the release.
+  # Release: downloads ALL build artifacts into one folder and attaches
+  # every binary to the GitHub Release as a SEPARATE asset — NO zip (FIX 8).
+  # Runs for v* tags, release/** tags, or a published GitHub Release.
+  # Built only when all `needs` jobs succeeded (no `always()`);
+  # build-linux-armv7 is continue-on-error, so its failure does NOT block
+  # the release, but any real failure of a required job does.
+  #
+  # Per GitHub's release-assets documentation, asset names must be unique
+  # within a release — the unified target naming (one file per OS/arch,
+  # mozvpn_beta-<target>[.exe]) guarantees that. softprops/action-gh-release
+  # attaches each matched file as its own asset and supports glob patterns
+  # in `files`.
   # --------------------------------------------------------------------------
   release-bundle:
-    name: Bundle all binaries
+    name: Attach binaries to release
     needs: [build, build-linux-x86, build-linux-armv7]
     if: >
       startsWith(github.ref, 'refs/tags/v') ||
@@ -559,44 +572,32 @@ jobs:
       contents: write
 
     steps:
+      # Download all build artifacts into the SAME folder (merge-multiple:
+      # true) so every binary lands side by side as dist/mozvpn_beta-<target>.
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: Sanitize release name
-        id: relname
-        run: |
-          set -euo pipefail
-          SAFE="${GITHUB_REF_NAME//\//-}"
-          echo "ref_name=${GITHUB_REF_NAME} -> safe=${SAFE}"
-          echo "safe=${SAFE}" >> "$GITHUB_OUTPUT"
-
-      - name: List and pack binaries
+      - name: Verify binaries
         run: |
           set -euo pipefail
           ls -laR dist
-          mkdir -p bundle
-          cp -v dist/mozvpn_beta-* bundle/ 2>/dev/null || true
-          ls -la bundle
-          if ! ls bundle/mozvpn_beta-* >/dev/null 2>&1; then
-            echo "ERROR: no binaries found in dist/ — nothing to bundle" >&2
+          if ! ls dist/mozvpn_beta-* >/dev/null 2>&1; then
+            echo "ERROR: no binaries found in dist/ — nothing to attach to the release" >&2
             exit 1
           fi
-          cd bundle
-          zip -9 "../mozvpn_beta-${{ steps.relname.outputs.safe }}.zip" ./*
+          echo "Binaries to attach as individual release assets:"
+          ls -1 dist/mozvpn_beta-*
 
-      - name: Upload release bundle artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: mozvpn_beta-${{ steps.relname.outputs.safe }}-all
-          path: mozvpn_beta-${{ steps.relname.outputs.safe }}.zip
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Attach to GitHub Release
+      # Each file matching the glob becomes its OWN release asset:
+      # mozvpn_beta-linux-x86_64, mozvpn_beta-linux-arm64,
+      # mozvpn_beta-linux-x86, mozvpn_beta-linux-armv7,
+      # mozvpn_beta-windows-x86_64.exe, mozvpn_beta-windows-x86.exe,
+      # mozvpn_beta-windows-arm64.exe — no zip is created anywhere.
+      - name: Attach binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: mozvpn_beta-${{ steps.relname.outputs.safe }}.zip
+          files: dist/mozvpn_beta-*
           generate_release_notes: true
