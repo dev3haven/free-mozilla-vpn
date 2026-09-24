@@ -1,22 +1,43 @@
 # ============================================================================
 # Free Mozilla VPN — build mozvpn_beta.py with Nuitka (Python 3.14)
-# Targets: Windows (x86, x64, ARM64) and Linux (x86_64, ARM64)
+#
+# Targets (unified uname-style naming, identical for every OS):
+#   linux-x86_64   — 64-bit Intel/AMD Linux (a.k.a. x64 / amd64)
+#   linux-x86      — 32-bit Linux (i386/i686)
+#   linux-arm64    — 64-bit ARM Linux (= ARMv8-A, aarch64)
+#   linux-armv7    — 32-bit ARM Linux (armhf / armv7)
+#   windows-x86_64 — 64-bit Intel/AMD Windows (a.k.a. x64)
+#   windows-x86    — 32-bit Windows (i386/i686)
+#   windows-arm64  — 64-bit ARM Windows (= ARMv8; Windows 11 on Arm)
+#
+# Naming convention note:
+#   * x86_64 = x64 = amd64 — three names for the same 64-bit Intel/AMD
+#     architecture; x86 alone means 32-bit.
+#   * arm64 = aarch64 = ARMv8-A (64-bit). Windows 11 on Arm requires
+#     ARMv8.1+ hardware, so the windows-11-arm runner is ARMv8.
+#   * armv7 — 32-bit ARM (armhf), e.g. Raspberry Pi 3/4 in 32-bit mode.
 #
 # Verified facts (2026-09-24):
 #   * Python 3.14 is a stable release (released 2025-10-07).
 #   * Nuitka supports Python 3.4–3.14 officially.
 #   * Nuitka does NOT cross-compile: every target is built natively
-#     on a runner with the corresponding OS and architecture.
-#   * Every target below uses a pre-built, installable CPython from
-#     actions/python-versions — nothing is compiled from source
-#     (no self-built CPython, no hours-long dependency builds):
-#       - ubuntu-latest (x86_64), ubuntu-24.04-arm (arm64),
-#         windows-latest (x86_64), windows-11-arm (arm64) via setup-python;
-#       - Windows x86 uses the 32-bit CPython installer selected with
-#         architecture: x86.
+#     (or, for emulated containers, transparently) on a hosted runner.
+#   * Nothing heavy is compiled from source. Every target uses a
+#     ready-to-install Python:
+#       - Hosted runners via actions/setup-python (pre-built CPython):
+#         ubuntu-latest (x86_64), ubuntu-24.04-arm (arm64),
+#         windows-latest (x86_64, plus 32-bit CPython via architecture:
+#         x86), windows-11-arm (arm64).
+#       - linux-x86 runs in an i386 container of the official multi-arch
+#         python Docker image (pre-built 32-bit CPython). The x86_64
+#         host kernel runs i386 code natively — no emulation needed.
+#       - linux-armv7 runs in an arm32v7 container of the same official
+#         multi-arch python image (pre-built 32-bit ARM CPython),
+#         executed via QEMU user-mode emulation registered by
+#         docker/setup-qemu-action (official Docker action). No CPython
+#         build from sources, but emulation is slow — experimental.
 #   * For 32-bit Python on Windows, Nuitka requires MSVC as the C compiler
-#     (NOT MinGW). MSVC is preinstalled on windows-latest runners, and
-#     Nuitka finds it automatically.
+#     (NOT MinGW). MSVC is preinstalled on windows-latest runners.
 #   * No requirements.txt / pyproject.toml exists in this repo (the project
 #     is a single mozvpn_beta.py script), so pip caching is NOT enabled:
 #     setup-python with cache: pip hard-fails when no dependency file
@@ -24,9 +45,6 @@
 #   * ARM runners on GitHub are free for public repositories; for a
 #     private repository you need a paid larger runner or a self-hosted
 #     runner.
-#   * 32-bit Linux is deliberately NOT built: there is no hosted x86 Linux
-#     runner and no 32-bit CPython in setup-python, so it would require
-#     compiling CPython from source — excluded per project requirements.
 # ============================================================================
 
 name: Build Free Mozilla VPN
@@ -50,8 +68,8 @@ permissions:
 
 jobs:
   # --------------------------------------------------------------------------
-  # Main matrix: every target uses a ready-to-install CPython from
-  # setup-python (nothing is built from sources).
+  # Main matrix: targets that run directly on hosted runners using a
+  # pre-built CPython from setup-python.
   # --------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.target }}
@@ -60,19 +78,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ----- Linux x86_64 -----
+          # ----- Linux x86_64 (64-bit Intel/AMD; a.k.a. x64/amd64) -----
           - os: ubuntu-latest
             target: linux-x86_64
             python_arch: x64
-          # ----- Linux arm64 (free for public repositories) -----
+          # ----- Linux arm64 (= ARMv8-A / aarch64; free for public repos) -----
           - os: ubuntu-24.04-arm
             target: linux-arm64
             python_arch: arm64
-          # ----- Windows x64 -----
+          # ----- Windows x86_64 (64-bit Intel/AMD; a.k.a. x64) -----
           - os: windows-latest
-            target: windows-x64
+            target: windows-x86_64
             python_arch: x64
-          # ----- Windows ARM64 (free for public repositories) -----
+          # ----- Windows arm64 (= ARMv8; free for public repositories) -----
           - os: windows-11-arm
             target: windows-arm64
             python_arch: arm64
@@ -206,11 +224,185 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
+  # Linux x86 (32-bit): there is no 32-bit hosted runner and setup-python
+  # does not provide 32-bit CPython for Linux, BUT nothing is built from
+  # source. The official python Docker image is multi-arch and publishes
+  # pre-built 32-bit (i386) CPython builds, so this job runs inside the
+  # i386 container on the regular x86_64 ubuntu-latest runner (the x86_64
+  # kernel executes 32-bit code natively, no emulation). All packages
+  # installed inside the container are pre-built binaries.
+  # --------------------------------------------------------------------------
+  build-linux-x86:
+    name: Build linux-x86 (32-bit)
+    runs-on: ubuntu-latest
+    # Pre-built 32-bit CPython straight from the official multi-arch image.
+    container:
+      image: python:${{ env.PYTHON_VERSION }}-slim
+      # Docker Hub serves the i386 variant of this multi-arch tag.
+      options: --platform linux/386
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install C toolchain (pre-built packages only)
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            gcc g++ ccache patchelf file
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python --version
+          python -c "import platform; print('arch:', platform.machine())"
+          # Install project dependencies only if a requirements file exists.
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt
+          else
+            echo "No requirements.txt found — installing only build tooling."
+          fi
+          # Build tooling: Nuitka compiler + helpers for onefile compression.
+          python -m pip install --upgrade nuitka ordered-set zstandard
+
+      - name: Show toolchain info
+        run: |
+          python --version
+          python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
+          python -m nuitka --version
+
+      # ------------------------------------------------------------------------
+      # Same Nuitka option set as the main matrix, but with gcc (no clang
+      # install needed — keeping the container lean; clang would also be a
+      # pre-built package if preferred).
+      # ------------------------------------------------------------------------
+      - name: Compile with Nuitka (32-bit Linux)
+        run: |
+          set -euo pipefail
+          python -m nuitka \
+            --standalone \
+            --onefile \
+            --lto=yes \
+            --jobs=4 \
+            --output-dir=build \
+            --output-filename="mozvpn_beta-linux-x86" \
+            --company-name="${{ env.APP_NAME }}" \
+            --product-name="${{ env.APP_NAME }}" \
+            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" \
+            --file-version="${{ env.FILE_VERSION }}" \
+            --product-version="${{ env.FILE_VERSION }}" \
+            --remove-output \
+            --assume-yes-for-downloads \
+            "${{ env.SCRIPT }}"
+
+      - name: Smoke test 32-bit binary
+        run: |
+          set -euo pipefail
+          file build/mozvpn_beta-linux-x86
+          # --help/-h works if the script uses argparse; otherwise replace
+          # it with a safe flag or remove this step.
+          ./build/mozvpn_beta-linux-x86 --help || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mozvpn_beta-linux-x86
+          path: build/mozvpn_beta-linux-x86*
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # Linux armv7 (32-bit ARM, a.k.a. armhf): there is no armv7 hosted runner
+  # and setup-python does not provide 32-bit ARM CPython, but nothing is
+  # built from source. The official python Docker image is multi-arch and
+  # publishes pre-built arm32v7 CPython builds, so this job pulls that
+  # image with QEMU user-mode emulation on the x86_64 ubuntu-latest
+  # runner (docker/setup-qemu-action registers the binfmt handlers).
+  # QEMU emulation makes the Nuitka build slow — hence experimental
+  # (continue-on-error) so a timeout cannot break the release.
+  # --------------------------------------------------------------------------
+  build-linux-armv7:
+    name: Build linux-armv7 (32-bit ARM, experimental)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Registers QEMU static binaries with binfmt_misc so an armv7
+      # container can run on the x86_64 runner (official Docker action).
+      - name: Set up QEMU for armv7 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      # The build runs inside the arm32v7 container via plain `docker run`
+      # (QEMU must be registered before the container starts, so a
+      # jobs.container is not usable here). The workspace is bind-mounted
+      # so the resulting binary is directly visible to the runner for
+      # the artifact upload step.
+      - name: Compile with Nuitka (armv7 Linux, inside emulated container)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "python:${PYTHON_VERSION}-slim" \
+            bash -euo pipefail -c '
+              # Pre-built packages only — nothing compiled from sources.
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                gcc g++ patchelf file
+              python --version
+              python -c "import platform; print(\"arch:\", platform.machine())"
+              # Install project dependencies only if a requirements file exists.
+              if [ -f requirements.txt ]; then
+                python -m pip install --upgrade pip
+                python -m pip install -r requirements.txt
+              else
+                echo "No requirements.txt found — installing only build tooling."
+              fi
+              # Build tooling: Nuitka compiler + onefile compression helpers.
+              python -m pip install --upgrade nuitka ordered-set zstandard
+              python -m nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --jobs=4 \
+                --output-dir=build \
+                --output-filename="mozvpn_beta-linux-armv7" \
+                --company-name="Free Mozilla VPN" \
+                --product-name="Free Mozilla VPN" \
+                --file-description="Free Mozilla VPN (mozvpn_beta)" \
+                --file-version="1.0.0.0" \
+                --product-version="1.0.0.0" \
+                --remove-output \
+                --assume-yes-for-downloads \
+                "mozvpn_beta.py"
+              # Smoke test: --help/-h works if the script uses argparse;
+              # otherwise replace with a safe flag or remove this line.
+              file build/mozvpn_beta-linux-armv7
+              ./build/mozvpn_beta-linux-armv7 --help || true
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mozvpn_beta-linux-armv7
+          path: build/mozvpn_beta-linux-armv7*
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
   # Release: collects all binaries into a single zip (for v* tags).
   # --------------------------------------------------------------------------
   release-bundle:
     name: Bundle all binaries
-    needs: [build]
+    needs: [build, build-linux-x86, build-linux-armv7]
     if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
