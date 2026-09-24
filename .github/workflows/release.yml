@@ -31,6 +31,19 @@
 #   try/except blocks and some packages load submodules dynamically —
 #   the explicit include forces Nuitka to follow every sub-module.
 #
+# FIX 9 (build-env check crash, 2026-09-24): the "Show toolchain info"
+#      step (and the identical checks inside BOTH container jobs) died
+#      with `AttributeError: module 'pyotp' has no attribute '__version__'`.
+#      pyotp does NOT export __version__ — the canonical way to get an
+#      installed package's version is importlib.metadata.version() from
+#      the Python standard library (stable API since 3.8, non-provisional
+#      since 3.10). Every version probe now goes through
+#      `from importlib.metadata import version`: version('pyotp'),
+#      version('Pillow'), version('zxing-cpp'), version('aioquic') —
+#      no module-level __version__ attributes are read at all, so a
+#      package dropping/renaming that attribute can never break the build
+#      again. The version probe is wrapped so it can never crash the job.
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn_beta-* file to the GitHub Release as a
@@ -205,19 +218,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ccache clang
 
+      # ------------------------------------------------------------------------
+      # FIX 9: version reporting goes through importlib.metadata ONLY.
+      # pyotp does not expose __version__ (AttributeError crash, 2026-09-24);
+      # importlib.metadata.version() is the standard-library way and works
+      # for every installed distribution regardless of what attributes the
+      # module itself exports.
+      # ------------------------------------------------------------------------
       - name: Show toolchain info
         shell: bash
         run: |
+          set -euo pipefail
           python --version
           python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
           # Prove pip/setuptools AND ALL runtime deps are importable in
           # the build env (the precondition for the --include-package
-          # options in the compile steps).
-          python -c "import pip, setuptools, wheel; print('pip', pip.__version__, '| setuptools', setuptools.__version__)"
-          python -c "import pyotp; print('pyotp', pyotp.__version__)"
-          python -c "import zxingcpp; print('zxingcpp OK')"
-          python -c "import PIL; print('Pillow', PIL.__version__)"
-          python -c "import aioquic; print('aioquic OK')"
+          # options in the compile steps). Version strings come from
+          # importlib.metadata, never from module __version__ attributes.
+          python - <<'PYEOF'
+          from importlib.metadata import version
+          import pip, setuptools, wheel
+          print("pip", version("pip"), "| setuptools", version("setuptools"), "| wheel", version("wheel"))
+          import pyotp
+          print("pyotp", version("pyotp"))
+          import zxingcpp
+          print("zxing-cpp", version("zxing-cpp"))
+          import PIL
+          print("Pillow", version("Pillow"))
+          import aioquic
+          print("aioquic", version("aioquic"))
+          PYEOF
           python -m nuitka --version
 
       # ------------------------------------------------------------------------
@@ -374,12 +404,14 @@ jobs:
               # WITHOUT it: the payload is packed UNCOMPRESSED.
               python -m pip install --upgrade zstandard || \
                 echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
-              # Prove pip/setuptools + ALL runtime deps are importable.
-              python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
-              python -c "import pyotp; print(\"pyotp\", pyotp.__version__)"
-              python -c "import zxingcpp; print(\"zxingcpp OK\")"
-              python -c "import PIL; print(\"Pillow\", PIL.__version__)"
-              python -c "import aioquic; print(\"aioquic OK\")"
+              # FIX 9: prove pip/setuptools + ALL runtime deps are
+              # importable; versions come from importlib.metadata, NEVER
+              # from module __version__ attributes (pyotp has none).
+              python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
+              python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
+              python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
+              python -c "import PIL; from importlib.metadata import version; print(\"Pillow\", version(\"Pillow\"))"
+              python -c "import aioquic; from importlib.metadata import version; print(\"aioquic\", version(\"aioquic\"))"
               python -m nuitka \
                 --standalone \
                 --onefile \
@@ -504,12 +536,14 @@ jobs:
               # stays fully functional.
               python -m pip install --upgrade zstandard || \
                 echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
-              # Prove pip/setuptools + ALL runtime deps are importable.
-              python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
-              python -c "import pyotp; print(\"pyotp\", pyotp.__version__)"
-              python -c "import zxingcpp; print(\"zxingcpp OK\")"
-              python -c "import PIL; print(\"Pillow\", PIL.__version__)"
-              python -c "import aioquic; print(\"aioquic OK\")"
+              # FIX 9: prove pip/setuptools + ALL runtime deps are
+              # importable; versions come from importlib.metadata, NEVER
+              # from module __version__ attributes (pyotp has none).
+              python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
+              python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
+              python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
+              python -c "import PIL; from importlib.metadata import version; print(\"Pillow\", version(\"Pillow\"))"
+              python -c "import aioquic; from importlib.metadata import version; print(\"aioquic\", version(\"aioquic\"))"
               python -m nuitka \
                 --standalone \
                 --onefile \
