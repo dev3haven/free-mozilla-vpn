@@ -13,11 +13,25 @@
 # ---------------------------------------------------------------------------
 # DEPENDENCY MANAGEMENT (audited 2026-09-24):
 #
-#   ALL runtime dependencies (pyotp, zxing-cpp, Pillow, aioquic) live in
-#   ONE file at the repo root: requirements.txt. Every build job runs
+#   ALL runtime dependencies (pyotp, zxing-cpp, Pillow, aioquic — plus
+#   the transitive `cryptography` pin for Windows ARM64) live in ONE file
+#   at the repo root: requirements.txt. Every build job runs
 #   `pip install -r requirements.txt` when the file exists, and the
 #   build FAILS if it cannot be satisfied — aioquic is REQUIRED (real
 #   MASQUE / HTTP-3 CONNECT-UDP probing must be compiled in).
+#
+#   NOTHING runtime-related is pinned or hardcoded in this workflow:
+#   even the cryptography==46.0.3 constraint for Windows on ARM64 is a
+#   PEP 508 environment-marker line INSIDE requirements.txt
+#   (`cryptography==46.0.3; sys_platform == "win32" and
+#   platform_machine == "ARM64"`), because 46.0.3 is the last release
+#   line with a cp38-abi3 win_arm64 wheel (pyca dropped win_arm64
+#   wheels after 46.0.3; on 46.0.4+ pip builds the sdist with
+#   maturin/Rust and dies on the missing OpenSSL — pyca/cryptography
+#   #14249). abi3 wheels are forward-compatible across Python 3.x, so
+#   the pin satisfies aioquic's `cryptography>=42.0.0` on 3.14 too, and
+#   every OTHER platform keeps resolving to the latest release, which
+#   has prebuilt wheels there.
 #
 #   This is THE fix for the "dependencies NOT installed in the exe" bug:
 #   mozvpn_beta.py imports these packages behind try/except ImportError,
@@ -32,41 +46,29 @@
 #   the explicit include forces Nuitka to follow every sub-module.
 #
 # FIX 10 (cryptography / Pillow source-build FATALs, 2026-09-24):
-#      aioquic pulls in `cryptography` as a transitive dependency, and
-#      the latest release line (50.0.1, Aug 2026) publishes NO wheel for
-#      TWO of our targets:
-#        * win_arm64: pyca dropped win_arm64 wheels after 46.0.3 —
-#          pip falls back to the sdist and builds it with maturin/Rust,
-#          whose openssl-sys crate then dies with "Could not find
-#          directory of OpenSSL installation" (verified live in the
-#          windows-11-arm job log; also pyca/cryptography#14249 and
-#          crossbario/autobahn-python#1945 confirm 46.0.0–46.0.3 DID
-#          ship cp38-abi3/cp311-abi3 win_arm64 wheels and 46.0.4+ do
-#          not). Fix: the windows-arm64 job pre-installs
-#          `cryptography==46.0.3` BEFORE `pip install -r
-#          requirements.txt` — the cp38-abi3 win_arm64 wheel installs
-#          as a plain binary (abi3 wheels are forward-compatible across
-#          Python 3.x, so 3.14 is fine) and satisfies aioquic's
-#          `cryptography>=42.0.0` requirement, so pip never touches the
-#          50.x sdist and no Rust/OpenSSL toolchain is needed at all.
-#        * linux x86 (i686): no cp314/abi3 i686 wheel for the latest
-#          cryptography either — pip builds the sdist via maturin, which
-#          needs OpenSSL discovered through pkg-config (the openssl-sys
-#          build script looks for `pkg-config openssl` first), and the
-#          python:*-slim image has neither pkg-config nor libssl-dev.
-#          Fix: both container jobs apt-install `pkg-config libssl-dev`
-#          (puccinialin/maturin fetch the Rust toolchain themselves,
-#          as seen live in the job log — only the OpenSSL headers were
-#          missing).
+#      aioquic pulls in `cryptography` transitively, and on targets
+#      where the latest release line has no wheel pip builds the sdist:
+#        * win_arm64: no wheel at all since 46.0.4 — fixed inside
+#          requirements.txt via the environment-marker pin (see above);
+#          no Rust/OpenSSL toolchain is needed on the runner at all.
+#        * linux x86 (i686): pip builds the sdist via maturin, whose
+#          openssl-sys crate discovers OpenSSL through pkg-config —
+#          and python:*-slim images ship neither pkg-config nor
+#          libssl-dev. Fixed by apt-installing `pkg-config libssl-dev`
+#          in BOTH container jobs (puccinialin/maturin fetch the Rust
+#          toolchain themselves, as seen live in the job log — only the
+#          OpenSSL headers were missing). These are SYSTEM libraries,
+#          not pip packages: they cannot live in requirements.txt.
 #        * Pillow (i686): no cp314 i686 wheel — pip builds the sdist,
 #          which hard-requires zlib headers and dies with
 #          "RequiredDependencyException: zlib" on the slim image.
-#          Fix: both container jobs apt-install `zlib1g-dev libjpeg-dev`
-#          (zlib is REQUIRED by Pillow, libjpeg is the standard
-#          recommended companion per the Pillow installation docs).
-#      All of these are REQUIRED (not ||-fallbacks): a build env without
-#      them cannot produce a binary with working QR/TOTP and real
-#      MASQUE probing.
+#          Fixed by apt-installing `zlib1g-dev libjpeg-dev` in BOTH
+#          container jobs (zlib is a hard Pillow dependency; libjpeg is
+#          the standard recommended companion per the Pillow docs).
+#          Again system headers, not pip packages.
+#      All apt additions are REQUIRED (not ||-fallbacks): a build env
+#      without them cannot produce a binary with working QR/TOTP and
+#      real MASQUE probing.
 #
 # FIX 9 (build-env check crash, 2026-09-24): the "Show toolchain info"
 #      step (and the identical checks inside BOTH container jobs) died
@@ -163,6 +165,11 @@
 #   * --include-package=pip / =setuptools stays: mozvpn_beta.py runs
 #     pip AT RUNTIME (hotkey 'd' / --reinstall-deps), and Nuitka
 #     standalone does not bundle pip/setuptools by default.
+#   * nuitka / ordered-set / zstandard / setuptools / wheel are BUILD
+#     TOOLING of this workflow, not runtime dependencies of the script
+#     (the script's --reinstall-deps only manages pyotp, zxing-cpp,
+#     Pillow, aioquic) — that is why they stay in the workflow and not
+#     in requirements.txt.
 # ============================================================================
 
 name: Build Free Mozilla VPN
@@ -200,23 +207,18 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64
             python_arch: x64
-            pin_cryptography: "false"
           - os: ubuntu-24.04-arm
             target: linux-arm64
             python_arch: arm64
-            pin_cryptography: "false"
           - os: windows-latest
             target: windows-x86_64
             python_arch: x64
-            pin_cryptography: "false"
           - os: windows-11-arm
             target: windows-arm64
             python_arch: arm64
-            pin_cryptography: "true"
           - os: windows-latest
             target: windows-x86
             python_arch: x86
-            pin_cryptography: "false"
 
     steps:
       - name: Checkout
@@ -228,24 +230,6 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: ${{ matrix.python_arch }}
 
-      # ------------------------------------------------------------------------
-      # FIX 10 (windows-arm64): cryptography 46.0.4+ publishes NO win_arm64
-      # wheel, so pip would build the 50.x sdist with maturin/Rust and die
-      # on the missing OpenSSL. 46.0.3 is the last line that ships a
-      # cp38-abi3 win_arm64 wheel (abi3 = forward-compatible with Python
-      # 3.14) and satisfies aioquic's `cryptography>=42.0.0`, so installing
-      # it FIRST means `pip install -r requirements.txt` finds the
-      # requirement already met and never touches the sdist.
-      # ------------------------------------------------------------------------
-      - name: Pre-install binary cryptography wheel (Windows ARM64 only)
-        if: matrix.pin_cryptography == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Installing cryptography==46.0.3 (last release with a cp38-abi3 win_arm64 wheel) ..."
-          python -m pip install "cryptography==46.0.3"
-          python -c "from importlib.metadata import version; import cryptography; print('cryptography', version('cryptography'), 'pinned OK')"
-
       - name: Install dependencies
         shell: bash
         run: |
@@ -253,9 +237,12 @@ jobs:
           python -m pip install --upgrade pip
           # -----------------------------------------------------------------
           # Runtime dependencies from requirements.txt (ALL REQUIRED,
-          # including aioquic): the build FAILS if they cannot be
-          # installed — a binary without them is broken (TOTP/QR do not
-          # work, MASQUE probing falls back to HTTP CONNECT).
+          # including aioquic and the cryptography pin for win-arm64):
+          # the build FAILS if they cannot be installed — a binary
+          # without them is broken (TOTP/QR do not work, MASQUE probing
+          # falls back to HTTP CONNECT). No runtime package is pinned or
+          # hardcoded here — requirements.txt is the single source of
+          # truth.
           # -----------------------------------------------------------------
           if [ -f requirements.txt ]; then
             python -m pip install -r requirements.txt
@@ -436,7 +423,8 @@ jobs:
             bash -euo pipefail -c '
               # Pre-built packages only where they exist; everything that
               # must be built from source (FIX 10) needs its native
-              # headers present:
+              # SYSTEM headers present (these are OS packages, NOT pip
+              # packages — they cannot live in requirements.txt):
               #   libffi-dev    — <ffi.h> for cffi (zstandard/aioquic chain)
               #   pkg-config + libssl-dev — REQUIRED to build cryptography
               #                  from the sdist: the openssl-sys build script
@@ -460,6 +448,8 @@ jobs:
               # Runtime dependencies from requirements.txt (ALL REQUIRED,
               # including aioquic — built from source here if no i386
               # wheel exists; the build FAILS if that does not succeed).
+              # No runtime package is pinned or hardcoded here —
+              # requirements.txt is the single source of truth.
               if [ -f requirements.txt ]; then
                 python -m pip install -r requirements.txt
               else
@@ -540,7 +530,8 @@ jobs:
   #     of being killed at the wall.
   #
   # FIX 10 applies here identically to linux-x86: pkg-config + libssl-dev
-  # for a cryptography source build, zlib1g-dev + libjpeg-dev for Pillow.
+  # for a cryptography source build, zlib1g-dev + libjpeg-dev for Pillow
+  # (system headers — they cannot live in requirements.txt).
   # --------------------------------------------------------------------------
   build-linux-armv7:
     name: Build linux-armv7 (32-bit ARM, experimental)
@@ -579,7 +570,8 @@ jobs:
             bash -euo pipefail -c '
               # Pre-built packages only where they exist; everything that
               # must be built from source (FIX 10) needs its native
-              # headers present:
+              # SYSTEM headers present (OS packages, NOT pip packages —
+              # they cannot live in requirements.txt):
               #   libffi-dev    — <ffi.h> for cffi (zstandard/aioquic chain)
               #   pkg-config + libssl-dev — REQUIRED to build cryptography
               #                  from the sdist (openssl-sys discovers
@@ -597,7 +589,9 @@ jobs:
               python -m pip install --upgrade pip
               # Runtime dependencies from requirements.txt (ALL REQUIRED,
               # including aioquic — built from source here; the build
-              # FAILS if that does not succeed).
+              # FAILS if that does not succeed). No runtime package is
+              # pinned or hardcoded here — requirements.txt is the
+              # single source of truth.
               if [ -f requirements.txt ]; then
                 python -m pip install -r requirements.txt
               else
