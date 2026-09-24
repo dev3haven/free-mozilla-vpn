@@ -25,6 +25,9 @@ on:
 # and setuptools are compiled INTO the binary (--include-package=pip,
 # --include-package=setuptools), and all known project dependencies are
 # pre-installed at build time so Nuitka can compile them in as well.
+# NOTE: since Python 3.12, ensurepip/venv no longer bundle setuptools, so
+# CPython 3.14 environments ship pip only; setuptools is therefore installed
+# explicitly from PyPI before compilation.
 env:
   PYTHON_VERSION: '3.14'
   LLVM_VERSION: '22'
@@ -120,7 +123,10 @@ jobs:
           fi
           # Nuitka with the "onefile" extra pulls in "zstandard", which
           # enables automatic onefile payload compression.
-          python3 -m pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set
+          # setuptools/wheel are installed explicitly: since Python 3.12
+          # ensurepip/venv no longer bundle them, and CPython 3.14
+          # environments ship pip only.
+          python3 -m pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set setuptools wheel
 
       - name: Compile with Nuitka (optimized onefile, Clang + LTO)
         run: |
@@ -215,8 +221,11 @@ jobs:
               if [ -f requirements.txt ]; then
                 python3 -m pip install --no-cache-dir --upgrade -r requirements.txt
               fi
-              # nuitka[onefile] pulls in zstandard -> automatic onefile compression
-              python3 -m pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set
+              # nuitka[onefile] pulls in zstandard -> automatic onefile compression.
+              # setuptools/wheel are installed explicitly because CPython 3.12+
+              # no longer bundles them with pip (needed for
+              # --include-package=setuptools).
+              python3 -m pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set setuptools wheel
               # Compile with Nuitka (optimized onefile, Clang + LTO).
               # pip/setuptools are included because the script calls pip at runtime.
               mkdir -p /src/build
@@ -310,8 +319,11 @@ jobs:
           if (Test-Path requirements.txt) {
             pip install --no-cache-dir --upgrade -r requirements.txt
           }
-          # nuitka[onefile] pulls in zstandard -> automatic onefile compression
-          pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set
+          # nuitka[onefile] pulls in zstandard -> automatic onefile compression.
+          # setuptools/wheel are installed explicitly because CPython 3.12+
+          # no longer bundles them with pip (needed for
+          # --include-package=setuptools).
+          pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set setuptools wheel
 
       - name: Compile with Nuitka (optimized onefile, MSVC + LTO)
         shell: pwsh
