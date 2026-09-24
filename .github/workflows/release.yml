@@ -14,9 +14,17 @@ on:
 #                  arm64 : arm64v8/python:3.14-slim-trixie (official per-arch image)
 #                  armv7 : arm32v7/python:3.14-slim-trixie (official per-arch image)
 #   Windows    - official python.org installers via actions/setup-python
-# All Python packages (nuitka, zstandard, project deps) - latest stable from PyPI.
+# Python packages (nuitka, zstandard, project deps) - latest stable from PyPI.
 # C compiler on Linux - latest stable Clang from the official LLVM apt
 # repository (apt.llvm.org), branch 22, wired up by the official llvm.sh script.
+# NOTE: there is no "--onefile-compression" option in Nuitka. Onefile payload
+# compression is enabled automatically when the "zstandard" package is
+# installed in the build environment; installing "nuitka[onefile]" is the
+# officially recommended way to pull it in.
+# NOTE: mozvpn_beta.py calls pip at runtime to install dependencies, so pip
+# and setuptools are compiled INTO the binary (--include-package=pip,
+# --include-package=setuptools), and all known project dependencies are
+# pre-installed at build time so Nuitka can compile them in as well.
 env:
   PYTHON_VERSION: '3.14'
   LLVM_VERSION: '22'
@@ -105,11 +113,14 @@ jobs:
         run: |
           set -euxo pipefail
           python3 -m pip install --no-cache-dir --upgrade pip
+          # Pre-install project dependencies so Nuitka compiles them into
+          # the binary; the script also installs deps via pip at runtime.
           if [ -f requirements.txt ]; then
             python3 -m pip install --no-cache-dir --upgrade -r requirements.txt
           fi
-          # Nuitka and helper packages - latest stable from PyPI
-          python3 -m pip install --no-cache-dir --upgrade nuitka ordered-set zstandard
+          # Nuitka with the "onefile" extra pulls in "zstandard", which
+          # enables automatic onefile payload compression.
+          python3 -m pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set
 
       - name: Compile with Nuitka (optimized onefile, Clang + LTO)
         run: |
@@ -119,8 +130,9 @@ jobs:
             --clang \
             --mode=onefile \
             --lto=yes \
-            --onefile-compression=zstd \
             --assume-yes-for-downloads \
+            --include-package=pip \
+            --include-package=setuptools \
             --output-dir=build \
             --output-filename=mozvpn_beta-${{ matrix.platform }} \
             --product-name="mozvpn_beta" \
@@ -159,6 +171,7 @@ jobs:
   build-linux-armv7:
     name: linux-armv7
     runs-on: ubuntu-26.04
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -195,20 +208,25 @@ jobs:
               ln -sf "$(command -v clang-${LLVM_VERSION})" /usr/local/bin/clang
               ln -sf "$(command -v clang++-${LLVM_VERSION})" /usr/local/bin/clang++
               clang --version
-              # Python dependencies - latest stable from PyPI
+              # Python dependencies - latest stable from PyPI.
+              # Pre-install project deps so Nuitka compiles them in; the
+              # script also installs deps via pip at runtime.
               python3 -m pip install --no-cache-dir --upgrade pip
               if [ -f requirements.txt ]; then
                 python3 -m pip install --no-cache-dir --upgrade -r requirements.txt
               fi
-              python3 -m pip install --no-cache-dir --upgrade nuitka ordered-set zstandard
-              # Compile with Nuitka (optimized onefile, Clang + LTO)
+              # nuitka[onefile] pulls in zstandard -> automatic onefile compression
+              python3 -m pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set
+              # Compile with Nuitka (optimized onefile, Clang + LTO).
+              # pip/setuptools are included because the script calls pip at runtime.
               mkdir -p /src/build
               python3 -m nuitka \
                 --clang \
                 --mode=onefile \
                 --lto=yes \
-                --onefile-compression=zstd \
                 --assume-yes-for-downloads \
+                --include-package=pip \
+                --include-package=setuptools \
                 --output-dir=/src/build \
                 --output-filename=mozvpn_beta-linux-armv7 \
                 --product-name="mozvpn_beta" \
@@ -287,10 +305,13 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --no-cache-dir --upgrade pip
+          # Pre-install project dependencies so Nuitka compiles them into
+          # the binary; the script also installs deps via pip at runtime.
           if (Test-Path requirements.txt) {
             pip install --no-cache-dir --upgrade -r requirements.txt
           }
-          pip install --no-cache-dir --upgrade nuitka ordered-set zstandard
+          # nuitka[onefile] pulls in zstandard -> automatic onefile compression
+          pip install --no-cache-dir --upgrade "nuitka[onefile]" ordered-set
 
       - name: Compile with Nuitka (optimized onefile, MSVC + LTO)
         shell: pwsh
@@ -298,8 +319,9 @@ jobs:
           python -m nuitka `
             --mode=onefile `
             --lto=yes `
-            --onefile-compression=zstd `
             --assume-yes-for-downloads `
+            --include-package=pip `
+            --include-package=setuptools `
             --output-dir=build `
             --output-filename=mozvpn_beta-${{ matrix.platform }}.exe `
             --product-name="mozvpn_beta" `
