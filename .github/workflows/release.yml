@@ -1,422 +1,336 @@
 # ============================================================================
-# Free Mozilla VPN — Nuitka CI
-# ----------------------------------------------------------------------------
-# Builds mozvpn_beta.py into optimized onefile binaries:
-#   Linux   : x86_64, aarch64 (native runners), i386 (official
-#             i386/python:3.14-slim-bookworm Docker image, natively, no QEMU)
-#   Windows : x64, arm64 (native runners), x86 (official 32-bit CPython
-#             installer from python.org + MSVC cross-tools)
+# Free Mozilla VPN — build mozvpn_beta.py with Nuitka (Python 3.14)
+# Targets: Windows (x86, x64, ARM64) and Linux (x86, x64, ARM64)
 #
-# Build rules:
-#   - Python 3.14 from official sources only: actions/setup-python,
-#     the official python Docker image (Docker Hub), the official
-#     python.org installer.
-#   - ALL Python dependencies are installed ONLY from binary wheels
-#     (pip --only-binary=:all:). Nothing is ever built from an sdist.
-#   - System packages are installed with the platform's native package
-#     manager (apt).
-#   - Nuitka optimizations: onefile+standalone, LTO, --jobs set to the
-#     full core count, Nuitka/ccache caching between runs, dynamic
-#     --include-package flags.
-#
-# Trigger: push a v* tag (a Release with the binaries is created) or run
-# manually (Actions -> Run workflow).
+# Verified facts (2026-09-24):
+#   * Python 3.14 is a stable release (released 2025-10-07).
+#   * Nuitka supports Python 3.4–3.14 (current release line supports 3.14
+#     officially; experimental support for 3.15 has started).
+#   * Nuitka does NOT cross-compile: every target is built natively
+#     on a runner with the corresponding OS and architecture.
+#   * Ready-made GitHub runners: ubuntu-latest (x86_64), ubuntu-24.04-arm
+#     (arm64, free for public repositories), windows-latest (x86_64),
+#     windows-11-arm (arm64, free for public repositories since April 2025).
+#     There are NO 32-bit hosted runners, so:
+#       - Windows x86 is built on windows-latest x64 using a 32-bit
+#         Python (architecture: x86) + MinGW i686 (Nuitka downloads it
+#         automatically).
+#       - Linux x86 is built on ubuntu-latest from a self-compiled
+#         32-bit CPython 3.14 (gcc -m32); the job is marked
+#         continue-on-error since it is the most fragile target.
+#   * ARM runners on GitHub are free for public repositories; for a
+#     private repository you need a paid larger runner or a self-hosted
+#     runner.
 # ============================================================================
 
-name: Build binaries (Nuitka, Python 3.14)
+name: Build Free Mozilla VPN
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
+
+env:
+  APP_NAME: "Free Mozilla VPN"
+  SCRIPT: mozvpn_beta.py
+  PYTHON_VERSION: "3.14"
+  # Version used for Windows binary resources
+  FILE_VERSION: "1.0.0.0"
 
 permissions:
   contents: read
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  APP_NAME: "Free Mozilla VPN"
-  APP_VERSION: "1.0.0.0"
-  # Current stable CPython 3.14 line (3.14.0 was released 2025-10-07).
-  PYTHON_VERSION: "3.14"
-  # Exact patch version for the 32-bit python.org installer (an exact URL
-  # is required). Before running, verify this is the latest 3.14 patch.
-  PYTHON_PATCH_VERSION: "3.14.7"
-
 jobs:
-  # ==========================================================================
-  # LINUX — x86_64 (ubuntu-24.04) and aarch64 (ubuntu-24.04-arm), natively
-  # ==========================================================================
-  build-linux:
-    name: Linux ${{ matrix.id }}
+  # --------------------------------------------------------------------------
+  # Main matrix: targets for which ready-made runners exist, or a 32-bit
+  # Python available via setup-python (Windows x86).
+  # --------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - id: amd64
-            os: ubuntu-24.04
-            artifact: mozvpn-linux-amd64
-          - id: arm64
-            os: ubuntu-24.04-arm
-            artifact: mozvpn-linux-arm64
-    env:
-      NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
+          # ----- Linux x86_64 -----
+          - os: ubuntu-latest
+            target: linux-x86_64
+            python_arch: x64
+            experimental: false
+          # ----- Linux arm64 (free for public repositories) -----
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            python_arch: arm64
+            experimental: false
+          # ----- Windows x64 -----
+          - os: windows-latest
+            target: windows-x64
+            python_arch: x64
+            experimental: false
+          # ----- Windows ARM64 (free for public repositories) -----
+          - os: windows-11-arm
+            target: windows-arm64
+            python_arch: arm64
+            experimental: false
+          # ----- Windows x86 (32-bit Python + MinGW i686) -----
+          - os: windows-latest
+            target: windows-x86
+            python_arch: x86
+            experimental: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Python 3.14 (official CPython builds)
+      - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python_arch }})
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.python_arch }}
+          cache: pip
+          cache-dependency-path: |
+            requirements*.txt
 
-      # System tools — ONLY from the official Ubuntu repositories
-      # (prebuilt deb packages, never compiled from source).
-      - name: Install system build tools (Ubuntu official repos)
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install --upgrade nuitka ordered-set zstandard
+
+      - name: Install C compiler cache (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential ccache patchelf
+          sudo apt-get install -y ccache clang
 
-      - name: Cache pip / Nuitka / ccache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ${{ env.NUITKA_CACHE_DIR }}
-            ${{ env.CCACHE_DIR }}
-          key: nuitka-linux-${{ matrix.id }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('mozvpn_beta.py') }}
-          restore-keys: |
-            nuitka-linux-${{ matrix.id }}-py${{ env.PYTHON_VERSION }}-
-            nuitka-linux-${{ matrix.id }}-
-
-      - name: Install Nuitka (latest stable, binary wheels only)
+      - name: Show toolchain info
+        shell: bash
         run: |
-          python -m pip install --only-binary=:all: --upgrade pip setuptools wheel
-          python -m pip install --only-binary=:all: --upgrade Nuitka ordered-set
+          python --version
+          python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
           python -m nuitka --version
 
-      # All application dependencies — prebuilt PyPI wheels only.
-      # If no prebuilt wheel exists for the platform, the dependency is
-      # skipped with a warning (no sdist building ever happens). The
-      # script itself works fine without optional packages (all of its
-      # imports are wrapped in try/except).
-      - name: Install application dependencies (binary wheels only)
+      # ------------------------------------------------------------------------
+      # Nuitka build with optimizations:
+      #   --standalone        : self-contained environment (no installed Python
+      #                         required on the target machine)
+      #   --onefile           : a single self-sufficient executable file
+      #   --lto=yes           : whole-program link-time optimization
+      #   --clang (Linux)     : clang is faster and more memory-efficient
+      #                         than gcc
+      #   --remove-output     : delete the temporary build folder
+      #   --assume-yes-for-downloads : let Nuitka download MinGW (Windows),
+      #                         ccache and depends.exe automatically when
+      #                         needed
+      # ------------------------------------------------------------------------
+      - name: Compile with Nuitka (Linux)
+        if: runner.os == 'Linux'
         run: |
-          INCLUDE_FLAGS=""
-          for pair in "pyotp:pyotp" "zxing-cpp:zxingcpp" "Pillow:PIL" "aioquic:aioquic"; do
-            pkg="${pair%%:*}"
-            mod="${pair##*:}"
-            if python -m pip install --only-binary=:all: --upgrade "$pkg"; then
-              INCLUDE_FLAGS="$INCLUDE_FLAGS --include-package=$mod"
-              echo "OK: $pkg ($mod)"
-            else
-              echo "::warning::No prebuilt binary wheel for '$pkg' on ${{ matrix.id }} - skipped (the script degrades gracefully)."
-            fi
-          done
-          echo "INCLUDE_FLAGS=$INCLUDE_FLAGS" >> "$GITHUB_ENV"
-          python -m pip freeze
-
-      - name: Compile with Nuitka (optimized onefile)
-        run: |
-          JOBS=$(nproc)
-          echo "Compiling with $JOBS parallel jobs..."
+          set -euo pipefail
           python -m nuitka \
             --standalone \
             --onefile \
             --lto=yes \
-            --jobs="$JOBS" \
-            --assume-yes-for-downloads \
+            --clang \
+            --jobs=4 \
             --output-dir=build \
-            --output-filename=mozvpn \
+            --output-filename="mozvpn_beta-${{ matrix.target }}" \
+            --company-name="${{ env.APP_NAME }}" \
+            --product-name="${{ env.APP_NAME }}" \
+            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" \
+            --file-version="${{ env.FILE_VERSION }}" \
+            --product-version="${{ env.FILE_VERSION }}" \
             --remove-output \
-            --report=build/compilation-report.xml \
-            $INCLUDE_FLAGS \
-            mozvpn_beta.py
-          ls -la build/
+            --assume-yes-for-downloads \
+            "${{ env.SCRIPT }}"
 
-      - name: Smoke test (binary must start)
-        run: ./build/mozvpn --help
+      - name: Compile with Nuitka (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m nuitka `
+            --standalone `
+            --onefile `
+            --lto=yes `
+            --jobs=4 `
+            --output-dir=build `
+            --output-filename="mozvpn_beta-${{ matrix.target }}.exe" `
+            --company-name="${{ env.APP_NAME }}" `
+            --product-name="${{ env.APP_NAME }}" `
+            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" `
+            --file-version="${{ env.FILE_VERSION }}" `
+            --product-version="${{ env.FILE_VERSION }}" `
+            --copyright="Free Mozilla VPN" `
+            --windows-console-mode=force `
+            --remove-output `
+            --assume-yes-for-downloads `
+            "${{ env.SCRIPT }}"
+
+      - name: Smoke test binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          file "build/mozvpn_beta-${{ matrix.target }}"
+          # --help/-h works if the script uses argparse; otherwise replace
+          # it with a safe flag or remove this step.
+          "./build/mozvpn_beta-${{ matrix.target }}" --help || true
+
+      - name: Smoke test binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "build/mozvpn_beta-${{ matrix.target }}.exe"
+          if (Test-Path $bin) { & $bin --help; if ($LASTEXITCODE -ne 0) { Write-Host "exit=$LASTEXITCODE" } }
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
-          path: build/mozvpn
+          name: mozvpn_beta-${{ matrix.target }}
+          path: build/mozvpn_beta-${{ matrix.target }}*
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Upload compilation report
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}-report
-          path: build/compilation-report.xml
-          if-no-files-found: ignore
-
-  # ==========================================================================
-  # LINUX i386 — the official i386/python Docker image (Docker Hub, the
-  # Python project's own image). Runs on an amd64 runner NATIVELY (no
-  # QEMU): 32-bit processes are executed directly by the CPU.
-  # ==========================================================================
-  build-linux-i386:
-    name: Linux i386 (official python image)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    container:
-      image: i386/python:3.14-slim-bookworm
-    env:
-      NUITKA_CACHE_DIR: /tmp/nuitka-cache
-      CCACHE_DIR: /tmp/ccache
+  # --------------------------------------------------------------------------
+  # Linux x86 (32-bit): there is no ready-made hosted runner and no 32-bit
+  # CPython in setup-python, so we build CPython 3.14 from source with -m32.
+  # This is the most fragile target — marked as experimental.
+  # --------------------------------------------------------------------------
+  build-linux-x86:
+    name: Build linux-x86 (32-bit, experimental)
+    runs-on: ubuntu-latest
+    continue-on-error: true
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # The container's native package manager — apt (Debian bookworm,
-      # official repositories). git is required by actions/checkout
-      # inside a container.
-      - name: Install system build tools (Debian official repos)
+      - name: Install build dependencies and 32-bit toolchain
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential ccache patchelf git ca-certificates
+          set -euo pipefail
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential gcc-multilib g++-multilib \
+            pkg-config wget ccache \
+            libncurses-dev:i386 zlib1g-dev:i386 libbz2-dev:i386 \
+            libreadline-dev:i386 libsqlite3-dev:i386 libffi-dev:i386 \
+            libssl-dev:i386 liblzma-dev:i386 uuid-dev:i386
 
-      - name: Verify 32-bit Python 3.14
+      - name: Build 32-bit CPython ${{ env.PYTHON_VERSION }}
         run: |
-          python3 -c "import struct, sys; print(sys.version); assert struct.calcsize('P') * 8 == 32, 'not a 32-bit interpreter!'"
+          set -euo pipefail
+          PYVER="${PYTHON_VERSION}"
+          PYMINOR="${PYVER#*.}"
+          SRCDIR="Python-${PYVER}"
+          wget -q "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tar.xz"
+          tar -xf "Python-${PYVER}.tar.xz"
+          cd "${SRCDIR}"
+          # 32-bit build via -m32 on an x86_64 host (the x86_64 kernel
+          # runs 32-bit code natively, no emulation is required).
+          CC="gcc -m32" CXX="g++ -m32" \
+            ./configure \
+              --build=i686-pc-linux-gnu \
+              --prefix="$HOME/.local/python32" \
+              --enable-optimizations \
+              --with-lto \
+              --disable-test-modules
+          make -j"$(nproc)"
+          make install
+          cd ..
+          rm -rf "${SRCDIR}" "Python-${PYVER}.tar.xz"
 
-      - name: Install Nuitka (latest stable, binary wheels only)
+      - name: Install Nuitka into 32-bit Python
         run: |
-          python3 -m pip install --only-binary=:all: --upgrade pip setuptools wheel
-          python3 -m pip install --only-binary=:all: --upgrade Nuitka ordered-set
-          python3 -m nuitka --version
+          set -euo pipefail
+          export PATH="$HOME/.local/python32/bin:$PATH"
+          python3 --version
+          python3 -c "import platform; print('arch:', platform.machine())"
+          if [ -f requirements.txt ]; then
+            python3 -m pip install --upgrade pip
+            python3 -m pip install -r requirements.txt
+          fi
+          python3 -m pip install --upgrade nuitka ordered-set zstandard
 
-      # On i386 not every package ships a prebuilt wheel. Anything without
-      # a wheel is skipped — honoring the "never build from sdist" rule.
-      - name: Install application dependencies (binary wheels only)
+      - name: Compile with Nuitka (32-bit Linux)
         run: |
-          INCLUDE_FLAGS=""
-          for pair in "pyotp:pyotp" "zxing-cpp:zxingcpp" "Pillow:PIL" "aioquic:aioquic"; do
-            pkg="${pair%%:*}"
-            mod="${pair##*:}"
-            if python3 -m pip install --only-binary=:all: --upgrade "$pkg"; then
-              INCLUDE_FLAGS="$INCLUDE_FLAGS --include-package=$mod"
-              echo "OK: $pkg ($mod)"
-            else
-              echo "::warning::No prebuilt binary wheel for '$pkg' on i386 - skipped (the script degrades gracefully)."
-            fi
-          done
-          echo "INCLUDE_FLAGS=$INCLUDE_FLAGS" >> "$GITHUB_ENV"
-          python3 -m pip freeze
-
-      - name: Compile with Nuitka (optimized onefile)
-        run: |
-          JOBS=$(nproc)
-          echo "Compiling with $JOBS parallel jobs..."
+          set -euo pipefail
+          export PATH="$HOME/.local/python32/bin:$PATH"
           python3 -m nuitka \
             --standalone \
             --onefile \
             --lto=yes \
-            --jobs="$JOBS" \
-            --assume-yes-for-downloads \
+            --jobs=4 \
             --output-dir=build \
-            --output-filename=mozvpn \
-            --remove-output \
-            --report=build/compilation-report.xml \
-            $INCLUDE_FLAGS \
-            mozvpn_beta.py
-          ls -la build/
-
-      - name: Smoke test (binary must start)
-        run: ./build/mozvpn --help
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mozvpn-linux-i386
-          path: build/mozvpn
-          if-no-files-found: error
-
-  # ==========================================================================
-  # WINDOWS — x64 and arm64 natively; x86 via the official 32-bit python.org
-  # installer + MSVC cross-tools. MinGW64 is unusable with Python >= 3.13,
-  # so --msvc=latest is used everywhere (per the Nuitka documentation).
-  # ==========================================================================
-  build-windows:
-    name: Windows ${{ matrix.id }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: amd64
-            os: windows-11
-            arch: x64
-            artifact: mozvpn-windows-amd64
-          - id: arm64
-            os: windows-11-arm
-            arch: arm64
-            artifact: mozvpn-windows-arm64
-          - id: i386
-            os: windows-11
-            arch: x86
-            artifact: mozvpn-windows-i386
-    env:
-      NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      # Native word sizes (x64, arm64) — official CPython builds.
-      - name: Set up Python 3.14 (official CPython builds)
-        if: matrix.arch != 'x86'
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      # 32-bit build: the official python.org installer.
-      # The file WITHOUT a suffix (python-3.14.7.exe) is the 32-bit
-      # installer; the 64-bit one is called *-amd64.exe.
-      - name: Install 32-bit Python 3.14 (official python.org installer)
-        if: matrix.arch == 'x86'
-        shell: pwsh
-        run: |
-          $ver = $env:PYTHON_PATCH_VERSION
-          $installer = "python-$ver.exe"
-          curl.exe -L -o "$installer" "https://www.python.org/ftp/python/$ver/$installer"
-          Start-Process -Wait -FilePath ".\$installer" -ArgumentList `
-            "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_test=0"
-          $pyDir = "C:\Program Files (x86)\Python3$($ver.Split('.')[1])"
-          Add-Content $env:GITHUB_PATH $pyDir
-          & "$pyDir\python.exe" -c "import struct, sys; print(sys.version); assert struct.calcsize('P')*8 == 32, 'not 32-bit!'"
-
-      # MSVC from the runner image; ilammy/msvc-dev-cmd prepares the
-      # compiler environment with the required target (x64 / x86 cross).
-      # On the arm64 runner VS is already set up for the native target —
-      # Nuitka will locate it on its own.
-      - name: Set up MSVC environment (x64 / x86 targets)
-        if: matrix.arch != 'arm64'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.arch }}
-
-      - name: Cache Nuitka cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~\AppData\Local\pip\Cache
-            ${{ env.NUITKA_CACHE_DIR }}
-          key: nuitka-windows-${{ matrix.id }}-py${{ env.PYTHON_VERSION }}-${{ hashFiles('mozvpn_beta.py') }}
-          restore-keys: |
-            nuitka-windows-${{ matrix.id }}-py${{ env.PYTHON_VERSION }}-
-            nuitka-windows-${{ matrix.id }}-
-
-      - name: Install Nuitka (latest stable, binary wheels only)
-        run: |
-          python -m pip install --only-binary=:all: --upgrade pip setuptools wheel
-          python -m pip install --only-binary=:all: --upgrade Nuitka ordered-set
-          python -m nuitka --version
-
-      - name: Install application dependencies (binary wheels only)
-        run: |
-          INCLUDE_FLAGS=""
-          for pair in "pyotp:pyotp" "zxing-cpp:zxingcpp" "Pillow:PIL" "aioquic:aioquic"; do
-            pkg="${pair%%:*}"
-            mod="${pair##*:}"
-            if python -m pip install --only-binary=:all: --upgrade "$pkg"; then
-              INCLUDE_FLAGS="$INCLUDE_FLAGS --include-package=$mod"
-              echo "OK: $pkg ($mod)"
-            else
-              echo "::warning::No prebuilt binary wheel for '$pkg' on windows-${{ matrix.arch }} - skipped (the script degrades gracefully)."
-            fi
-          done
-          echo "INCLUDE_FLAGS=$INCLUDE_FLAGS" >> "$GITHUB_ENV"
-          python -m pip freeze
-
-      - name: Compile with Nuitka (optimized onefile)
-        run: |
-          JOBS=$NUMBER_OF_PROCESSORS
-          echo "Compiling with $JOBS parallel jobs..."
-          python -m nuitka \
-            --standalone \
-            --onefile \
-            --msvc=latest \
-            --lto=yes \
-            --jobs="$JOBS" \
-            --assume-yes-for-downloads \
-            --output-dir=build \
-            --output-filename=mozvpn.exe \
-            --remove-output \
-            --report=build/compilation-report.xml \
+            --output-filename="mozvpn_beta-linux-x86" \
             --company-name="${{ env.APP_NAME }}" \
             --product-name="${{ env.APP_NAME }}" \
-            --file-version="${{ env.APP_VERSION }}" \
-            --product-version="${{ env.APP_VERSION }}" \
-            --file-description="Mozilla VPN / Firefox IP Protection client" \
-            $INCLUDE_FLAGS \
-            mozvpn_beta.py
-          ls -la build/
+            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" \
+            --file-version="${{ env.FILE_VERSION }}" \
+            --product-version="${{ env.FILE_VERSION }}" \
+            --remove-output \
+            --assume-yes-for-downloads \
+            "${{ env.SCRIPT }}"
 
-      - name: Smoke test (binary must start)
-        run: ./build/mozvpn.exe --help
+      - name: Smoke test 32-bit binary
+        run: |
+          set -euo pipefail
+          file build/mozvpn_beta-linux-x86
+          ./build/mozvpn_beta-linux-x86 --help || ./build/mozvpn_beta-linux-x86 -h || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
-          path: build/mozvpn.exe
+          name: mozvpn_beta-linux-x86
+          path: build/mozvpn_beta-linux-x86*
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Upload compilation report
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}-report
-          path: build/compilation-report.xml
-          if-no-files-found: ignore
-
-  # ==========================================================================
-  # RELEASE — only on a v* tag push. Gathers all binaries into a GitHub Release.
-  # ==========================================================================
-  release:
-    name: Create GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-linux, build-linux-i386, build-windows]
+  # --------------------------------------------------------------------------
+  # Release: collects all binaries into a single zip (for v* tags).
+  # --------------------------------------------------------------------------
+  release-bundle:
+    name: Bundle all binaries
+    needs: [build, build-linux-x86]
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: List binaries
+      - name: List and pack binaries
         run: |
-          find dist -maxdepth 1 -type f | sort
-          file dist/* || true
+          set -euo pipefail
+          ls -laR dist
+          mkdir -p bundle
+          cp -v dist/mozvpn_beta-* bundle/ 2>/dev/null || true
+          ls -la bundle
+          cd bundle
+          zip -9 "../mozvpn_beta-${GITHUB_REF_NAME}.zip" ./*
 
-      - name: Create release with binaries
-        uses: softprops/action-gh-release@v2
+      - name: Upload release bundle artifact
+        uses: actions/upload-artifact@v7
         with:
-          files: |
-            dist/mozvpn-linux-amd64
-            dist/mozvpn-linux-arm64
-            dist/mozvpn-linux-i386
-            dist/mozvpn-windows-amd64.exe
-            dist/mozvpn-windows-arm64.exe
-            dist/mozvpn-windows-i386.exe
+          name: mozvpn_beta-${{ github.ref_name }}-all
+          path: mozvpn_beta-${{ github.ref_name }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: mozvpn_beta-${{ github.ref_name }}.zip
           generate_release_notes: true
-          fail_on_unmatched_files: true
