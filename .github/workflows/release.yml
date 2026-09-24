@@ -176,6 +176,11 @@ jobs:
       #   --remove-output     : delete the temporary build folder
       #   --assume-yes-for-downloads : let Nuitka download ccache and other
       #                         optional tooling automatically when needed
+      #   --include-package=pip / =setuptools : mozvpn_beta.py runs pip
+      #                         at runtime to install its dependencies,
+      #                         and Nuitka standalone does NOT include
+      #                         pip/setuptools by default — they must be
+      #                         explicitly bundled into the binary.
       #
       # Windows note: Nuitka uses the preinstalled MSVC (Build Tools) on
       # windows-latest runners; for the 32-bit Python (x86) target MSVC is
@@ -189,6 +194,8 @@ jobs:
             --standalone \
             --onefile \
             --lto=yes \
+            --include-package=pip \
+            --include-package=setuptools \
             --clang \
             --jobs=4 \
             --output-dir=build \
@@ -211,6 +218,8 @@ jobs:
             --standalone `
             --onefile `
             --lto=yes `
+            --include-package=pip `
+            --include-package=setuptools `
             --jobs=4 `
             --output-dir=build `
             --output-filename="mozvpn_beta-${{ matrix.target }}.exe" `
@@ -262,8 +271,11 @@ jobs:
     name: Build linux-x86 (32-bit)
     runs-on: ubuntu-latest
     # Pre-built 32-bit CPython straight from the official multi-arch image.
+    # NOTE: the `env` context is NOT available in jobs.<id>.container.image
+    # (confirmed limitation), so the Python version is hardcoded here —
+    # keep it in sync with PYTHON_VERSION above.
     container:
-      image: python:${{ env.PYTHON_VERSION }}-slim
+      image: python:3.14-slim
       # Docker Hub serves the i386 variant of this multi-arch tag.
       options: --platform linux/386
 
@@ -311,6 +323,8 @@ jobs:
             --standalone \
             --onefile \
             --lto=yes \
+            --include-package=pip \
+            --include-package=setuptools \
             --jobs=4 \
             --output-dir=build \
             --output-filename="mozvpn_beta-linux-x86" \
@@ -398,6 +412,8 @@ jobs:
                 --standalone \
                 --onefile \
                 --lto=yes \
+                --include-package=pip \
+                --include-package=setuptools \
                 --jobs=4 \
                 --output-dir=build \
                 --output-filename="mozvpn_beta-linux-armv7" \
