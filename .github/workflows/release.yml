@@ -1,26 +1,32 @@
 # ============================================================================
 # Free Mozilla VPN — build mozvpn_beta.py with Nuitka (Python 3.14)
-# Targets: Windows (x86, x64, ARM64) and Linux (x86, x64, ARM64)
+# Targets: Windows (x86, x64, ARM64) and Linux (x86_64, ARM64)
 #
 # Verified facts (2026-09-24):
 #   * Python 3.14 is a stable release (released 2025-10-07).
-#   * Nuitka supports Python 3.4–3.14 (current release line supports 3.14
-#     officially; experimental support for 3.15 has started).
+#   * Nuitka supports Python 3.4–3.14 officially.
 #   * Nuitka does NOT cross-compile: every target is built natively
 #     on a runner with the corresponding OS and architecture.
-#   * Ready-made GitHub runners: ubuntu-latest (x86_64), ubuntu-24.04-arm
-#     (arm64, free for public repositories), windows-latest (x86_64),
-#     windows-11-arm (arm64, free for public repositories since April 2025).
-#     There are NO 32-bit hosted runners, so:
-#       - Windows x86 is built on windows-latest x64 using a 32-bit
-#         Python (architecture: x86) + MinGW i686 (Nuitka downloads it
-#         automatically).
-#       - Linux x86 is built on ubuntu-latest from a self-compiled
-#         32-bit CPython 3.14 (gcc -m32); the job is marked
-#         continue-on-error since it is the most fragile target.
+#   * Every target below uses a pre-built, installable CPython from
+#     actions/python-versions — nothing is compiled from source
+#     (no self-built CPython, no hours-long dependency builds):
+#       - ubuntu-latest (x86_64), ubuntu-24.04-arm (arm64),
+#         windows-latest (x86_64), windows-11-arm (arm64) via setup-python;
+#       - Windows x86 uses the 32-bit CPython installer selected with
+#         architecture: x86.
+#   * For 32-bit Python on Windows, Nuitka requires MSVC as the C compiler
+#     (NOT MinGW). MSVC is preinstalled on windows-latest runners, and
+#     Nuitka finds it automatically.
+#   * No requirements.txt / pyproject.toml exists in this repo (the project
+#     is a single mozvpn_beta.py script), so pip caching is NOT enabled:
+#     setup-python with cache: pip hard-fails when no dependency file
+#     matches (known upstream behavior, actions/setup-python#807).
 #   * ARM runners on GitHub are free for public repositories; for a
 #     private repository you need a paid larger runner or a self-hosted
 #     runner.
+#   * 32-bit Linux is deliberately NOT built: there is no hosted x86 Linux
+#     runner and no 32-bit CPython in setup-python, so it would require
+#     compiling CPython from source — excluded per project requirements.
 # ============================================================================
 
 name: Build Free Mozilla VPN
@@ -44,13 +50,12 @@ permissions:
 
 jobs:
   # --------------------------------------------------------------------------
-  # Main matrix: targets for which ready-made runners exist, or a 32-bit
-  # Python available via setup-python (Windows x86).
+  # Main matrix: every target uses a ready-to-install CPython from
+  # setup-python (nothing is built from sources).
   # --------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,49 +64,48 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64
             python_arch: x64
-            experimental: false
           # ----- Linux arm64 (free for public repositories) -----
           - os: ubuntu-24.04-arm
             target: linux-arm64
             python_arch: arm64
-            experimental: false
           # ----- Windows x64 -----
           - os: windows-latest
             target: windows-x64
             python_arch: x64
-            experimental: false
           # ----- Windows ARM64 (free for public repositories) -----
           - os: windows-11-arm
             target: windows-arm64
             python_arch: arm64
-            experimental: false
-          # ----- Windows x86 (32-bit Python + MinGW i686) -----
+          # ----- Windows x86 (32-bit CPython via architecture: x86) -----
           - os: windows-latest
             target: windows-x86
             python_arch: x86
-            experimental: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # NOTE: no cache: pip here — the repo has no requirements.txt or
+      # pyproject.toml, and setup-python fails hard when the cache
+      # dependency glob matches nothing.
       - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python_arch }})
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: ${{ matrix.python_arch }}
-          cache: pip
-          cache-dependency-path: |
-            requirements*.txt
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
+          # Install project dependencies only if a requirements file exists.
           if [ -f requirements.txt ]; then
             python -m pip install --upgrade pip
             python -m pip install -r requirements.txt
+          else
+            echo "No requirements.txt found — installing only build tooling."
           fi
+          # Build tooling: Nuitka compiler + helpers for onefile compression.
           python -m pip install --upgrade nuitka ordered-set zstandard
 
       - name: Install C compiler cache (Linux)
@@ -126,9 +130,12 @@ jobs:
       #   --clang (Linux)     : clang is faster and more memory-efficient
       #                         than gcc
       #   --remove-output     : delete the temporary build folder
-      #   --assume-yes-for-downloads : let Nuitka download MinGW (Windows),
-      #                         ccache and depends.exe automatically when
-      #                         needed
+      #   --assume-yes-for-downloads : let Nuitka download ccache and other
+      #                         optional tooling automatically when needed
+      #
+      # Windows note: Nuitka uses the preinstalled MSVC (Build Tools) on
+      # windows-latest runners; for the 32-bit Python (x86) target MSVC is
+      # required — MinGW must not be used there.
       # ------------------------------------------------------------------------
       - name: Compile with Nuitka (Linux)
         if: runner.os == 'Linux'
@@ -199,106 +206,11 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
-  # Linux x86 (32-bit): there is no ready-made hosted runner and no 32-bit
-  # CPython in setup-python, so we build CPython 3.14 from source with -m32.
-  # This is the most fragile target — marked as experimental.
-  # --------------------------------------------------------------------------
-  build-linux-x86:
-    name: Build linux-x86 (32-bit, experimental)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install build dependencies and 32-bit toolchain
-        run: |
-          set -euo pipefail
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential gcc-multilib g++-multilib \
-            pkg-config wget ccache \
-            libncurses-dev:i386 zlib1g-dev:i386 libbz2-dev:i386 \
-            libreadline-dev:i386 libsqlite3-dev:i386 libffi-dev:i386 \
-            libssl-dev:i386 liblzma-dev:i386 uuid-dev:i386
-
-      - name: Build 32-bit CPython ${{ env.PYTHON_VERSION }}
-        run: |
-          set -euo pipefail
-          PYVER="${PYTHON_VERSION}"
-          PYMINOR="${PYVER#*.}"
-          SRCDIR="Python-${PYVER}"
-          wget -q "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tar.xz"
-          tar -xf "Python-${PYVER}.tar.xz"
-          cd "${SRCDIR}"
-          # 32-bit build via -m32 on an x86_64 host (the x86_64 kernel
-          # runs 32-bit code natively, no emulation is required).
-          CC="gcc -m32" CXX="g++ -m32" \
-            ./configure \
-              --build=i686-pc-linux-gnu \
-              --prefix="$HOME/.local/python32" \
-              --enable-optimizations \
-              --with-lto \
-              --disable-test-modules
-          make -j"$(nproc)"
-          make install
-          cd ..
-          rm -rf "${SRCDIR}" "Python-${PYVER}.tar.xz"
-
-      - name: Install Nuitka into 32-bit Python
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/python32/bin:$PATH"
-          python3 --version
-          python3 -c "import platform; print('arch:', platform.machine())"
-          if [ -f requirements.txt ]; then
-            python3 -m pip install --upgrade pip
-            python3 -m pip install -r requirements.txt
-          fi
-          python3 -m pip install --upgrade nuitka ordered-set zstandard
-
-      - name: Compile with Nuitka (32-bit Linux)
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/python32/bin:$PATH"
-          python3 -m nuitka \
-            --standalone \
-            --onefile \
-            --lto=yes \
-            --jobs=4 \
-            --output-dir=build \
-            --output-filename="mozvpn_beta-linux-x86" \
-            --company-name="${{ env.APP_NAME }}" \
-            --product-name="${{ env.APP_NAME }}" \
-            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" \
-            --file-version="${{ env.FILE_VERSION }}" \
-            --product-version="${{ env.FILE_VERSION }}" \
-            --remove-output \
-            --assume-yes-for-downloads \
-            "${{ env.SCRIPT }}"
-
-      - name: Smoke test 32-bit binary
-        run: |
-          set -euo pipefail
-          file build/mozvpn_beta-linux-x86
-          ./build/mozvpn_beta-linux-x86 --help || ./build/mozvpn_beta-linux-x86 -h || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: mozvpn_beta-linux-x86
-          path: build/mozvpn_beta-linux-x86*
-          if-no-files-found: error
-          retention-days: 14
-
-  # --------------------------------------------------------------------------
   # Release: collects all binaries into a single zip (for v* tags).
   # --------------------------------------------------------------------------
   release-bundle:
     name: Bundle all binaries
-    needs: [build, build-linux-x86]
+    needs: [build]
     if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
