@@ -50,7 +50,7 @@
 #     exist so users can pick the naming that matches their hardware;
 #     the armv9 artifact is the "newer hardware" build of the same code.
 #
-# ARMv7 (32-bit ARM Linux) support is REMMOVED (2026-09-24): the QEMU-
+# ARMv7 (32-bit ARM Linux) support is REMOVED (2026-09-24): the QEMU-
 # emulated job was slow, experimental and never required — 32-bit ARM
 # Linux desktops/servers are effectively dead, and the AoT world has
 # moved to aarch64.
@@ -223,7 +223,8 @@
 #      history.
 #
 # Everything else verified and kept as-is:
-#   * actions/checkout@v5, actions/setup-python@v6,
+#   *   actions/checkout@v7 (current major: v7.0.1, 2026-07),
+#     actions/setup-python@v6,
 #     actions/upload-artifact@v7, actions/download-artifact@v8,
 #     softprops/action-gh-release@v3 — current, valid major tags.
 #   * setup-python provides pre-built CPython 3.14 for x64/x86 on
@@ -327,7 +328,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python_arch }})
         uses: actions/setup-python@v6
@@ -518,7 +519,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Compile with Nuitka (32-bit Linux, inside i386 container)
         run: |
@@ -620,13 +621,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-          if-no-files-found: error
-          retention-days: 14
-
   # --------------------------------------------------------------------------
   # TERMUX (Android, Bionic libc) — armv8 + armv9. Бинарники собираются
   # ВНУТРИ настоящего Termux: контейнер termux/termux-docker:aarch64
-  # (проект termux/termux-docker) запускается НПРАВКУ на ARMv9-раннере
+  # (проект termux/termux-docker) запускается НАПРЯМУЮ на ARMv9-раннере
   # ubuntu-24.04-arm (host aarch64 == arch контейнера, эмуляция не
   # нужна; aarch64-контейнеры termux-docker иногда требуют
   # привилегированного режима — поэтому --privileged).
@@ -676,7 +674,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Compile with Nuitka (inside Termux container)
         run: |
