@@ -1,16 +1,43 @@
-# Runtime dependencies of mozvpn_beta.py — ALL REQUIRED.
-# Nuitka embeds into the binary exactly what is importable at COMPILE
-# time: the script imports these packages behind try/except ImportError,
-# so they MUST be installed in the build environment, otherwise the
-# compiled binary ships with <pkg> = None fallbacks and reports
-# "NOT installed" at startup.
+# ============================================================================
+# Free Mozilla VPN (mozvpn_beta.py) — RUNTIME dependencies.
 #
-# pip name     -> module imported by mozvpn_beta.py
-# pyotp        -> pyotp     (TOTP generation)
-# zxing-cpp    -> zxingcpp  (QR decoding)
-# Pillow       -> PIL       (image opening for QR)
-# aioquic      -> aioquic   (real MASQUE / HTTP-3 CONNECT-UDP probing)
+# This is THE single source of truth for the script's runtime deps; the
+# CI workflow (release.yml) only runs `pip install -r requirements.txt`
+# and FAILS if it cannot be satisfied — nothing runtime-related is
+# pinned or hardcoded in the workflow.
+#
+# Direct runtime deps of mozvpn_beta.py:
+#   pyotp      — TOTP code generation (REQUIRED for 2FA)
+#   zxing-cpp  — QR decoding (REQUIRED to read 2FA QR images)
+#   Pillow     — image opening for the QR loader (REQUIRED)
+#   aioquic    — real MASQUE / HTTP-3 CONNECT-UDP probing (REQUIRED;
+#                without it every upstream falls back to HTTP CONNECT)
+#
+# Transitive dependency of aioquic that needs an explicit constraint:
+#   cryptography — aioquic requires `cryptography>=42.0.0`. The current
+#                 release line (50.x, Aug 2026) publishes NO wheel for
+#                 Windows on ARM64 (pyca dropped win_arm64 wheels after
+#                 46.0.3), so on that platform pip falls back to the
+#                 sdist and tries a Rust/maturin build, which dies with
+#                 "Could not find directory of OpenSSL installation"
+#                 (pyca/cryptography#14249). 46.0.3 is the last release
+#                 that ships a cp38-abi3 win_arm64 wheel; abi3 wheels are
+#                 forward-compatible across Python 3.x, so it works on
+#                 3.14 and still satisfies `cryptography>=42.0.0`.
+#                 The pin is applied ONLY where it is needed, via a PEP
+#                 508 environment marker (Windows + ARM64); every other
+#                 platform (win x64/x86, linux x86_64/arm64/x86/armv7,
+#                 macOS) keeps resolving to the latest release, which
+#                 has prebuilt wheels there.
+# ============================================================================
+
 pyotp
 zxing-cpp
 Pillow
 aioquic
+
+# Last release line with a win_arm64 wheel (cp38-abi3). Remove this
+# marker line when pyca ships win_arm64 wheels again — verify with:
+#   pip index versions cryptography
+#   https://pypi.org/pypi/cryptography/<version>/json  (urls -> *.whl)
+cryptography==46.0.3; sys_platform == "win32" and platform_machine == "ARM64"
