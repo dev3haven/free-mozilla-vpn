@@ -16,51 +16,68 @@
 #   * arm64 = aarch64 = ARMv8-A (64-bit).
 #   * armv7 — 32-bit ARM (armhf).
 #
-# IMPORTANT trigger notes (verified, 2026-09-24):
-#   * In on.push.tags filters the single "*" does NOT match "/" — the
-#     tag "release/1.2.20" does NOT match "release/*". The correct
-#     pattern is "release/**" (documented in Workflow syntax; "**"
-#     matches hierarchical tags like v1.0/beta).
-#   * A tag push runs the workflow file version FROM THE COMMIT the
-#     tag points to. If the tag was created on a commit that predates
-#     this updated workflow file, the OLD trigger filters apply and
-#     nothing starts. Tags must point to a commit that already
-#     contains this file.
-#   * The `on: release` trigger uses the workflow file version from
-#     the DEFAULT branch, and the release event cannot be filtered by
-#     tag name — filtering is done by the release-bundle job's `if`.
-#   * Tag names with slashes (release/1.2.20) are valid git refs, but
-#     GITHUB_REF_NAME then contains a slash — sanitized below before
-#     it is used in file names.
+# ---------------------------------------------------------------------------
+# FIXES IN THIS REVISION (audited 2026-09-24, all facts verified online):
 #
-# Verified facts (2026-09-24):
-#   * Python 3.14 is a stable release (released 2025-10-07).
-#   * Nuitka supports Python 3.4–3.14 officially.
-#   * Nuitka does NOT cross-compile: every target is built natively
-#     (or, for emulated containers, transparently) on a hosted runner.
-#   * Nothing heavy is compiled from source. Every target uses a
-#     ready-to-install Python:
-#       - Hosted runners via actions/setup-python (pre-built CPython):
-#         ubuntu-latest (x86_64), ubuntu-24.04-arm (arm64),
-#         windows-latest (x86_64, plus 32-bit CPython via architecture:
-#         x86), windows-11-arm (arm64).
-#       - linux-x86 runs in an i386 container of the official multi-arch
-#         python Docker image (pre-built 32-bit CPython). The x86_64
-#         host kernel runs i386 code natively — no emulation needed.
-#       - linux-armv7 runs in an arm32v7 container of the same official
-#         multi-arch python image (pre-built 32-bit ARM CPython),
-#         executed via QEMU user-mode emulation registered by
-#         docker/setup-qemu-action. No CPython build from sources, but
-#         emulation is slow — experimental.
-#   * For 32-bit Python on Windows, Nuitka requires MSVC as the C compiler
-#     (NOT MinGW). MSVC is preinstalled on windows-latest runners.
-#   * No requirements.txt / pyproject.toml exists in this repo (the project
-#     is a single mozvpn_beta.py script), so pip caching is NOT enabled:
-#     setup-python with cache: pip hard-fails when no dependency file
-#     matches (known upstream behavior, actions/setup-python#807).
-#   * ARM runners on GitHub are free for public repositories; for a
-#     private repository you need a paid larger runner or a self-hosted
-#     runner.
+# FIX 1 (THE windows-arm64 FATAL, and a latent bomb in EVERY other job):
+#     "FATAL: Error, failed to locate package 'setuptools' you asked to
+#      include."  Root cause: since Python 3.12 the CPython distributions
+#      installed by actions/setup-python (and the official python Docker
+#      images) NO LONGER BUNDLE setuptools — ensurepip/venv install only
+#     pip (python/cpython#95299, python-build-standalone#300). Nuitka's
+#      --include-package=setuptools therefore fails whenever setuptools
+#      is not explicitly pip-installed into the BUILD environment. On some
+#      x86_64 images setuptools happened to still be present (leftover /
+#      preinstalled by other tooling), which is why only windows-arm64
+#      blew up first — but the same crash could hit any matrix cell.
+#      Fix: `pip install --upgrade pip setuptools wheel` is now run in
+#      EVERY build job (matrix job + both container jobs), BEFORE nuitka.
+#
+# FIX 2: generate_release_notes had a corrupted value ("truedeep-research"
+#      paste artifact) — restored to `true`.
+#
+# FIX 3: the release-bundle job used `always()` in its `if`, so it also ran
+#      after FAILED builds (producing a broken/empty release zip and a
+#      failing download-artifact step). Now the bundle is built only when
+#      all `needs` jobs succeeded (the experimental armv7 job is
+#      continue-on-error, so its failure does not block the release).
+#
+# FIX 4: docker/setup-qemu-action bumped v3 -> v4 (current major, see the
+#      official action README); v3 still works, v4 is the maintained line.
+#
+# Everything else verified and kept as-is:
+#   * actions/checkout@v5, actions/setup-python@v6,
+#     actions/upload-artifact@v7, actions/download-artifact@v8,
+#     softprops/action-gh-release@v3 — all are current, valid major tags.
+#   * setup-python DOES provide pre-built CPython 3.14 for x64 and x86 on
+#     windows-latest and for arm64 on windows-11-arm.
+#   * Tag filter "release/**" (a single "*" does NOT match "/" in
+#     tags/branches filters); a tag push uses the workflow file FROM THE
+#     COMMIT the tag points at; the `release` event uses the DEFAULT
+#     branch's file and cannot be filtered by tag (handled via the
+#     release-bundle job's `if`).
+#   * No requirements.txt/pyproject.toml exists in this repo, so
+#     `cache: pip` in setup-python is NOT used (it hard-fails when the
+#     dependency glob matches nothing — actions/setup-python#807).
+#   * jobs.<id>.container CANNOT be used for the 32-bit/emulated builds:
+#     the runner mounts only 64-bit node binaries into /__e/, so in an
+#     i386/armv7 job container every action dies with
+#     "exec /__e/node24/bin/node: no such file or directory"
+#     (actions/runner#2115). All actions therefore run on the host and
+#     the builds run via plain `docker run` with the workspace bind-mounted.
+#   * linux-x86 runs natively on the x86_64 kernel (no emulation);
+#     linux-armv7 runs under QEMU user emulation — slow, experimental,
+#     continue-on-error so a timeout can never break a release.
+#   * Nuitka officially supports Python 3.4–3.14 and does NOT
+#     cross-compile; every target is built natively (or emulated) on a
+#     hosted runner with a PRE-BUILT CPython — nothing is compiled from
+#     source.
+#   * For 32-bit Python on Windows, Nuitka requires MSVC (NOT MinGW);
+#     MSVC is preinstalled on windows-latest, and the windows-11-arm image
+#     ships Visual Studio with ARM64 build tools.
+#   * --include-package=pip / =setuptools is required because
+#     mozvpn_beta.py runs pip AT RUNTIME to install its dependencies,
+#     and Nuitka standalone does not bundle pip/setuptools by default.
 # ============================================================================
 
 name: Build Free Mozilla VPN
@@ -149,6 +166,14 @@ jobs:
           else
             echo "No requirements.txt found — installing only build tooling."
           fi
+          # -----------------------------------------------------------------
+          # FIX (was the windows-arm64 FATAL):
+          # Python 3.12+ CPython from setup-python no longer bundles
+          # setuptools, and Nuitka --include-package=setuptools hard-fails
+          # with "failed to locate package 'setuptools'" when it is not
+          # installed. Install it EXPLICITLY, on every OS/arch, before nuitka.
+          # -----------------------------------------------------------------
+          python -m pip install --upgrade pip setuptools wheel
           # Build tooling: Nuitka compiler + helpers for onefile compression.
           python -m pip install --upgrade nuitka ordered-set zstandard
 
@@ -163,6 +188,9 @@ jobs:
         run: |
           python --version
           python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
+          # Prove that pip AND setuptools are importable in the build env
+          # (the exact precondition for --include-package=pip/setuptools).
+          python -c "import pip, setuptools, wheel; print('pip', pip.__version__, '| setuptools', setuptools.__version__)"
           python -m nuitka --version
 
       # ------------------------------------------------------------------------
@@ -180,11 +208,15 @@ jobs:
       #                         at runtime to install its dependencies,
       #                         and Nuitka standalone does NOT include
       #                         pip/setuptools by default — they must be
-      #                         explicitly bundled into the binary.
+      #                         explicitly bundled into the binary. Both
+      #                         packages must be installed in the BUILD
+      #                         environment (see the Install dependencies
+      #                         step) or Nuitka aborts with FATAL.
       #
       # Windows note: Nuitka uses the preinstalled MSVC (Build Tools) on
       # windows-latest runners; for the 32-bit Python (x86) target MSVC is
-      # required — MinGW must not be used there.
+      # required — MinGW must not be used there. The windows-11-arm image
+      # ships Visual Studio with ARM64 build tools for the arm64 target.
       # ------------------------------------------------------------------------
       - name: Compile with Nuitka (Linux)
         if: runner.os == 'Linux'
@@ -228,7 +260,7 @@ jobs:
             --file-description="${{ env.APP_NAME }} (mozvpn_beta)" `
             --file-version="${{ env.FILE_VERSION }}" `
             --product-version="${{ env.FILE_VERSION }}" `
-            --copyright="Free Mozilla VPN" `
+            --copyright="${{ env.APP_NAME }}" `
             --windows-console-mode=force `
             --remove-output `
             --assume-yes-for-downloads `
@@ -239,8 +271,7 @@ jobs:
         run: |
           set -euo pipefail
           file "build/mozvpn_beta-${{ matrix.target }}"
-          # --help/-h works if the script uses argparse; otherwise replace
-          # it with a safe flag or remove this step.
+          # --help/-h works because the script uses argparse.
           "./build/mozvpn_beta-${{ matrix.target }}" --help || true
 
       - name: Smoke test binary (Windows)
@@ -248,7 +279,15 @@ jobs:
         shell: pwsh
         run: |
           $bin = "build/mozvpn_beta-${{ matrix.target }}.exe"
-          if (Test-Path $bin) { & $bin --help; if ($LASTEXITCODE -ne 0) { Write-Host "exit=$LASTEXITCODE" } }
+          if (Test-Path $bin) {
+            # Non-fatal on purpose: an interactive console app may return
+            # a non-zero exit code from --help; the build result is the
+            # binary itself, which Test-Path already proved exists.
+            & $bin --help
+            Write-Host "smoke exit=$LASTEXITCODE"
+          } else {
+            throw "Binary not found: $bin"
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -262,88 +301,84 @@ jobs:
   # Linux x86 (32-bit): there is no 32-bit hosted runner and setup-python
   # does not provide 32-bit CPython for Linux, BUT nothing is built from
   # source. The official python Docker image is multi-arch and publishes
-  # pre-built 32-bit (i386) CPython builds, so this job runs inside the
-  # i386 container on the regular x86_64 ubuntu-latest runner (the x86_64
-  # kernel executes 32-bit code natively, no emulation). All packages
-  # installed inside the container are pre-built binaries.
+  # pre-built 32-bit (i386) CPython builds, so this job runs the build in
+  # an i386 container on the regular x86_64 ubuntu-latest runner (the
+  # x86_64 kernel executes 32-bit code natively, no emulation).
+  #
+  # IMPORTANT: jobs.<id>.container CANNOT be used for a 32-bit container.
+  # Action steps run inside the job container and need Node.js there, but
+  # the runner mounts only 64-bit node binaries into /__e/ — in an i386
+  # container every action (even checkout) dies with
+  # "exec /__e/node24/bin/node: no such file or directory"
+  # (actions/runner#2115, actions/upload-artifact#616). Therefore all
+  # actions run on the host, and the build itself runs via plain
+  # `docker run` with the workspace bind-mounted.
   # --------------------------------------------------------------------------
   build-linux-x86:
     name: Build linux-x86 (32-bit)
     runs-on: ubuntu-latest
-    # Pre-built 32-bit CPython straight from the official multi-arch image.
-    # NOTE: the `env` context is NOT available in jobs.<id>.container.image
-    # (confirmed limitation), so the Python version is hardcoded here —
-    # keep it in sync with PYTHON_VERSION above.
-    container:
-      image: python:3.14-slim
-      # Docker Hub serves the i386 variant of this multi-arch tag.
-      options: --platform linux/386
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install C toolchain (pre-built packages only)
+      # The build runs inside the i386 container via plain `docker run`
+      # (see the comment above for why jobs.container is not usable).
+      # The workspace is bind-mounted so the resulting binary is directly
+      # visible to the runner for the artifact upload step.
+      - name: Compile with Nuitka (32-bit Linux, inside i386 container)
         run: |
           set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            gcc g++ ccache patchelf file
-
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python --version
-          python -c "import platform; print('arch:', platform.machine())"
-          # Install project dependencies only if a requirements file exists.
-          if [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
-            python -m pip install -r requirements.txt
-          else
-            echo "No requirements.txt found — installing only build tooling."
-          fi
-          # Build tooling: Nuitka compiler + helpers for onefile compression.
-          python -m pip install --upgrade nuitka ordered-set zstandard
-
-      - name: Show toolchain info
-        run: |
-          python --version
-          python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
-          python -m nuitka --version
-
-      # ------------------------------------------------------------------------
-      # Same Nuitka option set as the main matrix, but with gcc (no clang
-      # install needed — keeping the container lean; clang would also be a
-      # pre-built package if preferred).
-      # ------------------------------------------------------------------------
-      - name: Compile with Nuitka (32-bit Linux)
-        run: |
-          set -euo pipefail
-          python -m nuitka \
-            --standalone \
-            --onefile \
-            --lto=yes \
-            --include-package=pip \
-            --include-package=setuptools \
-            --jobs=4 \
-            --output-dir=build \
-            --output-filename="mozvpn_beta-linux-x86" \
-            --company-name="${{ env.APP_NAME }}" \
-            --product-name="${{ env.APP_NAME }}" \
-            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" \
-            --file-version="${{ env.FILE_VERSION }}" \
-            --product-version="${{ env.FILE_VERSION }}" \
-            --remove-output \
-            --assume-yes-for-downloads \
-            "${{ env.SCRIPT }}"
-
-      - name: Smoke test 32-bit binary
-        run: |
-          set -euo pipefail
-          file build/mozvpn_beta-linux-x86
-          # --help/-h works if the script uses argparse; otherwise replace
-          # it with a safe flag or remove this step.
-          ./build/mozvpn_beta-linux-x86 --help || true
+          # NOTE: the workflow-level env block is exported into run-step
+          # shells, so ${PYTHON_VERSION} expands correctly here (host shell).
+          docker run --rm \
+            --platform linux/386 \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "python:${PYTHON_VERSION}-slim" \
+            bash -euo pipefail -c '
+              # Pre-built packages only — nothing compiled from sources.
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                gcc g++ patchelf file
+              python --version
+              python -c "import platform; print(\"arch:\", platform.machine())"
+              # Install project dependencies only if a requirements file exists.
+              if [ -f requirements.txt ]; then
+                python -m pip install --upgrade pip
+                python -m pip install -r requirements.txt
+              else
+                echo "No requirements.txt found — installing only build tooling."
+              fi
+              # FIX: Python 3.12+ images do not bundle setuptools any more;
+              # Nuitka --include-package=setuptools requires it in the build env.
+              python -m pip install --upgrade pip setuptools wheel
+              # Build tooling: Nuitka compiler + onefile compression helpers.
+              python -m pip install --upgrade nuitka ordered-set zstandard
+              # Prove pip/setuptools are importable (precondition for the
+              # --include-package options below).
+              python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
+              python -m nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --include-package=pip \
+                --include-package=setuptools \
+                --jobs=4 \
+                --output-dir=build \
+                --output-filename="mozvpn_beta-linux-x86" \
+                --company-name="Free Mozilla VPN" \
+                --product-name="Free Mozilla VPN" \
+                --file-description="Free Mozilla VPN (mozvpn_beta)" \
+                --file-version="1.0.0.0" \
+                --product-version="1.0.0.0" \
+                --remove-output \
+                --assume-yes-for-downloads \
+                "mozvpn_beta.py"
+              # Smoke test: --help/-h works because the script uses argparse.
+              file build/mozvpn_beta-linux-x86
+              ./build/mozvpn_beta-linux-x86 --help || true
+            '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -374,8 +409,9 @@ jobs:
 
       # Registers QEMU static binaries with binfmt_misc so an armv7
       # container can run on the x86_64 runner (official Docker action).
+      # v4 is the current major line of the action.
       - name: Set up QEMU for armv7 emulation
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm
 
@@ -406,8 +442,14 @@ jobs:
               else
                 echo "No requirements.txt found — installing only build tooling."
               fi
+              # FIX: Python 3.12+ images do not bundle setuptools any more;
+              # Nuitka --include-package=setuptools requires it in the build env.
+              python -m pip install --upgrade pip setuptools wheel
               # Build tooling: Nuitka compiler + onefile compression helpers.
               python -m pip install --upgrade nuitka ordered-set zstandard
+              # Prove pip/setuptools are importable (precondition for the
+              # --include-package options below).
+              python -c "import pip, setuptools, wheel; print(\"pip+setuptools OK\")"
               python -m nuitka \
                 --standalone \
                 --onefile \
@@ -425,8 +467,7 @@ jobs:
                 --remove-output \
                 --assume-yes-for-downloads \
                 "mozvpn_beta.py"
-              # Smoke test: --help/-h works if the script uses argparse;
-              # otherwise replace with a safe flag or remove this line.
+              # Smoke test: --help/-h works because the script uses argparse.
               file build/mozvpn_beta-linux-armv7
               ./build/mozvpn_beta-linux-armv7 --help || true
             '
@@ -442,6 +483,12 @@ jobs:
   # --------------------------------------------------------------------------
   # Release: collects all binaries into a single zip (for v* tags,
   # release/** tags, or a published GitHub Release).
+  #
+  # NOTE: no `always()` here on purpose. With `always()` the job also ran
+  # after FAILED builds and then either packed an incomplete bundle or
+  # died inside download-artifact. The default (success of `needs`) is
+  # correct: build-linux-armv7 is continue-on-error, so its failure does
+  # NOT block the release, while a real failure of any required job does.
   # --------------------------------------------------------------------------
   release-bundle:
     name: Bundle all binaries
@@ -450,11 +497,9 @@ jobs:
     # (release/1.2.20), or when a GitHub Release is published. Note that
     # for the release event github.ref still points at the tag ref.
     if: >
-      always() && (
-        startsWith(github.ref, 'refs/tags/v') ||
-        startsWith(github.ref, 'refs/tags/release/') ||
-        github.event_name == 'release'
-      )
+      startsWith(github.ref, 'refs/tags/v') ||
+      startsWith(github.ref, 'refs/tags/release/') ||
+      github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -483,6 +528,10 @@ jobs:
           mkdir -p bundle
           cp -v dist/mozvpn_beta-* bundle/ 2>/dev/null || true
           ls -la bundle
+          if ! ls bundle/mozvpn_beta-* >/dev/null 2>&1; then
+            echo "ERROR: no binaries found in dist/ — nothing to bundle" >&2
+            exit 1
+          fi
           cd bundle
           zip -9 "../mozvpn_beta-${{ steps.relname.outputs.safe }}.zip" ./*
 
