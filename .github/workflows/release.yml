@@ -162,11 +162,12 @@
 #      `cryptography==46.0.3; sys_platform == "win32"` НЕ применяется в
 #      Termux (sys_platform == "linux"), вместо сборки cryptography из
 #      sdist ставится предсобранный Termux-пакет python-cryptography
-#      (50.0.1 в termux-packages (актуально на 2026-09-24, живой прогон), deps: openssl + python + python-pip)
-#      ДО `pip install -r requirements.txt` — тогда pip видит
-#      `cryptography>=42.0.0` (требование aioquic) уже выполненным и
-#      не трогает его вообще. Pillow аналогично ставится
-#      предсобранным Termux-пакетом python-pillow. Остальное (pyotp —
+#      (50.0.1 в termux-packages (актуально на 2026-09-24, живой прогон),
+#      deps: openssl + python + python-pip) ДО `pip install -r
+#      requirements.txt` — тогда pip видит `cryptography>=42.0.0`
+#      (требование aioquic) уже выполненным и не трогает его вообще.
+#      Pillow аналогично ставится предсобранным Termux-пакетом
+#      python-pillow (12.3.0, живой прогон). Остальное (pyotp —
 #      pure Python, zxing-cpp, aioquic + pylsqpack) собирается pip-ом
 #      из sdist-ов clang-ом Termux: Termux НЕ использует -dev пакеты —
 #      заголовки входят в сами пакеты (openssl, libjpeg-turbo, zlib),
@@ -637,9 +638,13 @@ jobs:
   #
   # Порядок установки зависимостей ВАЖЕН:
   #   1. pkg-ом ставятся предсобранные Termux-пакеты python, python-pip,
-  #      python-cryptography (50.0.1 в termux-packages (актуально на 2026-09-24, живой прогон)) и python-pillow;
-  #      плюс тулчейн Nuitka по официальной документации:
-  #      clang binutils patchelf ccache ldd termux-elf-cleaner file.
+  #      python-cryptography (50.0.1 в termux-packages, живой прогон
+  #      2026-09-24) и python-pillow (12.3.0); плюс тулчейн Nuitka по
+  #      официальной документации:
+  #      clang binutils patchelf ccache ldd termux-elf-cleaner file,
+  #      а ТАКЖЕ cmake + ninja (FIX 13): zxing-cpp собирается через
+  #      scikit-build-core, которому нужен системный cmake >= 3.18 —
+  #      без него pip пытается собрать PyPI-sdist cmake и падает.
   #      Termux НЕ использует -dev пакеты: заголовки входят в сами
   #      пакеты (openssl установлен всегда, libjpeg-turbo/zlib ставятся
   #      вместе с python-pillow).
@@ -705,7 +710,15 @@ jobs:
                 python python-pip \
                 python-cryptography python-pillow \
                 clang binutils patchelf ccache ldd termux-elf-cleaner \
+                cmake ninja \
                 pkg-config libjpeg-turbo zlib file make
+              # NOTE (FIX 13): zxing-cpp builds from its sdist via
+              # scikit-build-core, which requires cmake >= 3.18. Without a
+              # SYSTEM cmake pip tries to build the `cmake` PyPI sdist as a
+              # build dependency and dies (bootstrap fails in the Termux
+              # prefix, live run 2026-09-24). With Termux's own `cmake`
+              # (and `ninja`) installed via pkg, scikit-build-core finds
+              # cmake on PATH and never touches the PyPI cmake.
               # Копируем исходники ВНУТРЬ prefix Termux: Android запрещает
               # exec с внешних смонтированных путей, а Nuitka компилирует и
               # запускает промежуточные бинарники в output-dir.
@@ -736,8 +749,6 @@ jobs:
                 echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
                 exit 1
               fi
-              # FIX 1: setuptools обязателен для --include-package=setuptools
-              # (уже установлен шагом выше, pip-ом — это разрешено).
               # Build-тулинг: Nuitka + хелперы onefile-сжатия.
               python -m pip install --upgrade nuitka ordered-set
               python -m pip install --upgrade zstandard || \
