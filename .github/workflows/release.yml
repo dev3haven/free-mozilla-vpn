@@ -181,6 +181,38 @@
 #      запускается ТОЛЬКО в Termux на Android (Bionic libc), НЕ на
 #      обычном glibc-Linux — и наоборот.
 #
+# FIX 14 (Termux build: bind-mount-independent file transfer, 2026-09-25):
+#      ЖИВОЙ ПРОГОН упал на `cp /src/mozvpn_beta.py` c "No such file or
+#      directory", хотя -v "$GITHUB_WORKSPACE:/src" был передан в docker
+#      run. Всё ДО cp работало (pkg update, 69 пакетов через apt, pip) —
+#      значит сеть, привилегии и Termux-окружение в порядке, а точка
+#      монтирования /src ВНУТРИ контейнера оказалась ПУСТОЙ: bind-mount
+#      с хоста не дошёл до процесса (termux-docker entrypoint.sh exec'ает
+#      команду через /system/bin/su + `env -i` от пользователя system
+#      (UID 1000) — сам по себе он пути не меняет, но и не защищает от
+#      пустого маунта). Классический симптом: docker создал mountpoint
+#      /src, но источник на стороне демона не виден. Диагностировать
+#      причину по логу невозможно, поэтому фикс УСТРАНЯЕТ САМ КЛАСС
+#      проблемы — в джобе build-termux БОЛЬШЕ НЕТ bind-mount'ов:
+#        * ВВОД: `docker build` запекает mozvpn_beta.py + requirements.txt
+#          в слой образа через COPY. Контекст сборки docker-КЛИЕНТ
+#          загружает демону tar-потоком (Docker docs: Build context),
+#          поэтому путь на хосте демону вообще не нужен. Если checkout
+#          пуст — docker build падает с понятной ошибкой на COPY сразу,
+#          а не с загадочным cannot stat после 15 минут установки.
+#          COPY-файлы (root:root, 0644) читаются пользователем system.
+#        * ВЫВОД: контейнер сборки запускается БЕЗ --rm под фиксированным
+#          именем; когда он завершается, бинарник извлекается из
+#          ОСТАНОВЛЕННОГО контейнера командой docker cp (Docker docs:
+#          "The CONTAINER can be a running or stopped container").
+#          Никакой путь хоста не монтируется ни на вход, ни на выход.
+#        * Exit-код сборки: docker run в foreground — non-zero exit
+#          контейнера роняет шаг GitHub Actions автоматически.
+#      Внутренний скрипт сборки не изменился: TARGET/MARCH по-прежнему
+#      «запечены» в текст подстановкой ${{ matrix.* }} (это уже
+#      доказанно работало в живом прогоне), pkg-тулчейн и порядок
+#      установки зависимостей сохранены.
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn_beta-* file to the GitHub Release as a
@@ -636,6 +668,21 @@ jobs:
   # наоборот — termux-бинарник (Bionic, ELF interpreter
   # /system/bin/linker64) НЕ запустится на glibc-Linux.
   #
+  # ПОРЯДОК ПЕРЕДАЧИ ФАЙЛОВ (FIX 14, 2026-09-25) — БЕЗ bind-mount'ов:
+  #   ВВОД:  docker build запекает mozvpn_beta.py + requirements.txt в
+  #          слой образа через COPY (контекст сборки docker-клиент
+  #          загружает демону tar-потоком — путь хоста демону не
+  #          нужен). В живом прогоне 2026-09-24/25 bind-mount
+  #          -v "$GITHUB_WORKSPACE:/src" оказался ПУСТЫМ внутри
+  #          контейнера (cp /src/mozvpn_beta.py → "No such file or
+  #          directory" при работающих pkg/apt/pip), поэтому джоб
+  #          больше вообще не полагается на host bind mounts.
+  #   ВЫВОД: контейнер сборки запускается БЕЗ --rm под фиксированным
+  #          именем mozvpn-termux-build; после его завершения бинарник
+  #          извлекается из ОСТАНОВЛЕННОГО контейнера командой
+  #          docker cp (Docker docs: работает и с running, и со
+  #          stopped контейнером).
+  #
   # Порядок установки зависимостей ВАЖЕН:
   #   1. pkg-ом ставятся предсобранные Termux-пакеты python, python-pip,
   #      python-cryptography (50.0.1 в termux-packages, живой прогон
@@ -685,22 +732,39 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p termux-out
-          # NOTE: termux-docker's entrypoint passes COMMAND-LINE ARGUMENTS
-          # into the Termux environment (through a privilege-dropping su,
-          # UID 1000) — Docker `-e` env vars do NOT survive into the proot
-          # session, which caused "TARGET: unbound variable" under set -u
-          # in the live run (2026-09-24). Therefore TARGET/MARCH are baked
-          # into the script text by the GitHub Actions expression
-          # substitution (${{ matrix.* }} is replaced BEFORE the shell
-          # runs — the inner script sees plain literals), and
-          # PIP_BREAK_SYSTEM_PACKAGES is exported INSIDE the script.
-          docker run --rm \
+          # -----------------------------------------------------------------
+          # FIX 14 (2026-09-25): НЕ полагаемся на bind-mount'ы вообще.
+          #
+          # 1) ВВОД через слой образа: исходники запекаются в образ
+          #    docker build-ом с COPY. Контекст сборки (каталог
+          #    $GITHUB_WORKSPACE) docker-КЛИЕНТ отправляет демону
+          #    tar-потоком — путь хоста НЕ обязан быть виден демону
+          #    (в отличие от -v bind mount). Пустой checkout теперь
+          #    валит шаг СРАЗУ с понятной ошибкой COPY, а не после
+          #    15 минут установки пакетов.
+          # 2) ВЫВОД через docker cp: контейнер сборки запускается в
+          #    foreground БЕЗ --rm под именем mozvpn-termux-build; когда
+          #    он завершается (exit-код = exit-код шага), бинарник
+          #    извлекается из ОСТАНОВЛЕННОГО контейнера (docker cp
+          #    официально поддерживает stopped containers), после чего
+          #    контейнер удаляется.
+          # -----------------------------------------------------------------
+          cat > termux-builder.Dockerfile <<'DOCKERFILE'
+          FROM termux/termux-docker:aarch64
+          COPY mozvpn_beta.py requirements.txt /src/
+          DOCKERFILE
+          docker build -t mozvpn-termux-builder -f termux-builder.Dockerfile "$GITHUB_WORKSPACE"
+          docker run \
             --privileged \
-            -v "$GITHUB_WORKSPACE:/src" \
-            -w /src \
-            termux/termux-docker:aarch64 \
+            --name mozvpn-termux-build \
+            mozvpn-termux-builder \
             bash -euo pipefail -c '
               set -euo pipefail
+              # NOTE: termux-docker entrypoint passes COMMAND-LINE ARGUMENTS
+              # into the Termux environment (through a privilege-dropping su,
+              # UID 1000) — Docker `-e` env vars do NOT survive into it, and
+              # `${{ ... }}` below is substituted by GitHub Actions BEFORE
+              # the shell runs, so the inner script sees plain literals.
               TARGET="${{ matrix.target }}"
               MARCH="${{ matrix.march }}"
               export PIP_BREAK_SYSTEM_PACKAGES=1
@@ -716,12 +780,16 @@ jobs:
               # scikit-build-core, which requires cmake >= 3.18. Without a
               # SYSTEM cmake pip tries to build the `cmake` PyPI sdist as a
               # build dependency and dies (bootstrap fails in the Termux
-              # prefix, live run 2026-09-24). With Termux's own `cmake`
+              # prefix, live run 2026-09-24). With Termux own `cmake`
               # (and `ninja`) installed via pkg, scikit-build-core finds
               # cmake on PATH and never touches the PyPI cmake.
-              # Копируем исходники ВНУТРЬ prefix Termux: Android запрещает
-              # exec с внешних смонтированных путей, а Nuitka компилирует и
-              # запускает промежуточные бинарники в output-dir.
+              # The sources come from the IMAGE LAYER baked by docker build
+              # (COPY mozvpn_beta.py requirements.txt /src/ — FIX 14), not
+              # from a host bind mount. COPY files are root:root 0644 —
+              # readable by the `system` user. We copy them INSIDE the
+              # Termux prefix: Android disallows exec from external mounted
+              # paths, and Nuitka compiles and runs intermediate binaries
+              # in its output-dir.
               mkdir -p "$HOME/mozvpn"
               cp /src/mozvpn_beta.py /src/requirements.txt "$HOME/mozvpn"/
               cd "$HOME/mozvpn"
@@ -739,22 +807,23 @@ jobs:
               # pip ARE allowed and needed for
               # Nuitka --include-package=setuptools (FIX 1).
               python -m pip install --upgrade setuptools wheel
-              # Runtime-зависимости: requirements.txt — единственный источник
-              # истины. cryptography и Pillow уже удовлетворены предсобранными
-              # Termux-пакетами (python-cryptography 50.0.1 >= 42.0.0 —
-              # требование aioquic; python-pillow), pip их не трогает.
+              # Runtime dependencies: requirements.txt is the single source
+              # of truth. cryptography and Pillow are already satisfied by
+              # the prebuilt Termux packages (python-cryptography 50.0.1 >=
+              # 42.0.0 — the aioquic requirement; python-pillow), pip does
+              # not touch them.
               if [ -f requirements.txt ]; then
                 python -m pip install -r requirements.txt
               else
                 echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
                 exit 1
               fi
-              # Build-тулинг: Nuitka + хелперы onefile-сжатия.
+              # Build tooling: Nuitka + onefile compression helpers.
               python -m pip install --upgrade nuitka ordered-set
               python -m pip install --upgrade zstandard || \
                 echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
-              # FIX 9: версии ТОЛЬКО через importlib.metadata (pyotp не
-              # экспортирует __version__).
+              # FIX 9: versions ONLY via importlib.metadata (pyotp does
+              # not export __version__).
               python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
               python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
               python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
@@ -762,11 +831,11 @@ jobs:
               python -c "import aioquic; from importlib.metadata import version; print(\"aioquic\", version(\"aioquic\"))"
               python -c "import cryptography; from importlib.metadata import version; print(\"cryptography\", version(\"cryptography\"))"
               python -m nuitka --version
-              # Сборка Nuitka ВНУТРИ Termux (официально поддерживается:
-              # документация требует patchelf/ccache/binutils/ldd/
-              # termux-elf-cleaner; standalone rpath для Termux чинился в
-              # Nuitka 2.6.7/2.7). termux-elf-cleaner afterwards убирает
-              # версии ELF, которые Android linker64 не поддерживает.
+              # Nuitka build INSIDE Termux (officially supported: the
+              # documentation requires patchelf/ccache/binutils/ldd/
+              # termux-elf-cleaner; standalone rpath for Termux was fixed
+              # in Nuitka 2.6.7/2.7). termux-elf-cleaner afterwards strips
+              # the ELF versions Android linker64 does not support.
               python -m nuitka \
                 --standalone \
                 --onefile \
@@ -790,12 +859,22 @@ jobs:
                 --assume-yes-for-downloads \
                 "mozvpn_beta.py"
               file build/mozvpn_beta-termux-"${TARGET}"
-              # Smoke test внутри настоящего Termux: бинарник Bionic,
-              # запускается прямо здесь (armv9 флаг работает на ARMv9 host).
+              # Smoke test inside the real Termux: the binary is Bionic
+              # and runs right here (the armv9 flag works on the ARMv9
+              # host runner).
               ./build/mozvpn_beta-termux-"${TARGET}" --help || true
-              # Выгружаем результат на хост через bind-mount /src.
-              cp build/mozvpn_beta-termux-"${TARGET}" /src/termux-out/
+              # NOTE: the binary is NOT copied out through a bind mount
+              # anymore (FIX 14). The host extracts it from the stopped
+              # container via `docker cp` (see below).
             '
+          # The build container has exited now (non-zero exit would have
+          # failed the step above). Extract the binary from the STOPPED
+          # container — docker cp officially works with stopped containers,
+          # and no host path is ever mounted.
+          docker cp \
+            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn_beta-termux-${{ matrix.target }} \
+            termux-out/
+          docker rm mozvpn-termux-build
 
       - name: Verify binary was produced
         run: |
