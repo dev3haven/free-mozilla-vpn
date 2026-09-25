@@ -16,8 +16,12 @@
 #   termux-armv8   — Termux (Android, Bionic libc), armv8-baseline
 #                    aarch64 — runs in Termux on ANY aarch64 Android
 #                    device; does NOT run on glibc Linux
-#   termux-armv9   — Termux (Android, Bionic libc), built with
-#                    -march=armv9-a for ARMv9 devices
+#   termux-armv9   — Termux (Android, Bionic libc), TUNED for ARMv9
+#                    devices with -mtune (scheduler tuning only, the
+#                    ISA stays ARMv8-baseline: runs on ALL aarch64
+#                    phones; FIX 18 — an -march=armv9-a build SIGILLs
+#                    on phones without userspace SVE2, which includes
+#                    most real-world devices)
 #   (glibc linux-* binaries do NOT work in Termux, and termux binaries
 #    do not work on glibc Linux: different libc + ELF interpreter —
 #    see the NOTE below)
@@ -176,8 +180,9 @@
 #      -I$PREFIX/include and -L$PREFIX/lib. The Termux python package
 #      is PEP 668 externally managed: PIP_BREAK_SYSTEM_PACKAGES=1 is
 #      exported before pip. The armv9 variant is built with
-#      MARCH="-march=armv9-a" (clang supports armv9-a; the runner is
-#      Neoverse N2 = ARMv9). Both jobs are continue-on-error: true —
+#      MARCH="-mtune=neoverse-n2" (scheduler tuning only, ARMv8 ISA
+#      baseline — FIX 18: -march=armv9-a emits SVE2 and SIGILLs on
+#      phones). Both jobs are continue-on-error: true —
 #      the Termux build is EXPERIMENTAL and its failure must not break
 #      the release of the other targets. The Termux binary runs ONLY
 #      in Termux on Android (Bionic libc), NOT on regular glibc
@@ -275,6 +280,69 @@
 #      package is additionally pkg-installed explicitly so its
 #      presence does not depend on the transitive dependency graph.
 #
+# FIX 18 (Termux armv9: "Illegal instruction" (SIGILL) on the phone,
+#      2026-09-25): the armv9 Termux binary built with
+#      MARCH="-march=armv9-a" crashed with SIGILL on a real device.
+#      CAUSE: -march=armv9-a makes clang emit SVE2 instructions
+#      UNCONDITIONALLY (llvm/llvm-project#114987 — SVE2 is a mandatory
+#      part of the Armv9.0-A baseline), and SVE/SVE2 instructions
+#      fault with SIGILL on any CPU without SVE (verified live). On top
+#      of that, -march=armv9-a implies LSE atomics (mandatory since
+#      ARMv8.1-A) which also SIGILL on Cortex-A53/A57-class cores.
+#      Android phones are extremely heterogeneous: most handsets
+#      (including many marketed as ARMv9 — e.g. Snapdragon 8+ Gen 1
+#      with Cortex-A510/A710) do NOT expose usable SVE2 to userspace.
+#      FIX: the termux-armv9 target now uses MARCH="-mtune=neoverse-n2"
+#      — pure SCHEDULER TUNING (the instruction set stays ARMv8
+#      baseline), so the binary runs on EVERY aarch64 Android device
+#      while the code is scheduled for ARMv9-class (Neoverse N2)
+#      pipelines. The linux-armv9 job KEEPS -march=armv9-a: it is
+#      smoke-tested on the Neoverse N2 (ARMv9+SVE2) runner and targets
+#      ARMv9 Linux servers, not consumer phones.
+#
+# FIX 19 (FATAL smoke tests everywhere, 2026-09-25): every build job
+#      now VERIFIES that the binary actually LAUNCHES, and a failed
+#      launch FAILS the job. Previously every smoke test ended in
+#      `|| true` (Linux/Termux) or merely logged the exit code
+#      (Windows) — the tests proved only that a file exists, while
+#      swallowing exactly the failure class they exist to catch:
+#      a SIGILL crash (FIX 18) makes the shell report exit 132, and
+#      the job still went GREEN with a broken artifact shipped.
+#      Verified facts behind the fix:
+#        * The Nuitka onefile bootstrap propagates the child exit
+#          status to its own exit code (WEXITSTATUS in
+#          OnefileBootstrap.c) — the smoke test sees the REAL program
+#          exit status, including crashes of the extracted payload.
+#        * argparse exits with status 0 after printing --help
+#          (errors exit 2), and mozvpn_beta.py parses args with
+#          argparse in main(), so a healthy binary MUST exit 0.
+#        * POSIX shells report death-by-signal N as 128+N, so SIGILL
+#          (signal 4) surfaces as exit code 132 — detectable.
+#      Windows: the binary is built with --windows-console-mode=force,
+#      so the console process writes --help to the captured stdout and
+#      pwsh checks $LASTEXITCODE -eq 0 (non-zero fails the job).
+#      Scope: launch-only, by design — the smoke test proves the ELF
+#      loads, the interpreter starts and the modules import; it does
+#      NOT verify the VPN logic (that needs real credentials and
+#      network access, out of CI scope).
+#
+# FIX 20 (actions/setup-python v6 -> v7, 2026-09-25): the current
+#      major of actions/setup-python is v7 (the official README and
+#      Marketplace examples now show actions/setup-python@v7; v6
+#      documented its breaking changes in the release notes and is
+#      superseded). The `architecture` input (x64/x86/arm64) is kept
+#      in v7 — the matrix python_arch values remain valid. All other
+#      action majors re-verified on 2026-09-25 and unchanged:
+#      actions/checkout@v7 (GA 2026-06, latest v7.0.1, 2026-07),
+#      actions/upload-artifact@v7, actions/download-artifact@v8
+#      (the v7/v8 pair introduced the archive:false unzipped-artifact
+#      support, 2026-02), softprops/action-gh-release@v3. Runners
+#      re-verified: ubuntu-24.04-arm and windows-11-arm are standard
+#      supported arm64 runners (windows-11-arm moves to the VS2026
+#      image in September 2026 — still the same label). Nuitka
+#      officially supports Python 3.14 (current release line; PyPI:
+#      "Python 3 (3.4 - 3.14) are supported").
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn_beta-* file to the GitHub Release as a
@@ -319,7 +387,7 @@
 #
 # Everything else verified and kept as-is:
 #   *   actions/checkout@v7 (current major: v7.0.1, 2026-07),
-#     actions/setup-python@v6,
+#     actions/setup-python@v7 (FIX 20),
 #     actions/upload-artifact@v7, actions/download-artifact@v8,
 #     softprops/action-gh-release@v3 — current, valid major tags.
 #   * setup-python provides pre-built CPython 3.14 for x64/x86 on
@@ -426,7 +494,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python_arch }})
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           architecture: ${{ matrix.python_arch }}
@@ -571,25 +639,43 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          file "build/mozvpn_beta-${{ matrix.target }}"
-          # --help works because the script uses argparse. The armv9
-          # binary executes natively on the ARMv9 (Neoverse N2) runner.
-          "./build/mozvpn_beta-${{ matrix.target }}" --help || true
+          BIN="build/mozvpn_beta-${{ matrix.target }}"
+          file "$BIN"
+          # FIX 19: the smoke test is now FATAL. The old `|| true`
+          # swallowed exactly the failures the smoke test exists to
+          # catch: a SIGILL (e.g. an ARMv9-only instruction on
+          # non-ARMv9 hardware) makes the shell report exit code
+          # 132 (128 + signal 4) — with `|| true` the job went
+          # green and a broken binary was released (live incident:
+          # termux armv9, FIX 18). The Nuitka onefile bootstrap
+          # propagates the child's exit status to its own exit
+          # code (WEXITSTATUS in OnefileBootstrap.c), and argparse
+          # exits 0 after printing --help, so a healthy binary
+          # MUST exit 0 here. `set -e` turns any non-zero exit
+          # (crash, missing interpreter, import failure) into a
+          # FAILED job.
+          "$BIN" --help
+          echo "smoke: $BIN --help exited 0"
 
       - name: Smoke test binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = "build/mozvpn_beta-${{ matrix.target }}.exe"
-          if (Test-Path $bin) {
-            # Non-fatal on purpose: an interactive console app may return
-            # a non-zero exit code from --help; the build result is the
-            # binary itself, which Test-Path already proved exists.
-            & $bin --help
-            Write-Host "smoke exit=$LASTEXITCODE"
-          } else {
-            throw "Binary not found: $bin"
+          if (-not (Test-Path $bin)) { throw "Binary not found: $bin" }
+          # FIX 19: the smoke test is now FATAL. The binary is built
+          # with --windows-console-mode=force, so the console-enabled
+          # process prints --help to the captured stdout. argparse
+          # exits 0 after --help; the Nuitka onefile bootstrap
+          # propagates the child exit code; pwsh exposes it via
+          # $LASTEXITCODE (about_Automatic_Variables). Any non-zero
+          # exit (crash, DLL load failure, missing interpreter) now
+          # FAILS the job instead of being logged and ignored.
+          & $bin --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "smoke test failed: $bin --help exited with $LASTEXITCODE"
           }
+          Write-Host "smoke: $bin --help exited 0"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -703,9 +789,14 @@ jobs:
                 --remove-output \
                 --assume-yes-for-downloads \
                 "mozvpn_beta.py"
-              # Smoke test: --help works because the script uses argparse.
+              # Smoke test (FIX 19: FATAL — no || true anymore; see
+              # the matrix-job smoke step). --help works because the
+              # script uses argparse and exits 0; the i386 binary runs
+              # natively on the x86_64 runner kernel. A SIGILL/crash
+              # exits non-zero and FAILS the build under set -e.
               file build/mozvpn_beta-linux-x86
-              ./build/mozvpn_beta-linux-x86 --help || true
+              ./build/mozvpn_beta-linux-x86 --help
+              echo "smoke: build/mozvpn_beta-linux-x86 --help exited 0"
             '
 
       - name: Upload artifact
@@ -772,9 +863,13 @@ jobs:
   #   3. nuitka/ordered-set/zstandard are workflow BUILD tooling,
   #      not runtime dependencies.
   #
-  # armv9 variant: MARCH="-march=armv9-a" in CFLAGS/LDFLAGS (clang
-  # supports armv9-a; the host runner is Neoverse N2 = ARMv9-A).
-  # armv8 — the default baseline (runs on ALL aarch64 Android).
+  # armv9 variant (FIX 18): MARCH="-mtune=neoverse-n2" in
+  # CFLAGS/LDFLAGS — scheduler TUNING ONLY; the ISA stays ARMv8
+  # baseline, so the binary runs on ALL aarch64 Android devices
+  # (an -march=armv9-a build emits SVE2/LSE instructions that SIGILL
+  # on phones without userspace SVE2 — verified live on a real
+  # device; clang emits SVE unconditionally for Armv9-A per
+  # llvm/llvm-project#114987). armv8 — the plain default baseline.
   # The build is EXPERIMENTAL: continue-on-error: true — a Termux job
   # failure must not block the release of the other targets.
   # --------------------------------------------------------------------------
@@ -789,7 +884,7 @@ jobs:
           - target: armv8
             march: ""
           - target: armv9
-            march: "-march=armv9-a"
+            march: "-mtune=neoverse-n2"
 
     steps:
       - name: Checkout
@@ -976,11 +1071,16 @@ jobs:
                 --remove-output \
                 --assume-yes-for-downloads \
                 "mozvpn_beta.py"
+              # Smoke test inside the real Termux (FIX 19: FATAL —
+              # no || true anymore; see the matrix-job smoke step).
+              # The binary is Bionic and runs right here on the
+              # aarch64 host; --help exits 0 via argparse. A SIGILL
+              # (like the FIX 18 armv9 incident) exits non-zero
+              # (128+4=132) and FAILS the build under set -e — a
+              # broken binary can no longer ship unnoticed.
               file build/mozvpn_beta-termux-"${TARGET}"
-              # Smoke test inside the real Termux: the binary is Bionic
-              # and runs right here (the armv9 flag works on the ARMv9
-              # host runner).
-              ./build/mozvpn_beta-termux-"${TARGET}" --help || true
+              ./build/mozvpn_beta-termux-"${TARGET}" --help
+              echo "smoke: termux ${TARGET} --help exited 0"
               # NOTE: the binary is NOT copied out through a bind mount
               # anymore (FIX 14). The host extracts it from the stopped
               # container via `docker cp` (see below).
