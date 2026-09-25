@@ -204,6 +204,8 @@
 #          Никакой путь хоста не монтируется ни на вход, ни на выход.
 #        * Exit-код сборки: docker run в foreground — non-zero exit
 #          контейнера роняет шаг GitHub Actions автоматически.
+#      ПОДТВЕРЖДЕНО ВТОРЫМ ЖИВЫМ ПРОГОНОМ (2026-09-25): COPY дошёл,
+#      pkg/pip отработали, aioquic и pylsqpack собрались из sdist.
 #      Внутренний скрипт сборки не изменился: TARGET/MARCH по-прежнему
 #      «запечены» в текст подстановкой выражений matrix (это уже
 #      доказанно работало в живом прогоне), pkg-тулчейн и порядок
@@ -212,6 +214,30 @@
 #      комментариев в run:), поэтому литеральные заглушки вида
 #      «двойные фигурные скобки с тремя точками» в тексте скрипта
 #      запрещены — только реальные подстановки matrix.target/march.
+#
+# FIX 15 (Termux build: zxing-cpp dlopen "cannot locate symbol PyTuple_Type",
+#      2026-09-25): второй живой прогон упал на ПОСЛЕДНЕМ шаге сборки
+#      zxing-cpp: nanobind stubgen (генерация zxingcpp.pyi, шаг 125/125)
+#      ИМПОРТИРУЕТ свежесобранный zxingcpp.abi3.so и получает
+#      "ImportError: dlopen failed: cannot locate symbol PyTuple_Type".
+#      ПРИЧИНА (фундаментальное отличие Android linker от glibc): glibc
+#      разрешает неопределённые символы расширения через глобальную
+#      таблицу главного приложения (python), Android linker64 этого НЕ
+#      делает — dlopen требует, чтобы ВСЕ символы были разрешены при
+#      загрузке; расширения, собранные БЕЗ линковки к libpython (обычная
+#      практика на Linux, где она не нужна), на Android не загружаются.
+#      Тот же класс сбоя у numpy/dlib/PyGObject в Termux
+#      (termux-packages#24909, #25023), а канонический воркараунд из
+#      официальных инструкций Termux по сборке numpy —
+#      LDFLAGS="-lpython3.11": пакет python в Termux собран с shared
+#      libpython, $PREFIX/lib/libpython3.X.so существует, и линковка
+#      расширения против него разрешает Py*-символы при dlopen.
+#      FIX: LDFLAGS внутри Termux-скрипта получает -lpython${PYVER}, где
+#      PYVER вычисляется из самого интерпретатора (3.14 в текущем Termux) —
+#      имя libpython меняется с мажором Python автоматически, без хардкода.
+#      aioquic/pylsqpack от этого только выигрывают (их .so тоже получат
+#      все символы разрешёнными). Stable-ABI-модуль, слинкованный с
+#      libpython, на Termux работает (прецедент numpy).
 #
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
@@ -672,11 +698,8 @@ jobs:
   #   ВВОД:  docker build запекает mozvpn_beta.py + requirements.txt в
   #          слой образа через COPY (контекст сборки docker-клиент
   #          загружает демону tar-потоком — путь хоста демону не
-  #          нужен). В живом прогоне 2026-09-24/25 bind-mount
-  #          -v "$GITHUB_WORKSPACE:/src" оказался ПУСТЫМ внутри
-  #          контейнера (cp /src/mozvpn_beta.py → "No such file or
-  #          directory" при работающих pkg/apt/pip), поэтому джоб
-  #          больше вообще не полагается на host bind mounts.
+  #          нужен). Подтверждено вторым живым прогоном 2026-09-25:
+  #          COPY дошёл, pkg/pip/aioquic/pylsqpack отработали.
   #   ВЫВОД: контейнер сборки запускается БЕЗ --rm под фиксированным
   #          именем mozvpn-termux-build; после его завершения бинарник
   #          извлекается из ОСТАНОВЛЕННОГО контейнера командой
@@ -700,10 +723,18 @@ jobs:
   #      и не пересобирает их из sdist; остальное (pyotp — pure Python,
   #      zxing-cpp, aioquic + pylsqpack, pyopenssl, service-identity,
   #      certifi) ставится pip-ом (sdist собирается clang-ом Termux с
-  #      CFLAGS=-I$PREFIX/include LDFLAGS=-L$PREFIX/lib).
+  #      CFLAGS=-I$PREFIX/include LDFLAGS="-L$PREFIX/lib
+  #      -lpython$PYVER" — см. FIX 15).
   #      PIP_BREAK_SYSTEM_PACKAGES=1 обходит PEP 668 маркер.
   #      requirements.txt остаётся ЕДИНСТВЕННЫМ источником runtime-зависимостей.
   #   3. nuitka/ordered-set/zstandard — build-тулинг workflow, не runtime.
+  #
+  # FIX 15 (2026-09-25): zxing-cpp упал на dlopen собранного .so
+  #      ("cannot locate symbol PyTuple_Type") в nanobind stubgen —
+  #      Android linker64, в отличие от glibc, НЕ разрешает символы
+  #      расширения через главную программу. Все расширения линкуются
+  #      с -lpython${PYVER} (PYVER из интерпретатора; прецедент —
+  #      официальные инструкции Termux по сборке numpy).
   #
   # armv9-вариант: MARCH="-march=armv9-a" в CFLAGS/LDFLAGS (clang
   # поддерживает armv9-a; host-раннер — Neoverse N2 = ARMv9-A). armv8 —
@@ -797,9 +828,20 @@ jobs:
               cp /src/mozvpn_beta.py /src/requirements.txt "$HOME/mozvpn"/
               cd "$HOME/mozvpn"
               export PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+              # FIX 15: Android linker64 resolves dlopen symbols STRICTLY —
+              # a Python extension built WITHOUT linking against libpython
+              # fails to import with "cannot locate symbol PyTuple_Type"
+              # (zxing-cpp nanobind stubgen imports the freshly built .so
+              # as build step 125/125; same failure class as numpy/dlib in
+              # Termux). The official Termux numpy instructions use the same
+              # workaround: LDFLAGS="-lpython3.X". PYVER is derived from the
+              # interpreter itself so the libpython name follows the Python
+              # major.minor without hardcoding.
+              PYVER="$(python -c 'import sys; print("{}.{}".format(sys.version_info[0], sys.version_info[1]))')"
+              echo "=== linking extensions against libpython${PYVER} (FIX 15)"
               export CFLAGS="-I${PREFIX}/include ${MARCH}"
               export CXXFLAGS="-I${PREFIX}/include ${MARCH}"
-              export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib ${MARCH}"
+              export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -lpython${PYVER} ${MARCH}"
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               # NOTE (FIX 12): `pip install --upgrade pip` is FORBIDDEN in
