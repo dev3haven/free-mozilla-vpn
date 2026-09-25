@@ -13,14 +13,14 @@
 #   windows-x86_64 — 64-bit Intel/AMD Windows (a.k.a. x64)
 #   windows-x86    — 32-bit Windows (i386/i686)
 #   windows-arm64  — 64-bit ARM Windows (= ARMv8; Windows 11 on Arm)
-#   termux-armv8   — Termux (Android, Bionic libc) на armv8-baseline
-#                    aarch64 — запускается в Termux на ЛЮБОМ aarch64
-#                    Android-устройстве; НЕ запускается на glibc-Linux
-#   termux-armv9   — Termux (Android, Bionic libc), собрано с
-#                    -march=armv9-a для ARMv9-устройств
-#   (glibc-бинарники linux-* в Termux НЕ работают, а termux-бинарники
-#    не работают на glibc-Linux: разные libc + ELF interpreter —
-#    см. NOTE ниже)
+#   termux-armv8   — Termux (Android, Bionic libc), armv8-baseline
+#                    aarch64 — runs in Termux on ANY aarch64 Android
+#                    device; does NOT run on glibc Linux
+#   termux-armv9   — Termux (Android, Bionic libc), built with
+#                    -march=armv9-a for ARMv9 devices
+#   (glibc linux-* binaries do NOT work in Termux, and termux binaries
+#    do not work on glibc Linux: different libc + ELF interpreter —
+#    see the NOTE below)
 #
 # ARMv8 vs ARMv9 (why two separate builds, and why both are "aarch64"):
 #   * ARMv9-A is a superset of ARMv8-A at the A64 base level, so an
@@ -148,96 +148,109 @@
 #      (libc + dynamic linker), NOT an instruction-set problem: the CPU
 #      in an Android phone is the same aarch64.
 #
-#      THE FIX: Termux-нативные сборки (build-termux job ниже) собирают
-#      БИНАРНИК ВНУТРИ САМОГО TERMUX — в контейнере
-#      termux/termux-docker:aarch64 (официальный проект
-#      termux/termux-docker; AArch64-контейнеры могут требовать
-#      привилегированного режима — поэтому docker run --privileged) на
-#      ARMv9-раннере ubuntu-24.04-arm (aarch64 — эмуляция не нужна).
-#      Nuitka официально поддерживает Termux/Android: документация
-#      требует `pkg install patchelf ccache binutils ldd
-#      termux-elf-cleaner`, а релизы Nuitka 2.6.7/2.7 содержат
-#      специальные Termux-фиксы (standalone rpath, module mode).
-#      КРИПТОГРАФИЯ: requirements.txt pin
-#      `cryptography==46.0.3; sys_platform == "win32"` НЕ применяется в
-#      Termux (sys_platform == "linux"), вместо сборки cryptography из
-#      sdist ставится предсобранный Termux-пакет python-cryptography
-#      (50.0.1 в termux-packages (актуально на 2026-09-24, живой прогон),
-#      deps: openssl + python + python-pip) ДО `pip install -r
-#      requirements.txt` — тогда pip видит `cryptography>=42.0.0`
-#      (требование aioquic) уже выполненным и не трогает его вообще.
-#      Pillow аналогично ставится предсобранным Termux-пакетом
-#      python-pillow (12.3.0, живой прогон). Остальное (pyotp —
-#      pure Python, zxing-cpp, aioquic + pylsqpack) собирается pip-ом
-#      из sdist-ов clang-ом Termux: Termux НЕ использует -dev пакеты —
-#      заголовки входят в сами пакеты (openssl, libjpeg-turbo, zlib),
-#      поэтому для сборки из исходников достаточно CFLAGS/LDFLAGS с
-#      -I$PREFIX/include и -L$PREFIX/lib. Плейсхолдер python в Termux
-#      PEP 668: перед pip-ом экспортируется PIP_BREAK_SYSTEM_PACKAGES=1.
-#      armv9-вариант собирается с MARCH="-march=armv9-a" (clang
-#      поддерживает armv9-a; раннер — Neoverse N2 = ARMv9). Оба job-а
-#      continue-on-error: true — Termux-сборка ЭКСПЕРИМЕНТАЛЬНА, сбой не
-#      должен ломать релиз остальных целей. Termux-бинарник
-#      запускается ТОЛЬКО в Termux на Android (Bionic libc), НЕ на
-#      обычном glibc-Linux — и наоборот.
+#      THE FIX: native Termux builds (the build-termux job below) build
+#      THE BINARY INSIDE REAL TERMUX — in the
+#      termux/termux-docker:aarch64 container (the official
+#      termux/termux-docker project; AArch64 containers may require
+#      privileged mode — hence docker run --privileged) on the
+#      ARMv9 runner ubuntu-24.04-arm (aarch64 — no emulation needed).
+#      Nuitka officially supports Termux/Android: the documentation
+#      requires `pkg install patchelf ccache binutils ldd
+#      termux-elf-cleaner`, and the Nuitka 2.6.7/2.7 releases contain
+#      dedicated Termux fixes (standalone rpath, module mode).
+#      CRYPTOGRAPHY: the requirements.txt pin
+#      `cryptography==46.0.3; sys_platform == "win32"` does NOT apply in
+#      Termux (sys_platform == "linux"); instead of building cryptography
+#      from its sdist, the prebuilt Termux package python-cryptography
+#      (50.0.1 in termux-packages as of the live run 2026-09-24;
+#      deps: openssl + python + python-pip) is installed BEFORE
+#      `pip install -r requirements.txt` — pip then sees
+#      `cryptography>=42.0.0` (the aioquic requirement) as already
+#      satisfied and does not touch it at all. Pillow is likewise
+#      installed as the prebuilt Termux package python-pillow
+#      (12.3.0, live run). The rest (pyotp — pure Python, zxing-cpp,
+#      aioquic + pylsqpack) is built by pip from sdists with the Termux
+#      clang: Termux does NOT use -dev packages — headers ship inside
+#      the packages themselves (openssl, libjpeg-turbo, zlib), so
+#      building from source only needs CFLAGS/LDFLAGS with
+#      -I$PREFIX/include and -L$PREFIX/lib. The Termux python package
+#      is PEP 668 externally managed: PIP_BREAK_SYSTEM_PACKAGES=1 is
+#      exported before pip. The armv9 variant is built with
+#      MARCH="-march=armv9-a" (clang supports armv9-a; the runner is
+#      Neoverse N2 = ARMv9). Both jobs are continue-on-error: true —
+#      the Termux build is EXPERIMENTAL and its failure must not break
+#      the release of the other targets. The Termux binary runs ONLY
+#      in Termux on Android (Bionic libc), NOT on regular glibc
+#      Linux — and vice versa.
 #
 # FIX 14 (Termux build: bind-mount-independent file transfer, 2026-09-25):
-#      ЖИВОЙ ПРОГОН упал на `cp /src/mozvpn_beta.py` c "No such file or
-#      directory", хотя -v "$GITHUB_WORKSPACE:/src" был передан в docker
-#      run. Всё ДО cp работало (pkg update, 69 пакетов через apt, pip) —
-#      значит сеть, привилегии и Termux-окружение в порядке, а точка
-#      монтирования /src ВНУТРИ контейнера оказалась ПУСТОЙ: bind-mount
-#      с хоста не дошёл до процесса. Диагностировать причину по логу
-#      невозможно, поэтому фикс УСТРАНЯЕТ САМ КЛАСС проблемы — в джобе
-#      build-termux БОЛЬШЕ НЕТ bind-mount'ов:
-#        * ВВОД: docker build запекает mozvpn_beta.py + requirements.txt
-#          в слой образа через COPY. Контекст сборки docker-КЛИЕНТ
-#          загружает демону tar-потоком (Docker docs: Build context),
-#          поэтому путь на хосте демону вообще не нужен. Если checkout
-#          пуст — docker build падает с понятной ошибкой на COPY сразу,
-#          а не с загадочным cannot stat после 15 минут установки.
-#          COPY-файлы (root:root, 0644) читаются пользователем system.
-#        * ВЫВОД: контейнер сборки запускается БЕЗ --rm под фиксированным
-#          именем; когда он завершается, бинарник извлекается из
-#          ОСТАНОВЛЕННОГО контейнера командой docker cp (Docker docs:
+#      A LIVE RUN failed at `cp /src/mozvpn_beta.py` with "No such file or
+#      directory", even though -v "$GITHUB_WORKSPACE:/src" had been passed
+#      to docker run. Everything BEFORE the cp worked (pkg update, 69
+#      packages via apt, pip) — so the network, privileges and the
+#      Termux environment were fine, but the /src mountpoint INSIDE the
+#      container turned out to be EMPTY: the host bind-mount never
+#      reached the process (the termux-docker entrypoint.sh exec's the
+#      command through /system/bin/su + `env -i` as the user system
+#      (UID 1000) — by itself it does not alter paths, but it does not
+#      protect against an empty mount either). Classic symptom: docker
+#      created the /src mountpoint, but the source is not visible to
+#      the daemon. The cause cannot be diagnosed from the log, so the
+#      fix ELIMINATES THE ENTIRE CLASS of the problem — the
+#      build-termux job NO LONGER uses bind-mounts at all:
+#        * INPUT: `docker build` bakes mozvpn_beta.py + requirements.txt
+#          into an image layer via COPY. The docker CLIENT uploads the
+#          build context to the daemon as a tar stream (Docker docs:
+#          Build context), so the host path is not needed by the daemon
+#          at all. If the checkout is empty, docker build fails
+#          immediately with a clear COPY error instead of a cryptic
+#          cannot stat after 15 minutes of package installation.
+#          The COPY'd files (root:root, 0644) are readable by the
+#          system user.
+#        * OUTPUT: the build container is started WITHOUT --rm under a
+#          fixed name; when it finishes, the binary is extracted from
+#          the STOPPED container with docker cp (Docker docs:
 #          "The CONTAINER can be a running or stopped container").
-#          Никакой путь хоста не монтируется ни на вход, ни на выход.
-#        * Exit-код сборки: docker run в foreground — non-zero exit
-#          контейнера роняет шаг GitHub Actions автоматически.
-#      ПОДТВЕРЖДЕНО ВТОРЫМ ЖИВЫМ ПРОГОНОМ (2026-09-25): COPY дошёл,
-#      pkg/pip отработали, aioquic и pylsqpack собрались из sdist.
-#      Внутренний скрипт сборки не изменился: TARGET/MARCH по-прежнему
-#      «запечены» в текст подстановкой выражений matrix (это уже
-#      доказанно работало в живом прогоне), pkg-тулчейн и порядок
-#      установки зависимостей сохранены. ВАЖНО: парсер workflow
-#      вычисляет КАЖДЫЙ expression-токен в файле (в том числе внутри
-#      комментариев в run:), поэтому литеральные заглушки вида
-#      «двойные фигурные скобки с тремя точками» в тексте скрипта
-#      запрещены — только реальные подстановки matrix.target/march.
+#          No host path is mounted on either input or output.
+#        * Build exit code: docker run in the foreground — a non-zero
+#          container exit fails the GitHub Actions step automatically.
+#      The inner build script is unchanged: TARGET/MARCH are still
+#      baked into the text by the matrix expression substitution (this
+#      was already proven to work in a live run), and the pkg toolchain
+#      and the dependency installation order are preserved. IMPORTANT:
+#      the workflow parser evaluates EVERY expression token in the file
+#      (including inside comments within run:), so literal placeholder
+#      stubs — double curly braces with three dots — are forbidden in
+#      the script text; only the real matrix.target/march
+#      substitutions remain.
 #
 # FIX 15 (Termux build: zxing-cpp dlopen "cannot locate symbol PyTuple_Type",
-#      2026-09-25): второй живой прогон упал на ПОСЛЕДНЕМ шаге сборки
-#      zxing-cpp: nanobind stubgen (генерация zxingcpp.pyi, шаг 125/125)
-#      ИМПОРТИРУЕТ свежесобранный zxingcpp.abi3.so и получает
+#      2026-09-25): the second live run (FIX 14 already working: COPY
+#      arrived, pkg/pip finished, aioquic+pylsqpack built) failed at the
+#      LAST step of the zxing-cpp build: nanobind stubgen (generation of
+#      zxingcpp.pyi, step 125/125) IMPORTS the freshly built
+#      zxingcpp.abi3.so and gets
 #      "ImportError: dlopen failed: cannot locate symbol PyTuple_Type".
-#      ПРИЧИНА (фундаментальное отличие Android linker от glibc): glibc
-#      разрешает неопределённые символы расширения через глобальную
-#      таблицу главного приложения (python), Android linker64 этого НЕ
-#      делает — dlopen требует, чтобы ВСЕ символы были разрешены при
-#      загрузке; расширения, собранные БЕЗ линковки к libpython (обычная
-#      практика на Linux, где она не нужна), на Android не загружаются.
-#      Тот же класс сбоя у numpy/dlib/PyGObject в Termux
-#      (termux-packages#24909, #25023), а канонический воркараунд из
-#      официальных инструкций Termux по сборке numpy —
-#      LDFLAGS="-lpython3.11": пакет python в Termux собран с shared
-#      libpython, $PREFIX/lib/libpython3.X.so существует, и линковка
-#      расширения против него разрешает Py*-символы при dlopen.
-#      FIX: LDFLAGS внутри Termux-скрипта получает -lpython${PYVER}, где
-#      PYVER вычисляется из самого интерпретатора (3.14 в текущем Termux) —
-#      имя libpython меняется с мажором Python автоматически, без хардкода.
-#      aioquic/pylsqpack от этого только выигрывают (их .so тоже получат
-#      все символы разрешёнными). Stable-ABI-модуль, слинкованный с
-#      libpython, на Termux работает (прецедент numpy).
+#      CAUSE (a fundamental difference between the Android linker and
+#      glibc): glibc resolves an extension's undefined symbols through
+#      the global table of the main application (python); the Android
+#      linker64 does NOT do this — dlopen requires ALL symbols to be
+#      resolved at load time; extensions built WITHOUT linking against
+#      libpython (common practice on Linux, where it is not needed) do
+#      not load on Android. The same failure class hit numpy/dlib/
+#      PyGObject in Termux (termux-packages#24909, #25023), and the
+#      canonical workaround from the official Termux numpy build
+#      instructions is LDFLAGS="-lpython3.11": the Termux python package
+#      is built with a shared libpython, $PREFIX/lib/libpython3.X.so
+#      exists, and linking the extension against it resolves the Py*
+#      symbols at dlopen.
+#      FIX: LDFLAGS inside the Termux script gains -lpython${PYVER},
+#      where PYVER is derived from the interpreter itself (3.14 in the
+#      current Termux) — the libpython name follows the Python major
+#      automatically, with no hardcoding. aioquic/pylsqpack only benefit
+#      from this (their .so files also get all symbols resolved). A
+#      stable-ABI module linked against libpython works on Termux
+#      (the numpy precedent).
 #
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
@@ -681,66 +694,66 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
-  # TERMUX (Android, Bionic libc) — armv8 + armv9. Бинарники собираются
-  # ВНУТРИ настоящего Termux: контейнер termux/termux-docker:aarch64
-  # (проект termux/termux-docker) запускается НАПРЯМУЮ на ARMv9-раннере
-  # ubuntu-24.04-arm (host aarch64 == arch контейнера, эмуляция не
-  # нужна; aarch64-контейнеры termux-docker иногда требуют
-  # привилегированного режима — поэтому --privileged).
+  # TERMUX (Android, Bionic libc) — armv8 + armv9. The binaries are
+  # built INSIDE real Termux: the termux/termux-docker:aarch64
+  # container (the termux/termux-docker project) runs DIRECTLY on the
+  # ARMv9 runner ubuntu-24.04-arm (host aarch64 == container arch, no
+  # emulation needed; termux-docker aarch64 containers sometimes
+  # require privileged mode — hence --privileged).
   #
-  # Почему это отдельные бинарники: glibc-бинарники (linux-armv8/armv9)
-  # НЕ запускаются в Termux (ELF interpreter /lib/ld-linux-aarch64.so.1
-  # отсутствует на Android — execve() ENOENT; Bionic ≠ glibc). И
-  # наоборот — termux-бинарник (Bionic, ELF interpreter
-  # /system/bin/linker64) НЕ запустится на glibc-Linux.
+  # Why these are separate binaries: glibc binaries (linux-armv8/armv9)
+  # do NOT run in Termux (the ELF interpreter
+  # /lib/ld-linux-aarch64.so.1 does not exist on Android —
+  # execve() ENOENT; Bionic != glibc). And vice versa — a termux
+  # binary (Bionic, ELF interpreter /system/bin/linker64) will NOT
+  # run on glibc Linux.
   #
-  # ПОРЯДОК ПЕРЕДАЧИ ФАЙЛОВ (FIX 14, 2026-09-25) — БЕЗ bind-mount'ов:
-  #   ВВОД:  docker build запекает mozvpn_beta.py + requirements.txt в
-  #          слой образа через COPY (контекст сборки docker-клиент
-  #          загружает демону tar-потоком — путь хоста демону не
-  #          нужен). Подтверждено вторым живым прогоном 2026-09-25:
-  #          COPY дошёл, pkg/pip/aioquic/pylsqpack отработали.
-  #   ВЫВОД: контейнер сборки запускается БЕЗ --rm под фиксированным
-  #          именем mozvpn-termux-build; после его завершения бинарник
-  #          извлекается из ОСТАНОВЛЕННОГО контейнера командой
-  #          docker cp (Docker docs: работает и с running, и со
-  #          stopped контейнером).
+  # FILE TRANSFER ORDER (FIX 14, 2026-09-25) — WITHOUT bind-mounts:
+  #   INPUT:  docker build bakes mozvpn_beta.py + requirements.txt
+  #          into an image layer via COPY (the docker client uploads
+  #          the build context to the daemon as a tar stream — the
+  #          host path is not needed by the daemon). In the live run
+  #          2026-09-24/25 the bind-mount
+  #          -v "$GITHUB_WORKSPACE:/src" turned out to be EMPTY
+  #          inside the container (cp /src/mozvpn_beta.py → "No such
+  #          file or directory" while pkg/apt/pip were working), so
+  #          the job no longer relies on host bind mounts at all.
+  #   OUTPUT: the build container is started WITHOUT --rm under the
+  #          fixed name mozvpn-termux-build; after it finishes, the
+  #          binary is extracted from the STOPPED container with
+  #          docker cp (Docker docs: works with both running and
+  #          stopped containers).
   #
-  # Порядок установки зависимостей ВАЖЕН:
-  #   1. pkg-ом ставятся предсобранные Termux-пакеты python, python-pip,
-  #      python-cryptography (50.0.1 в termux-packages, живой прогон
-  #      2026-09-24) и python-pillow (12.3.0); плюс тулчейн Nuitka по
-  #      официальной документации:
+  # The dependency installation ORDER matters:
+  #   1. pkg installs the prebuilt Termux packages python, python-pip,
+  #      python-cryptography (50.0.1 in termux-packages, live run
+  #      2026-09-24) and python-pillow (12.3.0); plus the Nuitka
+  #      toolchain per the official documentation:
   #      clang binutils patchelf ccache ldd termux-elf-cleaner file,
-  #      а ТАКЖЕ cmake + ninja (FIX 13): zxing-cpp собирается через
-  #      scikit-build-core, которому нужен системный cmake >= 3.18 —
-  #      без него pip пытается собрать PyPI-sdist cmake и падает.
-  #      Termux НЕ использует -dev пакеты: заголовки входят в сами
-  #      пакеты (openssl установлен всегда, libjpeg-turbo/zlib ставятся
-  #      вместе с python-pillow).
-  #   2. `pip install -r requirements.txt` затем видит требования
-  #      aioquic `cryptography>=42.0.0` и `Pillow` уже УДОВЛЕТВОРЁННЫМИ
-  #      и не пересобирает их из sdist; остальное (pyotp — pure Python,
-  #      zxing-cpp, aioquic + pylsqpack, pyopenssl, service-identity,
-  #      certifi) ставится pip-ом (sdist собирается clang-ом Termux с
-  #      CFLAGS=-I$PREFIX/include LDFLAGS="-L$PREFIX/lib
-  #      -lpython$PYVER" — см. FIX 15).
-  #      PIP_BREAK_SYSTEM_PACKAGES=1 обходит PEP 668 маркер.
-  #      requirements.txt остаётся ЕДИНСТВЕННЫМ источником runtime-зависимостей.
-  #   3. nuitka/ordered-set/zstandard — build-тулинг workflow, не runtime.
+  #      and ALSO cmake + ninja (FIX 13): zxing-cpp builds via
+  #      scikit-build-core, which needs a system cmake >= 3.18 —
+  #      without it pip tries to build the PyPI cmake sdist and fails.
+  #      Termux does NOT use -dev packages: headers ship inside the
+  #      packages themselves (openssl is always installed,
+  #      libjpeg-turbo/zlib come with python-pillow).
+  #   2. `pip install -r requirements.txt` then sees the aioquic
+  #      requirements `cryptography>=42.0.0` and `Pillow` as already
+  #      SATISFIED and does not rebuild them from sdist; the rest
+  #      (pyotp — pure Python, zxing-cpp, aioquic + pylsqpack,
+  #      pyopenssl, service-identity, certifi) is installed by pip
+  #      (the sdist is built with the Termux clang using
+  #      CFLAGS=-I$PREFIX/include LDFLAGS=-L$PREFIX/lib).
+  #      PIP_BREAK_SYSTEM_PACKAGES=1 bypasses the PEP 668 marker.
+  #      requirements.txt remains the SINGLE source of runtime
+  #      dependencies.
+  #   3. nuitka/ordered-set/zstandard are workflow BUILD tooling,
+  #      not runtime dependencies.
   #
-  # FIX 15 (2026-09-25): zxing-cpp упал на dlopen собранного .so
-  #      ("cannot locate symbol PyTuple_Type") в nanobind stubgen —
-  #      Android linker64, в отличие от glibc, НЕ разрешает символы
-  #      расширения через главную программу. Все расширения линкуются
-  #      с -lpython${PYVER} (PYVER из интерпретатора; прецедент —
-  #      официальные инструкции Termux по сборке numpy).
-  #
-  # armv9-вариант: MARCH="-march=armv9-a" в CFLAGS/LDFLAGS (clang
-  # поддерживает armv9-a; host-раннер — Neoverse N2 = ARMv9-A). armv8 —
-  # baseline по умолчанию (запускается на ВСЕХ aarch64 Android).
-  # Сборка ЭКСПЕРИМЕНТАЛЬНАЯ: continue-on-error: true — сбой Termux job
-  # не должен блокировать релиз остальных целей.
+  # armv9 variant: MARCH="-march=armv9-a" in CFLAGS/LDFLAGS (clang
+  # supports armv9-a; the host runner is Neoverse N2 = ARMv9-A).
+  # armv8 — the default baseline (runs on ALL aarch64 Android).
+  # The build is EXPERIMENTAL: continue-on-error: true — a Termux job
+  # failure must not block the release of the other targets.
   # --------------------------------------------------------------------------
   build-termux:
     name: Build termux-${{ matrix.target }} (Bionic, Android)
@@ -764,21 +777,23 @@ jobs:
           set -euo pipefail
           mkdir -p termux-out
           # -----------------------------------------------------------------
-          # FIX 14 (2026-09-25): НЕ полагаемся на bind-mount'ы вообще.
+          # FIX 14 (2026-09-25): do NOT rely on bind-mounts at all.
           #
-          # 1) ВВОД через слой образа: исходники запекаются в образ
-          #    docker build-ом с COPY. Контекст сборки (каталог
-          #    $GITHUB_WORKSPACE) docker-КЛИЕНТ отправляет демону
-          #    tar-потоком — путь хоста НЕ обязан быть виден демону
-          #    (в отличие от -v bind mount). Пустой checkout теперь
-          #    валит шаг СРАЗУ с понятной ошибкой COPY, а не после
-          #    15 минут установки пакетов.
-          # 2) ВЫВОД через docker cp: контейнер сборки запускается в
-          #    foreground БЕЗ --rm под именем mozvpn-termux-build; когда
-          #    он завершается (exit-код = exit-код шага), бинарник
-          #    извлекается из ОСТАНОВЛЕННОГО контейнера (docker cp
-          #    официально поддерживает stopped containers), после чего
-          #    контейнер удаляется.
+          # 1) INPUT via an image layer: the sources are baked into
+          #    the image by docker build with COPY. The build context
+          #    (the $GITHUB_WORKSPACE directory) is sent by the docker
+          #    CLIENT to the daemon as a tar stream — the host path
+          #    does NOT have to be visible to the daemon (unlike a
+          #    -v bind mount). An empty checkout now fails the step
+          #    IMMEDIATELY with a clear COPY error, not after
+          #    15 minutes of package installation.
+          # 2) OUTPUT via docker cp: the build container runs in the
+          #    foreground WITHOUT --rm under the name
+          #    mozvpn-termux-build; when it finishes (exit code =
+          #    step exit code), the binary is extracted from the
+          #    STOPPED container (docker cp officially supports
+          #    stopped containers), after which the container is
+          #    removed.
           # -----------------------------------------------------------------
           cat > termux-builder.Dockerfile <<'DOCKERFILE'
           FROM termux/termux-docker:aarch64
@@ -837,7 +852,21 @@ jobs:
               # workaround: LDFLAGS="-lpython3.X". PYVER is derived from the
               # interpreter itself so the libpython name follows the Python
               # major.minor without hardcoding.
-              PYVER="$(python -c 'import sys; print("{}.{}".format(sys.version_info[0], sys.version_info[1]))')"
+              # FIX 16 (bash quoting, 2026-09-25): this whole inner
+              # script is the single-quoted argument passed to
+              # bash -euo pipefail -c — the FIRST single-quote
+              # character anywhere in the body (the old PYVER line
+              # used a single-quoted python -c argument) TERMINATES
+              # the outer string early, and the runner shell dies
+              # with a syntax error near an unexpected token (live
+              # run 2026-09-25, exit 2 BEFORE docker build started).
+              # RULE: NO single-quote characters anywhere in this
+              # script body, not even inside comments. The dot below
+              # is chr(46) so the python -c code needs NO inner
+              # quotes at all; the nested double quotes are legal
+              # because inside double-quoted command substitution
+              # the quoting restarts fresh.
+              PYVER="$(python -c "import sys; print(str(sys.version_info[0]) + chr(46) + str(sys.version_info[1]))")"
               echo "=== linking extensions against libpython${PYVER} (FIX 15)"
               export CFLAGS="-I${PREFIX}/include ${MARCH}"
               export CXXFLAGS="-I${PREFIX}/include ${MARCH}"
