@@ -252,6 +252,29 @@
 #      stable-ABI module linked against libpython works on Termux
 #      (the numpy precedent).
 #
+# FIX 17 (Termux build: zxing-cpp dlopen "cannot locate symbol
+#      _ZNSt6__ndk113__hash_memoryEPKvm", 2026-09-25): the third live
+#      run confirmed FIX 15/16 (the log shows "linking extensions
+#      against libpython3.14" and the PyTuple_Type error is gone) but
+#      zxing-cpp stubgen now fails at dlopen on a C++ symbol:
+#      _ZNSt6__ndk113__hash_memoryEPKvm = std::__ndk1::__hash_memory
+#      from the Termux libc++ (Android libc++ inline namespace).
+#      zxing-cpp is the ONLY C++ extension in the set (aioquic and
+#      pylsqpack are pure C — both built and imported fine in the same
+#      run), and Python extension modules are linked with the C driver
+#      (CC = clang), which does NOT add the C++ standard library.
+#      glibc would silently resolve the leftover undefined symbols
+#      through the global table of the main application at dlopen;
+#      the Android linker requires EVERY symbol to be resolvable at
+#      load time (Termux wiki: Common porting problems — shared library
+#      symbol visibility on dlopen). FIX: LDFLAGS also gains
+#      -lc++_shared — Termux ships libc++_shared.so in $PREFIX/lib
+#      (package libc++; the libc++.so linker script INPUTs -lc++_shared
+#      as the fake libstdc++, termux-packages PR #3444), and the
+#      existing -Wl,-rpath,$PREFIX/lib lets dlopen find it. The libc++
+#      package is additionally pkg-installed explicitly so its
+#      presence does not depend on the transitive dependency graph.
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn_beta-* file to the GitHub Release as a
@@ -822,6 +845,7 @@ jobs:
               pkg install -y \
                 python python-pip \
                 python-cryptography python-pillow \
+                libc++ \
                 clang binutils patchelf ccache ldd termux-elf-cleaner \
                 cmake ninja \
                 pkg-config libjpeg-turbo zlib file make
@@ -852,6 +876,26 @@ jobs:
               # workaround: LDFLAGS="-lpython3.X". PYVER is derived from the
               # interpreter itself so the libpython name follows the Python
               # major.minor without hardcoding.
+              # FIX 17 (libc++_shared, 2026-09-25): the third live run got
+              # PAST the PyTuple_Type error (FIX 15 works — the log shows
+              # linking against libpython3.14) but zxing-cpp stubgen now
+              # fails at dlopen on a C++ symbol:
+              # _ZNSt6__ndk113__hash_memoryEPKvm, which is
+              # std::__ndk1::__hash_memory from the Termux libc++
+              # (Android libc++ inline namespace). zxing-cpp is the only
+              # C++ extension here (aioquic/pylsqpack are pure C and built
+              # fine), and Python extensions are linked with the C
+              # driver (CC = clang), which does NOT add the C++ standard
+              # library — while glibc would resolve the leftover
+              # undefined symbols through the main application at
+              # dlopen, the Android linker requires EVERY symbol to be
+              # resolvable, so the module must explicitly link against
+              # libc++_shared. Termux ships libc++_shared.so in
+              # $PREFIX/lib (package libc++; the libc++.so linker script
+              # INPUTs -lc++_shared as the fake libstdc++), and the
+              # rpath above lets dlopen find it at load time.
+              # NOTE: no single-quote characters in this comment or
+              # code (FIX 16 rule).
               # FIX 16 (bash quoting, 2026-09-25): this whole inner
               # script is the single-quoted argument passed to
               # bash -euo pipefail -c — the FIRST single-quote
@@ -870,7 +914,7 @@ jobs:
               echo "=== linking extensions against libpython${PYVER} (FIX 15)"
               export CFLAGS="-I${PREFIX}/include ${MARCH}"
               export CXXFLAGS="-I${PREFIX}/include ${MARCH}"
-              export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -lpython${PYVER} ${MARCH}"
+              export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -lpython${PYVER} -lc++_shared ${MARCH}"
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               # NOTE (FIX 12): `pip install --upgrade pip` is FORBIDDEN in
