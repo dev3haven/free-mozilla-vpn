@@ -1,12 +1,312 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mozvpn.py — Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
+mozvpn.py â Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
-VERSION 2026-09-23 (v4.7.1) — startup duplicate-line fix + full re-audit:
+VERSION 2026-09-23 (v4.7.1) â startup duplicate-line fix + full re-audit:
+VERSION 2026-09-25 (v5.8) - probe log: ONE compact message + the probe
+  errors VERIFIED as not caused by the earlier edits:
 
-VERSION 2026-09-23 (v4.7.3) — fix: --no-save crashed at startup:
+  VERIF) The live v5.7 run showed 33/33 'data check not passed'
+     (SSLError(1, '[SSL: UNEXPECTED_MESSAGE] ...') on 32 upstreams, one
+     timeout). A full diff of the probe path against the pre-v5.6
+     sources shows the ONLY changes were: the DoH resolve-once memo in
+     _tls_connect(), the probe timeouts 10s->5s / 12s->6s, and skipping
+     the in-probe echo fallback when the failure was already at the
+     TLS/CONNECT stage - none of these can produce an SSL error; the
+     handshake code path (ctx.wrap_socket to the egress) is unchanged.
+     The builtin engine itself reaches the upstream via the SAME
+     _tls_connect() (timeout=20), so the probe reflects the real
+     serving conditions. Fastly's official blog confirms the rollout
+     proxy runs HTTP CONNECT over HTTP/2 (TLS); a failing TLS handshake
+     to *.m1.fastly-masque.net:2499 is a network/egress-side outcome
+     (the same 33/33 failure signature was already documented in the
+     v5.4 changelog from a live run BEFORE any of those edits).
+  LOG 1) probe_upstreams_parallel no longer prints one line per
+     upstream (33+ lines with raw exception reprs in the live run) plus
+     two host-list summaries: the whole probe now produces exactly ONE
+     message - an ok line when all upstreams pass, otherwise ONE info
+     line: 'Probe: {n}/{total} upstreams passed the data check; {n_fail}
+     did not - they are served anyway (32x TLS to the upstream failed
+     (network or egress side), 1x timed out)'. The raw per-probe details
+     stay in the result dicts / the JSON output.
+  LOG 2) new _probe_reason_public(): raw exception reprs (SSLError(...),
+     timeouts, refusals, resets) are mapped to short localized reason
+     classes so the summary stays informative without scary stack noise.
+  NOTE 3) probe speed: in a fully-failing run the duration is bounded by
+     the network itself (the TLS profile matrix x the per-attempt
+     timeout), not by DNS - the v5.6 DoH memoization already removed the
+     repeated DoH round-trips, which is why a failing run feels barely
+     faster (the handshakes, not the lookups, take the seconds).
+
+VERSION 2026-09-25 (v5.7) - FoxyProxy import FIXED for real (verified
+  against the official FoxyProxy Standard v9.8 sources,
+  github.com/foxyproxy/browser-extension):
+
+  DIAG) Why the v5.6 legacy import produced an EMPTY list: the legacy
+     file used a 'proxySettings' ARRAY, but migrate.js convert7()
+     extracts proxies ONLY from TOP-LEVEL object keys
+     (Object.values(pref).filter(i => i && ['address','type']
+     .some(p => Object.hasOwn(i, p)))) - a 'proxySettings' array is
+     silently dropped. Reproduced by simulating convert7 over the v5.6
+     output: 0 proxies found.
+  FIX 1) The LEGACY export (--foxyproxy-legacy-export / hotkey 'x') is
+     now the REAL FoxyProxy 6/7 shape: every proxy as its own TOP-LEVEL
+     'k<id>' key (id == key, sha256-derived) + {mode, sync, logging};
+     convert7() now finds every proxy - 33/33 in the simulation.
+  FIX 2) The CURRENT export (--foxyproxy-export / hotkey 'f') is now a
+     COMBINED file: the full current pref shape ({mode, sync, autoBackup,
+     passthrough (the standard localhost/private-IP CIDR list), theme,
+     container, commands, data: [...]}) PLUS the same proxies as
+     top-level 'k<id>' entries - so it imports via ANY FoxyProxy import
+     path ('Import' button reads 'data', 'Import from older versions'
+     reads the 'k<id>' entries); a wrong picker can no longer produce an
+     empty list. cc values are schema-valid ('REC' -> '' (no flag),
+     'UK' -> 'GB').
+  NOTE 3) After ANY import FoxyProxy shows the settings in the UI, but
+     they are persisted only after clicking 'Save' - the import hint
+     and the hotkey help now say the exact buttons to press.
+VERSION 2026-09-25 (v5.6) — probe speedup (DoH) + FoxyProxy import fixes:
+
+  SPEED 1) The 'probes take 10+ seconds' ROOT CAUSE was in the DoH
+     layer, not in the echo parsing: with the DoH cache OFF (the
+     default), EVERY TLS profile attempt of the probe re-resolved the
+     egress hostname over DoH - 4 profile attempts + 4 more in the
+     in-probe echo fallback = up to 8 DoH queries PER UPSTREAM, and
+     when the first DoH provider in the chain is slow or blocked
+     (typical on filtering networks), EACH query first paid the full
+     DOH_TIMEOUT before the chain moved on. Fixes:
+       a) an ALWAYS-ON short answer memo (DOH_MEMO_TTL = 60 s): the
+          same hostname is never re-resolved within one probe run -
+          the opt-in --doh-cache (300 s) semantics are unchanged;
+       b) a provider penalty (DOH_PROVIDER_PENALTY = 60 s): a DoH
+          endpoint that just timed out is SKIPPED for the next 60 s,
+          so one dead provider no longer adds its timeout to every
+          subsequent lookup;
+       c) DOH_TIMEOUT 10 s -> 4 s;
+       d) _tls_connect() resolves the host ONCE before the profile
+          loop and reuses the IP list for every profile attempt.
+  SPEED 2) The in-probe echo fallback (checkip.amazonaws.com) is now
+     skipped when the failure was at the TLS/CONNECT stage - on a
+     filtering network the second tunnel fails identically and only
+     doubled the probe time. The fallback still runs when a tunnel
+     worked but the echo BODY could not be parsed (its original
+     v5.4 purpose). Probe timeouts shortened: TLS 10 -> 5 s,
+     CONNECT wait 12 -> 6 s, inner HTTP 8 -> 6 s, probe_geo 15/20 ->
+     8/10 s.
+  FIX 3) FoxyProxy Standard import (both formats failed in the live
+     run 2026-09-25). Verified against the official extension source
+     (github.com/foxyproxy/browser-extension, v9.8 = the current AMO
+     release of FoxyProxy Standard):
+       a) 'Import from older versions' does NOT accept XML at all:
+          src/content/fs.js accepts only the text/plain and
+          application/json MIME types and JSON.parses the file; the
+          importer then runs Migrate.convert7() on the FoxyProxy 6/7
+          settings JSON ({proxySettings: [{address, port, type: 1,
+          whitePatterns, blackPatterns, ...}]}). The old FoxyProxy
+          4.x foxyproxy.xml cannot be imported by 9.x in any way
+          (the official help says it must first pass through
+          FoxyProxy 7.5.1). The legacy export (hotkey x /
+          --foxyproxy-legacy-export) is therefore REPLACED: it now
+          writes the FoxyProxy 6/7 settings JSON that 'Import from
+          older versions' actually parses.
+       b) The CURRENT-format file is imported with the 'Import' button
+          at the TOP of the Options page (next to Export) - there is
+          no 'Options -> Import Settings' submenu in 9.x; the import
+          hints now state the exact click path for both formats.
+
+VERSION 2026-09-25 (v5.5) — FoxyProxy Standard export + faster probes:
+
+  REQ 1) Confirmed (no change needed): a FAILED probe never removes an
+     upstream - the fail line says "the upstream is served anyway",
+     --probe-fail keep is the default (drop is opt-in), and a failed
+     MASQUE probe automatically falls back to HTTP CONNECT, so every
+     upstream is served with SOME protocol.
+  FIX 2) Faster probes (the "about 10 seconds" complaint): the v5.4
+     chunked parser already removed the main delay (the echo answer is
+     now parsed on the first try, no fallback tunnel); on top of that
+     the probe timeouts are TLS 15 s -> 10 s, CONNECT 20 s -> 12 s,
+     inner HTTP request 10 s -> 8 s. The "json" in the endpoint URL is
+     NOT the cause - the delay was the broken body parsing, now fixed.
+  NEW 3) FoxyProxy Standard settings export, CURRENT format (v8+/v9.x,
+     verified against src/content/schema.json of the extension sources,
+     v9.8 2026-09): --foxyproxy-export writes one JSON settings file
+     with ALL running local proxies (country code -> flag icon, city,
+     title, 127.0.0.1 address, port, type http, color palette, standard
+     localhost/private-IP exclude patterns); --foxyproxy-out FILE saves
+     straight to the path with NO dialog; without it an OS save dialog
+     (tkinter, with a console prompt fallback) asks where to save.
+     Live hotkey: f. Import in FoxyProxy Standard: Options -> Import
+     Settings.
+  NEW 4) The same export in the LEGACY FoxyProxy format (foxyproxy.xml
+     of FoxyProxy 4.x, structure per verified real-world exports):
+     --foxyproxy-legacy-export + --foxyproxy-legacy-out FILE; live
+     hotkey: x. isSocks="false" manualconf + a white wildcard match per
+     proxy. Import via Options -> Import Settings -> Import from older
+     versions.
+
+VERSION 2026-09-25 (v5.4) — probe algorithm fix per the live-run log:
+
+  DIAG) Live log 2026-09-25: ALL 33 upstreams failed the data check
+     ("Probe: ... - data check not passed") while the tunnels themselves
+     were fine (the user confirms the script works). The v5.2/v5.3
+     probe parsed the echo response with a NAIVE 'split once on
+     \r\n\r\n and take the rest' - it cannot handle 'Transfer-Encoding:
+     chunked' (RFC 9112 section 7.1, standard HTTP/1.1 framing), and
+     ipinfo.io answers /json with a chunked body, so the JSON decoder
+     got a body polluted with hex chunk-size lines and no probe could
+     extract the IP. The misleading 'Geo check skipped: the echo
+     service returns only the IP' line fired for the same reason.
+  FIX 1) _http_ip_request_over_tunnel(): a REAL HTTP/1.1 response
+     parser (_http_dechunked_body) - status line, lowercase header
+     dict, Content-Length slicing, chunked DECHUNKING, read-to-EOF
+     fallback; 'Accept-Encoding: identity' prevents gzip; the request
+     timeout is 15 s -> 10 s so a dead upstream fails faster (the
+     'very long probes' complaint).
+  FIX 2) probe_connect(): ONE in-probe fallback - if the primary echo
+     body cannot be parsed (CDN change, unexpected encoding, truncated
+     chunked body), ONE retry goes to https://checkip.amazonaws.com
+     (plain-text 'x.x.x.x\n' endpoint, no JSON, no chunking) through a
+     FRESH tunnel, so one flaky echo service can no longer fail all
+     probes. Geo still comes only from the primary JSON echo. The
+     data-flow requirement is KEPT: a bare 200 proves nothing, the IP
+     must arrive through the tunnel (unchanged).
+  NEW 3) Failed probe lines now print the REASON
+     ('data check not passed (no IP in echo response: ...)') instead
+     of failing silently - both EN and RU templates, so future
+     diagnosis does not need a code re-read.
+  NEW 4) probe_masque(): the keep-alive wait is 8 s -> 5 s (same probe
+     speedup; the MASQUE data requirement itself is NOT weakened).
+  FIX 5) The 'Geo check skipped' note now fires only when probes DID
+     pass but the echo carries no geo (a plain-IP echo service); on
+     total probe failure the failure lines speak for themselves.
+
+VERSION 2026-09-25 (v5.3) — verified against the ORIGINAL file + Python 3.14:
+
+  FIX 1) The hotkey hint emoji now match the ORIGINAL mozvpn_beta.py
+     EXACTLY (♻️ r, 🧹 c, 🔄 e, 🔀 l, 📂 o, 📋 v/b, 🔢 t, 🎫 j, 🖼️ g,
+     👤 u, 🔑 p, 📦 d, ⤴️ s, 🎨 m, 🌈 n, 📄 1-9, ⏹️ q - v5.2 had restored
+     them with slightly different glyphs) + the new v5.1 keys keep their
+     own: 🌐 h, 💾 k. Both languages.
+  VERIFIED 2) A FULL audit against the user-provided ORIGINAL file
+     (mozvpn_beta.py): message-template keys, _EMOJI map keys, argparse
+     options, watch-loop hotkey handlers and the function list were
+     diffed one by one - NOTHING from the original was removed; the
+     script only ADDS (DoH module, selection tokens, geo/probe changes,
+     the _hp alignment helper).
+  VERIFIED 3) Python 3.14 (the current stable release, 3.14.x) is fully
+     supported: sys.stdout.reconfigure exists (3.7+), argparse
+     BooleanOptionalAction (3.9+), and the 3.14 deprecations index has
+     nothing that this script uses. The UTF-8 reconfigure stays REQUIRED
+     on 3.14 - UTF-8 mode becomes the interpreter default only in
+     Python 3.15 (PEP 686).
+
+VERSION 2026-09-25 (v5.2) — aligned log, emoji restored + UTF-8, 1-request probe:
+
+  FIX 1) The log is now COLUMN-ALIGNED: every per-upstream line (probe,
+     geo check, protocol choice) prints host:port padded to a fixed
+     width, the copy lists (v/b) pad the address column and the DoH
+     menu (h) pads the provider names - the message text starts in the
+     same column on every line.
+  FIX 2) The emoji in the hotkey hint are RESTORED (removing them in
+     v5.1 was wrong - they are part of the functionality). The ROOT
+     CAUSE of the "garbage symbols" is fixed instead: stdout/stderr are
+     reconfigured to UTF-8 at startup (sys.stdout.reconfigure,
+     Python 3.7+; Windows legacy consoles may also need chcp 65001).
+     MORE emoji added: every message template that had none got its
+     emoji, and two new meaning-based highlight classes were added to
+     BOTH themes (dark + light): country codes (cc) and email
+     addresses (email).
+  FIX 3) Probes are FAST again: ONE request per upstream (like the
+     original), all in parallel (32 workers). The default echo
+     service is now ipinfo.io/json - its single answer carries the
+     external IP AND the exit country/city, so the separate
+     exit-country request of v5.0/v5.1 is GONE (no second tunnel, no
+     second thread pool) and the geo check uses the SAME probe
+     answer. probe_geo() is kept as working functionality.
+  FIX 4) Every hotkey press logs WHAT HAPPENED: the selection sub-modes
+     (v/b/h/1-9) confirm with an explicit info line (copied address /
+     applied resolver / opened file / cancelled selection).
+  FIX 5) DoH is reported ONCE AT STARTUP: the selected provider, the
+     full fallback chain (selected -> other presets -> system resolver)
+     and the cache state. During the run the individual DNS lookups
+     are SILENT - no more per-host "resolved via DoH" lines.
+  FIX 6) No functionality was removed: the function list was diffed
+     against the original mozvpn_beta.py - only additions exist
+     (DoH module, selection tokens, _hp alignment helper).
+
+VERSION 2026-09-25 (v5.1) — hotkey UX fixes, opt-in DoH cache, faster startup:
+
+  FIX 1) The hotkey hint lines no longer show "garbage symbols" - all
+     emoji decorations are removed from the hotkeys_hint block (both
+     languages); the key letters alone mark the hotkeys.
+  NEW 2) Hotkey 'h' no longer CYCLES the DNS resolver - it opens a
+     SELECTION MENU (like the v/b copy lists): every DoH preset
+     (Cloudflare, Google, NextDNS, Quad9) + the system DNS entry; the
+     choice is typed as a token and confirmed with Enter.
+  NEW 3) Selection tokens for ALL interactive lists (v/b proxy copy, the
+     DoH menu, the config-file list): 1-9, then the English letters a-z,
+     then two-letter combinations aa, ab, ... - confirmed with Enter,
+     Backspace deletes. Lists with more than 9 items stay usable (typing
+     "10" or "ab" no longer fires the first key instantly). The
+     config-file list is no longer capped at 9 entries.
+  NEW 4) The DoH answer cache is DISABLED BY DEFAULT (strictly opt-in):
+     --doh-cache / hotkey 'k' / env MOZVPN_DOH_CACHE=1 enable it,
+     --no-doh-cache disables. Without the cache every lookup queries the
+     DoH chain directly.
+  NEW 5) Every configured resolver is DoH ONLY (Cloudflare / Google /
+     NextDNS / Quad9 presets + the custom --doh-url endpoint); the SYSTEM
+     resolver is used ONLY when DoH is off ('off') or as the LAST resort
+     of the fallback chain.
+  NEW 6) Default resolver chain: the SELECTED provider first (Cloudflare
+     by default), then the remaining DoH presets, the system resolver
+     LAST (chain: selected -> other presets -> system).
+  NEW 7) Faster startup: the exit-country check (probe_geo) runs in
+     parallel WITH the data probe (a second thread pool; results are
+     collected after both), the probe pool grew 16 -> 32 workers, and
+     with the DoH cache enabled all unique egress hostnames are
+     pre-resolved in parallel BEFORE the probe starts.
+  NEW 8) While a selection sub-mode is active the watch loop polls keys
+     every 0.05 s (instead of 1 s) so multi-character tokens + Enter
+     feel instant.
+
+VERSION 2026-09-25 (v5.0) â all upstream proxies + DoH resolving + geo check:
+
+  ROOT CAUSE of the "few proxies / always US exit" problem (verified against
+  the LIVE vpn-serverlist Remote Settings collection on 2026-09-25, 35
+  records: 33 countries + US CatchAll Anycast + REC, one city and one server
+  {hostname, port 2499} per record, no 'protocols' field at all):
+
+    1) The live collection marks almost every country record 'locked: true'
+       (Peru, Brazil, Korea, UK, France, Singapore, ... - only US/DE/JP/AR/
+       AU/ZA are unlocked). Firefox serves ALL of them, but this script
+       skipped locked records by default -> only ~5 upstreams remained.
+       v5.0: locked records are INCLUDED by default (--exclude-locked
+       restores the old behavior).
+    2) --probe-count defaulted to 1, so only the first upstream was even
+       verified. v5.0: the default is 0 = probe ALL.
+    3) collect_verified_servers collapsed each city to ONE server and the
+       REC (recommended anycast p.m1.fastly-masque.net) record was never
+       served as a local proxy. v5.0: every server of every city AND the
+       REC egress get their own local proxy.
+    4) Fastly terminates the client TLS on the PoP whose IP you CONNECT to,
+       and the egress leaves from that same PoP (Fastly blog, June 2026:
+       today the proxy speaks HTTP CONNECT over TLS; MASQUE/HTTP-3 comes
+       later). A poisoned/geo-wrong system A record for *.m1.fastly-masque.net
+       therefore routes you to a US PoP -> US exit IPv4 even though the
+       untouched AAAA (IPv6) record still shows the right country (this is
+       exactly the "IPv6 shows the chosen country, IPv4 shows the US"
+       symptom). Firefox avoids this with TRR (DNS-over-HTTPS); the script
+       used the system resolver. v5.0: the egress hostnames are resolved
+       over DoH (presets: cloudflare, google, nextdns, quad9; --doh, custom
+       --doh-url, 'off' = system DNS; hotkey 'h' opens the resolver
+       selection menu), the TLS connection goes to the resolved IP while SNI
+       stays the hostname, and every probed upstream gets an exit-country
+       check via ipinfo.io/json (--probe-geo warn|drop|off) that warns
+       about / drops wrong-country egresses.
+
+VERSION 2026-09-23 (v4.7.3) â fix: --no-save crashed at startup:
 
   FIX 1) ValueError: invalid option name '--no-save' for BooleanOptionalAction.
      Python's argparse REJECTS BooleanOptionalAction for options whose name
@@ -20,7 +320,7 @@ VERSION 2026-09-23 (v4.7.3) — fix: --no-save crashed at startup:
      Behavior is unchanged: by default nothing is saved and local proxies
      are served; '--save' re-enables the JSON file.
 
-VERSION 2026-09-23 (v4.7.2) — DEFAULT-ON --local-proxy and --no-save:
+VERSION 2026-09-23 (v4.7.2) â DEFAULT-ON --local-proxy and --no-save:
 
   NEW 1) Both flags are now ON BY DEFAULT: starting the script without any
      arguments serves local proxies AND does not write the result JSON.
@@ -42,7 +342,7 @@ VERSION 2026-09-23 (v4.7.2) — DEFAULT-ON --local-proxy and --no-save:
      back on and releases it (OSC 111) when colors go off; the exit note
      is printed only when a background was actually forced.
 
-VERSION 2026-09-23 (v4.7) — forced console background, layout-independent
+VERSION 2026-09-23 (v4.7) â forced console background, layout-independent
 hotkeys, pip conflict-proof install:
 
   NEW 1) Themes now FORCE the console WINDOW background itself, not just
@@ -57,10 +357,10 @@ hotkeys, pip conflict-proof install:
   FIX 2) Hotkeys now work in ANY keyboard layout. On Windows the chain
      char -> VkKeyScanW -> virtual key -> MapVirtualKeyW(MAPVK_VK_TO_VSC)
      -> scan code recovers the PHYSICAL key cap, so e.g. the key labeled
-     'й' on a Russian ЙЦУКЕН layout still triggers hotkey 'q' (scan
+     'Ð¹' on a Russian ÐÐ¦Ð£ÐÐÐ layout still triggers hotkey 'q' (scan
      codes are layout-independent; verified against the Win32 docs).
      On POSIX terminals (no scan-code channel in the input stream) a
-     Cyrillic->English translation table for the ЙЦУКЕН family is used.
+     Cyrillic->English translation table for the ÐÐ¦Ð£ÐÐÐ family is used.
   FIX 3) Dependency reinstall no longer dies on pip ResolutionImpossible
      conflicts: a STAGED install is used - all packages in one command
      first (pip resolves them together), then each package separately
@@ -69,7 +369,7 @@ hotkeys, pip conflict-proof install:
      then pip install <pkg> --no-deps as a last resort, with a clear
      per-package OK/FAILED report at the end.
 
-VERSION 2026-09-23 (v4.6) — correct dark/light themes + sing-box dependency info:
+VERSION 2026-09-23 (v4.6) â correct dark/light themes + sing-box dependency info:
 
   FIX 1) The themes were misunderstood before. Now: the DARK theme is for a
      BLACK console background (bg 16 = true black) and the LIGHT theme is
@@ -84,7 +384,7 @@ VERSION 2026-09-23 (v4.6) — correct dark/light themes + sing-box dependency in
      (only the 'singbox' engine needs it; the builtin engine works fully
      without it).
 
-VERSION 2026-09-23 (v4.5) — full log redraw, JWT hotkey, hint styling:
+VERSION 2026-09-23 (v4.5) â full log redraw, JWT hotkey, hint styling:
 
   NEW 1) Hotkeys 'm' (theme) and 'n' (color) now FULLY REDRAW the whole
      log: every line printed so far is kept in an in-memory history and
@@ -104,7 +404,7 @@ VERSION 2026-09-23 (v4.5) — full log redraw, JWT hotkey, hint styling:
      with --flags and IPs inside the description still highlighted
      separately.
 
-VERSION 2026-09-23 (v4.4) — retry countdown, theme & color hotkeys:
+VERSION 2026-09-23 (v4.4) â retry countdown, theme & color hotkeys:
 
   NEW 1) After a failed sign-in (e.g. the Fastly WAF challenge not yielding
      a cookie - usually succeeds on the SECOND attempt) the script now says
@@ -117,7 +417,7 @@ VERSION 2026-09-23 (v4.4) — retry countdown, theme & color hotkeys:
   NEW 3) Hotkey 'n': toggle the colored log output on/off (mirrors
      --no-color).
 
-VERSION 2026-09-23 (v4.3) — dependencies management, new hotkeys:
+VERSION 2026-09-23 (v4.3) â dependencies management, new hotkeys:
 
   NEW 0) At startup the script prints ALL its Python dependencies (pyotp,
      zxing-cpp, Pillow, aioquic) with pip name, module, version and
@@ -153,7 +453,7 @@ VERSION 2026-09-23 (v4.3) — dependencies management, new hotkeys:
      clipboard.
   NEW 10) The hotkey hint is printed with EVERY hotkey on its own line.
 
-VERSION 2026-09-23 (v4.2) — curl test-command output now opt-in:
+VERSION 2026-09-23 (v4.2) â curl test-command output now opt-in:
 
   NEW 0) The ready-to-paste curl test commands (for the LOCAL proxies and
      for the UPSTREAM proxies, plus the per-server curl hints in one-shot
@@ -162,7 +462,7 @@ VERSION 2026-09-23 (v4.2) — curl test-command output now opt-in:
      MOZVPN_SHOW_TEST_COMMANDS=1) enables them; default: off. When the
      commands are hidden, one short hint line explains how to enable them.
 
-VERSION 2026-09-23 (v4.1) — hotkey 'r'/'c' crash fix per live-run feedback:
+VERSION 2026-09-23 (v4.1) â hotkey 'r'/'c' crash fix per live-run feedback:
 
   FIX 0) CRASH on hotkey 'r' (relogin) with the singbox engine running:
      FileNotFoundError(2, 'No such file or directory'). Cause: the wipe
@@ -179,7 +479,7 @@ VERSION 2026-09-23 (v4.1) — hotkey 'r'/'c' crash fix per live-run feedback:
           directory (os.makedirs, exist_ok=True) before rewriting the
           configs - defense in depth against any wipe while it runs.
 
-VERSION 2026-09-23 (v4.0) — hotkey fixes per live-run feedback:
+VERSION 2026-09-23 (v4.0) â hotkey fixes per live-run feedback:
 
   FIX 0) Hotkey 'o' no longer dead-ends with "File does not exist": if the
      sing-box config directory is not there yet (it is created only by the
@@ -197,7 +497,7 @@ VERSION 2026-09-23 (v4.0) — hotkey fixes per live-run feedback:
      so hotkeys clearly stand out in the hint line, file lists and status
      messages.
 
-VERSION 2026-09-23 (v3.9) — full-wipe relogin, TOTP hotkey, decoded JWT:
+VERSION 2026-09-23 (v3.9) â full-wipe relogin, TOTP hotkey, decoded JWT:
 
   FIX 1) 'c' / 'r' / --clear-cache / --relogin now wipe EVERYTHING the
      script has ever saved: the whole config directory (session cache,
@@ -214,7 +514,7 @@ VERSION 2026-09-23 (v3.9) — full-wipe relogin, TOTP hotkey, decoded JWT:
   NEW 4) Hotkeys are highlighted in the log (their own color class) and
      carry per-key emoji placed inside the hint line next to each key.
 
-VERSION 2026-09-23 (v3.8) — protocol choice logging, copy/open hotkeys:
+VERSION 2026-09-23 (v3.8) â protocol choice logging, copy/open hotkeys:
 
   NEW 1) Hotkey 'o': open the singbox config directory in the system file
      manager (os.startfile / open / xdg-open handle directories natively).
@@ -245,7 +545,7 @@ VERSION 2026-09-23 (v3.8) — protocol choice logging, copy/open hotkeys:
      rocket for the winning masque protocol, return arrow for the fallback,
      broom/wastebasket for cleanup).
 
-VERSION 2026-09-23 (v3.7) — audit, hotkeys l / 1-9, probe hint removed:
+VERSION 2026-09-23 (v3.7) â audit, hotkeys l / 1-9, probe hint removed:
 
   AUDIT 0) Full template audit: every tr() call supplies every placeholder
      used by BOTH the en and ru templates (the KeyError('reason') class of
@@ -267,7 +567,7 @@ VERSION 2026-09-23 (v3.7) — audit, hotkeys l / 1-9, probe hint removed:
      xdg-open (freedesktop.org standard, user's preferred application).
      The watch loop prints which number opens which file.
 
-VERSION 2026-09-23 (v3.6) — KeyError crash fix, --listen, config paths:
+VERSION 2026-09-23 (v3.6) â KeyError crash fix, --listen, config paths:
 
   FIX 1) CRASH during probe: KeyError('reason') - the EN template still
      had a {reason} placeholder while the caller no longer passes it.
@@ -290,7 +590,7 @@ VERSION 2026-09-23 (v3.6) — KeyError crash fix, --listen, config paths:
   NOTE 5) Ctrl+C: the FIRST press stops immediately by default; the
      two-press confirmation exists ONLY behind --confirm-exit.
 
-VERSION 2026-09-23 (v3.5) — quota fix, hotkeys, emoji & theme polish:
+VERSION 2026-09-23 (v3.5) â quota fix, hotkeys, emoji & theme polish:
 
   FIX 1) Quota now always shows GiB + MiB: the remainder was divided by
      the next LARGER unit (so "47 GiB 463 MiB" collapsed to "47 GiB");
@@ -315,7 +615,7 @@ VERSION 2026-09-23 (v3.5) — quota fix, hotkeys, emoji & theme polish:
      restart the local proxies with it, q = stop. Windows uses msvcrt,
      POSIX uses cbreak (restored before any interactive prompt).
 
-VERSION 2026-09-23 (v3.4) — hotfix for a v3.3 regression + restoration:
+VERSION 2026-09-23 (v3.4) â hotfix for a v3.3 regression + restoration:
 
   FIX 1) CRASH on startup: the word-highlight regex had unterminated
      subpatterns (nested named groups written incorrectly) -> re.PatternError
@@ -336,7 +636,7 @@ VERSION 2026-09-23 (v3.4) — hotfix for a v3.3 regression + restoration:
      top-level entry point catches KeyboardInterrupt so no traceback
      is printed in one-shot mode either.
 
-VERSION 2026-09-23 (v3.3) — probe wording, themes, richer word colors:
+VERSION 2026-09-23 (v3.3) â probe wording, themes, richer word colors:
 
   FIX 1) The probe output no longer looks like errors: per-upstream lines,
      the summary and the "nothing confirmed" case are informational results
@@ -361,7 +661,7 @@ VERSION 2026-09-23 (v3.3) — probe wording, themes, richer word colors:
      (session.json, credentials.json, fastly-cookie.json, the sing-box
      config directory) with size and modification time, or "not created yet".
 
-VERSION 2026-09-23 (v3.2) — logging polish based on a live run report:
+VERSION 2026-09-23 (v3.2) â logging polish based on a live run report:
 
   FIX 1) "Local proxy engine: builtin" was printed twice (once by main(),
      once by run_manager); now it is emitted exactly once at startup.
@@ -377,7 +677,7 @@ VERSION 2026-09-23 (v3.2) — logging polish based on a live run report:
   FIX 5) The quota line is humanized: "Quota: 47 GiB 463 MiB of 50 GiB left"
      instead of raw byte counters.
 
-VERSION 2026-09-23 (v3.1) — TLS profile fallback matrix, probe-fail policy,
+VERSION 2026-09-23 (v3.1) â TLS profile fallback matrix, probe-fail policy,
 upstream override, cross-engine log consistency, watch-loop error codes:
 
   FIX 1) SSLError(UNEXPECTED_MESSAGE) on the outer TLS to the egress:
@@ -413,7 +713,7 @@ upstream override, cross-engine log consistency, watch-loop error codes:
   FIX 8) The interactive QR answer check compared against corrupted string
      literals; it now uses the localized answer_no_words list.
 
-VERSION 2026-09-23 (v3.0) — MASQUE support, builtin proxy engine, i18n, colors:
+VERSION 2026-09-23 (v3.0) â MASQUE support, builtin proxy engine, i18n, colors:
 
   1) MASQUE PROTOCOL SUPPORT (verified against live data, 2026-09-23):
      - Fastly's official blog ("We Built the Proxy Behind Firefox's New
@@ -422,13 +722,13 @@ VERSION 2026-09-23 (v3.0) — MASQUE support, builtin proxy engine, i18n, colors
        Fastly's infrastructure later.
      - The live Remote Settings collection "vpn-serverlist" today only
        advertises protocols: [{name: "connect", ...}] on hosts like
-       *.m1.fastly-masque.net:2499 — i.e. the egress hostnames are
+       *.m1.fastly-masque.net:2499 â i.e. the egress hostnames are
        MASQUE-branded, but the actually served protocol is still HTTP CONNECT
        over TLS.
      - Therefore this script fully PARSES "masque" protocol entries in the
        server list, PROBES them for real MASQUE (HTTP/3 CONNECT-UDP over
-       QUIC via the optional `aioquic` package) and — when MASQUE is not
-       actually usable — FALLS BACK to HTTP CONNECT automatically (req. 1, 2).
+       QUIC via the optional `aioquic` package) and â when MASQUE is not
+       actually usable â FALLS BACK to HTTP CONNECT automatically (req. 1, 2).
      - The probe does not trust a bare "200" response: it tunnels real data
        through the proxy to a public IP-echo service and verifies the
        response body looks like an IP address.
@@ -451,7 +751,7 @@ VERSION 2026-09-23 (v3.0) — MASQUE support, builtin proxy engine, i18n, colors
        HTTP CONNECT proxy implemented inside this script (modeled after the
        connection-handling approach of the popular proxy.py package and the
        sing-box http outbound). No third-party runtime, no subprocesses,
-       no external engine binary — fully Nuitka/exe-friendly (req. 11).
+       no external engine binary â fully Nuitka/exe-friendly (req. 11).
        Token rotation is applied live: the tunnel reads the current proxyPass
        from an in-memory token holder for every new client connection.
      - --local-proxy-engine singbox: generates sing-box configs exactly like
@@ -521,15 +821,15 @@ Environment variables:
   MOZVPN_SHOW_TEST_COMMANDS (1/true/yes/on), MOZVPN_RETRY_DELAY (seconds)
 
 Caches (all mode 600, under ~/.config/mozvpn):
-  session.json        — sessionToken
-  credentials.json    — email/password/totp_secret (+digits/period/algorithm)
-  fastly-cookie.json  — Fastly WAF cookie
+  session.json        â sessionToken
+  credentials.json    â email/password/totp_secret (+digits/period/algorithm)
+  fastly-cookie.json  â Fastly WAF cookie
 """
 
 import argparse, base64, binascii, getpass, hashlib, hmac, http.cookiejar, json, os, re
 import sys, threading, time, socket, ssl, subprocess, signal, atexit
 import urllib.request, urllib.error
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -597,10 +897,213 @@ IP_ECHO_SERVICES = {
     "ifconfig":  "https://ifconfig.me",
     "icanhazip": "https://icanhazip.com",
     "aws":       "https://checkip.amazonaws.com",
-    "ipinfo":    "https://ipinfo.io/ip",
+    "ipinfo":    "https://ipinfo.io/json",
     "ident":     "https://ident.me",
 }
-DEFAULT_IP_ECHO_SERVICE = "ipify"
+# v5.2 (req. 3): the DEFAULT echo is ipinfo.io/json - ONE request per probe
+# returns BOTH the external IP and the geo (country ISO code + city), so
+# the separate exit-country request of v5.0/v5.1 is no longer needed and
+# every upstream is probed with a single fast request (verified: the
+# ipinfo.io JSON response contains ip/city/region/country fields).
+DEFAULT_IP_ECHO_SERVICE = "ipinfo"
+
+# ---------------------------------------------------------------------------
+# DNS-over-HTTPS (v5.0). Firefox resolves the Fastly egresses through TRR
+# (DNS-over-HTTPS) so a poisoned / geo-wrong system A record cannot send the
+# client to a wrong (usually US) Fastly PoP - Fastly terminates the client
+# TLS on the PoP whose IP you connect to and the traffic leaves from that
+# same PoP. This script now resolves the egress hostnames the same way:
+# DoH answer -> connect to that IP, SNI stays the original hostname.
+# Presets (public DoH JSON APIs, RFC 8484 'application/dns-json'):
+#   cloudflare  https://cloudflare-dns.com/dns-query   (Cloudflare 1.1.1.1)
+#   google      https://dns.google/resolve             (Google Public DNS)
+#   nextdns     https://dns.nextdns.io/dns-query       (NextDNS)
+#   quad9       https://dns.quad9.net:5053/dns-query  (Quad9)
+# (A public Nextcloud DoH endpoint could not be verified to exist; use
+#  --doh-url <endpoint> for any custom DoH JSON API.)
+DOH_PROVIDERS = {
+    "cloudflare": "https://cloudflare-dns.com/dns-query",
+    "google":     "https://dns.google/resolve",
+    "nextdns":    "https://dns.nextdns.io/dns-query",
+    "quad9":      "https://dns.quad9.net:5053/dns-query",
+}
+DOH_TTL = 300            # seconds a DoH answer is cached (cache is OPT-IN)
+DOH_TIMEOUT = 4          # v5.6: was 10 - a dead/slow DoH endpoint must not
+                         # add its full timeout to EVERY lookup while the
+                         # chain walks to the next provider
+DOH_MEMO_TTL = 60        # v5.6: TTL of the ALWAYS-ON short answer memo
+DOH_PROVIDER_PENALTY = 60  # v5.6: seconds a failed DoH provider is skipped
+DOH_PRESETS = ["cloudflare", "google", "nextdns", "quad9"]
+
+_doh_provider = "cloudflare"     # current provider, "" = system DNS (off)
+_doh_cache_enabled = False       # v5.1: the DoH cache is OFF by default
+_doh_cache = {}                  # host -> (expires_at, [ip, ...])
+_doh_lock = threading.Lock()
+# v5.6 probe speedup: an ALWAYS-ON, short-lived answer memo. It does NOT
+# change the opt-in --doh-cache semantics (that cache is 300 s and stays
+# opt-in): the memo only stops the SAME hostname from being re-resolved
+# over DoH 8+ times within seconds during one probe run (the 4-profile
+# TLS matrix + the in-probe echo fallback used to trigger a fresh DoH
+# query per attempt - the main 'probes take 10+ seconds' cause when the
+# DoH chain itself is slow or partially blocked).
+_doh_memo = {}                   # host -> (expires_at, [ip, ...])
+# v5.6: a DoH provider that failed (timeout/connection error) is skipped
+# for DOH_PROVIDER_PENALTY seconds, so ONE dead endpoint does not add its
+# full timeout to every subsequent lookup in the same run.
+_doh_provider_down = {}          # provider name -> down-until timestamp
+
+def set_doh_provider(name: str):
+    """Switch the DoH provider ('' = off, system DNS) and drop the cache."""
+    global _doh_provider
+    _doh_provider = (name or "").strip()
+    with _doh_lock:
+        _doh_cache.clear()
+
+def doh_provider() -> str:
+    """The current DoH provider name ('' = DoH off / system resolver)."""
+    return _doh_provider
+
+def set_doh_cache(enabled: bool):
+    """v5.1: enable/disable the DoH answer cache (default: disabled)."""
+    global _doh_cache_enabled
+    _doh_cache_enabled = bool(enabled)
+    if not _doh_cache_enabled:
+        with _doh_lock:
+            _doh_cache.clear()
+
+def doh_cache_enabled() -> bool:
+    """Whether DoH answers are cached (opt-in via --doh-cache / hotkey 'k')."""
+    return _doh_cache_enabled
+
+def _doh_query(provider_url: str, host: str) -> "list[str]":
+    """One DoH JSON query (RFC 8484 'application/dns-json'):
+    GET <endpoint>?name=<host>&type=A -> the Answer.data IPs."""
+    url = (provider_url.split("?")[0]
+           + ("&" if "?" in provider_url else "?")
+           + "name=" + urllib.parse.quote(host) + "&type=A")
+    r = urllib.request.Request(url, headers={
+        "Accept": "application/dns-json",
+        "User-Agent": "mozvpn/5.1"})
+    with urllib.request.urlopen(r, timeout=DOH_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+    out = []
+    for ans in data.get("Answer") or []:
+        # type 1 = A, type 28 = AAAA (kept too: the v4 route decides the PoP)
+        if ans.get("type") in (1, 28) and ans.get("data"):
+            out.append(str(ans["data"]))
+    return out
+
+def _doh_chain() -> list:
+    """v5.1 (req. 5, 6): the fallback chain of DoH endpoints - the SELECTED
+    provider first, then the remaining presets; every preset speaks DoH
+    only. The SYSTEM resolver is the LAST resort (and the only resolver
+    when DoH is off). A custom --doh-url endpoint is tried first, then the
+    presets follow."""
+    cur = _doh_provider
+    if not cur:
+        return []                       # 'off': the system resolver alone
+    rest = [n for n in DOH_PRESETS if n != cur]
+    if cur in DOH_PRESETS:
+        return [cur] + rest
+    return [cur] + list(DOH_PRESETS)    # custom endpoint first
+
+def resolve_host(host: str) -> "list[str] | None":
+    """Resolve a hostname over DoH ONLY (req. 5): the selected provider,
+    then the remaining DoH presets in the fallback chain; the SYSTEM
+    resolver is the last resort. The long answer cache stays OPT-IN
+    (req. 4: --doh-cache / hotkey 'k'); v5.6 adds an ALWAYS-ON short
+    memo (DOH_MEMO_TTL) plus a provider penalty (DOH_PROVIDER_PENALTY),
+    so one probe run never re-resolves the same host 8+ times and never
+    re-waits on a DoH endpoint that just timed out - together these two
+    fixes remove the multi-second per-upstream stalls of the v5.5 probe
+    when the DoH chain is slow or partially blocked.
+    Returns a list of IPs, or None when DoH is off (the caller then
+    resolves with the system resolver directly)."""
+    if not _doh_provider:
+        return None                      # 'off': plain system resolution
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host) or ":" in host:
+        return [host]                    # already an IP literal
+    now = time.time()
+    # 1) the opt-in long cache (--doh-cache / hotkey 'k')
+    if _doh_cache_enabled:
+        with _doh_lock:
+            hit = _doh_cache.get(host)
+            if hit and hit[0] > now:
+                return hit[1]
+    # 2) v5.6: the ALWAYS-ON short memo (same host within one probe run)
+    with _doh_lock:
+        hit = _doh_memo.get(host)
+        if hit and hit[0] > now:
+            return hit[1]
+    # 3) walk the DoH chain, skipping providers that failed recently
+    ips = None
+    for name in _doh_chain():
+        with _doh_lock:
+            down = _doh_provider_down.get(name, 0)
+        if down > now:
+            continue                     # v5.6: recently failed - skip
+        url = DOH_PROVIDERS.get(name) or name
+        try:
+            ips = _doh_query(url, host) or None
+        except Exception:
+            ips = None
+            with _doh_lock:
+                _doh_provider_down[name] = (time.time()
+                                            + DOH_PROVIDER_PENALTY)
+        if ips:
+            break
+    if not ips:
+        # Every DoH endpoint failed -> the SYSTEM resolver (last resort).
+        # v5.2 (req. 5): SILENT - the DoH setup is reported once at
+        # startup (doh_selected + doh_chain); individual lookups must
+        # NOT write "queried DoH / dns" lines into the log afterwards.
+        try:
+            ips = sorted({ai[4][0] for ai in
+                          socket.getaddrinfo(host, None,
+                                             proto=socket.IPPROTO_TCP)}) or None
+        except Exception:
+            ips = None
+    if ips:
+        if _doh_cache_enabled:
+            with _doh_lock:
+                _doh_cache[host] = (time.time() + DOH_TTL, ips)
+        # v5.6: remember in the always-on short memo too
+        with _doh_lock:
+            _doh_memo[host] = (time.time() + DOH_MEMO_TTL, ips)
+    return ips
+
+def _connect_resolved(host: str, port: int, timeout: int) -> "socket.socket":
+    """TCP connection to the egress. With DoH ON the DoH-resolved IPs are
+    tried in order (connect to the IP; the TLS SNI stays the hostname, set
+    by the caller's wrap_socket(server_hostname=host)); with DoH OFF (or a
+    failed DoH) the normal system resolution is used."""
+    ips = resolve_host(host)
+    if not ips:
+        return socket.create_connection((host, port), timeout=timeout)
+    last = None
+    for ip in ips:
+        try:
+            return socket.create_connection((ip, port), timeout=timeout)
+        except OSError as e:
+            last = e
+    raise last if last else OSError(f"no route to {host}:{port}")
+
+def _connect_resolved_ips(ips: "list[str] | None", host: str, port: int,
+                          timeout: int) -> "socket.socket":
+    """v5.6 probe speedup: same as _connect_resolved(), but the caller
+    passes an ALREADY resolved IP list, so the 4-profile TLS matrix (and
+    the in-probe echo fallback) does not trigger a fresh DoH query on
+    every attempt. With ips=None the normal system resolution is used
+    (the DoH-off case; also the last-resort path after a DoH failure)."""
+    if not ips:
+        return socket.create_connection((host, port), timeout=timeout)
+    last = None
+    for ip in ips:
+        try:
+            return socket.create_connection((ip, port), timeout=timeout)
+        except OSError as e:
+            last = e
+    raise last if last else OSError(f"no route to {host}:{port}")
 
 # Supported upstream protocols: CONNECT (always) and MASQUE (probed, with fallback).
 PROTO_CONNECT = "connect"
@@ -640,6 +1143,9 @@ THEME_SETTINGS = {
         "key":   "\033[1;93m",     # hotkeys ('r' or a bare key before " - ")
         "hotkey": "\033[1;93;48;5;238m",  # hotkey keys: bold on a visible gray block
         "hotdesc": "\033[0;97m",   # hotkey DESCRIPTIONS (per-key hint lines)
+        # v5.2 (req. 2): new meaning-based highlight classes
+        "cc":    "\033[1;92m",     # country codes (US, DE, REC in geo lines)
+        "email": "\033[0;93m",     # email addresses (logins)
     },
     "light": {
         # TRUE WHITE background (xterm color 231 = #ffffff) - matches the
@@ -669,6 +1175,9 @@ THEME_SETTINGS = {
         "key":   "\033[1;35m",
         "hotkey": "\033[1;30;48;5;229m",  # hotkey keys: bold on a light-yellow block
         "hotdesc": "\033[0;90m",   # hotkey DESCRIPTIONS (per-key hint lines)
+        # v5.2 (req. 2): new meaning-based highlight classes (light theme)
+        "cc":    "\033[0;32m",     # country codes
+        "email": "\033[38;5;130m", # email addresses (dark amber)
     },
 }
 DEFAULT_THEME = "dark"
@@ -686,7 +1195,7 @@ STR = {
 "en": {
   "engine_selected": "Local proxy engine {_e}: {engine}",
   "config_files_header": "Configuration and cache files used on this system {_e}:",
-  "config_file_entry": "  {_e} {path} — {status}",
+  "config_file_entry": "  {_e} {path} â {status}",
   "config_file_exists": "{size} bytes, modified {mtime} UTC",
   "config_file_dir": "directory, {n} entries",
   "config_file_missing": "not created yet",
@@ -772,13 +1281,46 @@ STR = {
   "qr_verify_cancelled": "Cancelled: the QR secret does not match the app.\nIf 2FA was re-created, download a fresh QR: accounts.firefox.com -> Settings -> Two-step authentication.",
   "qr_code_for_review": "Code from the parsed QR (for review, no question asked, --qr-verify to enable): {code}, valid for {sec} more s",
   "proxy_check_started": "Probing {n} upstream proxies in parallel via '{service}' ({url}) ...",
-  "proxy_check_summary_ok": "Probe: {n}/{total} upstreams passed the data check ({list})",
-  "proxy_check_summary_fail": "Probe: {n}/{total} upstreams did not pass the data check ({list})",
-  "proxy_check_masque_ok": "Probe: {host}:{port} - MASQUE (HTTP/3 CONNECT-UDP) tunnel carried data",
-  "proxy_check_masque_fallback": "Probe: MASQUE on {host}:{port} not confirmed - this upstream will use HTTP CONNECT",
-  "proxy_check_connect_ok": "Probe: {host}:{port} - CONNECT tunnel carried data (external IP {ip})",
-  "proxy_check_connect_fail": "Probe: {host}:{port} - data check not passed; the upstream is served anyway",
+  "proxy_check_summary_ok": "Probe: {n}/{total} upstreams passed the data check",
+  "proxy_check_summary_fail": "Probe: {n}/{total} upstreams passed the data check; {n_fail} did not - they are served anyway ({breakdown})",
+  "probe_reason_tls": "TLS to the upstream failed (network or egress side)",
+  "probe_reason_timeout": "timed out",
+  "probe_reason_declined": "the egress declined the CONNECT tunnel",
+  "probe_reason_refused": "connection refused",
+  "probe_reason_reset": "connection reset",
+  "probe_reason_unreachable": "network unreachable",
+  "probe_reason_echo": "the echo service answer was unusable",
+  "probe_reason_other": "other transport error",
+  "proxy_check_masque_ok": "Probe: {hp} - MASQUE (HTTP/3 CONNECT-UDP) tunnel carried data",
+  "proxy_check_masque_fallback": "Probe: MASQUE on {hp} not confirmed - this upstream will use HTTP CONNECT",
+  "proxy_check_connect_ok": "Probe: {hp} - CONNECT tunnel carried data (external IP {ip})",
+  "proxy_check_connect_fail": "Probe: {hp} - data check not passed ({reason}); the upstream is served anyway",
   "proxy_check_disabled": "Proxy pre-check disabled (--no-proxy-check): using all server-list upstreams as-is.",
+  "doh_selected": "DNS resolver {_e}: {provider} ({url}) — the Fastly egress hostnames are resolved over DoH ONLY (like Firefox TRR); if this provider fails, the chain falls back to the other DoH providers, the system resolver is the LAST resort.",
+  "doh_system": "DoH disabled {_e} — the egress hostnames are resolved by the SYSTEM DNS (a poisoned/geo-wrong answer can route you to a wrong Fastly PoP, usually a US one). Use --doh <provider> or hotkey 'h'.",
+  "doh_system_short": "system DNS (DoH off)",
+  "doh_chain": "DoH fallback chain (checked left to right): {chain} — the system resolver is the LAST resort. This is logged once at startup; individual DNS lookups during the run are silent.",
+  "geo_echo_no_geo": "Geo check skipped: the echo service '{service}' returns only the IP. Use the default --ip-echo-service ipinfo (ipinfo.io/json) - its single answer carries the IP AND the exit country/city.",
+  "foxyproxy_no_proxies": "FoxyProxy export skipped: no local proxies are currently running.",
+  "foxyproxy_export_cancel": "FoxyProxy export cancelled - no save path chosen.",
+  "foxyproxy_export_done": "FoxyProxy settings file written: {path} ({n} proxies, format: {format})",
+  "foxyproxy_export_fail": "FoxyProxy settings export failed: {err}",
+  "foxyproxy_import_hint": "FoxyProxy Standard import: the file ({format}) imports via ANY FoxyProxy import path - the 'Import' button at the top of the Options page (next to Export) OR the Import tab -> 'Import from older versions'. After the import click 'Save' so the proxies are persisted.",
+  "foxyproxy_path_prompt": "Enter the path to save the FoxyProxy settings file (default: {name}): ",
+  "foxyproxy_format_current": "combined settings JSON (current v8+/v9.x 'data' + FoxyProxy 6/7 entries - imports via ANY FoxyProxy import path)",
+  "foxyproxy_format_legacy": "legacy settings JSON (the REAL FoxyProxy 6/7 export shape - for 'Import from older versions')",
+  "doh_cache_state_on": "DoH cache {_e}: ENABLED — answers are cached for {ttl}s (hotkey 'k' or --no-doh-cache disables).",
+  "doh_cache_state_off": "DoH cache {_e}: DISABLED (default) — every lookup queries the DoH chain directly (hotkey 'k' or --doh-cache enables).",
+  "doh_geo_mismatch": "Geo check: {hp} exits in {geo} ({city}), but the location is {cc} ({cname}). The egress PoP is reached via a wrong route (usually a geo-wrong DNS answer); the IPv6 route may still show the right country.",
+  "doh_geo_ok": "Geo check: {hp} exits in {geo} ({city}) — matches the location {cc}.",
+  "doh_menu_hint": "Choose the DNS resolver {_e} — type its number/letter and press Enter (Backspace deletes, any other key cancels):",
+  "doh_menu_entry": "  {n} - {name}{url}",
+  "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} — new upstream connections use it immediately (the sing-box engine resolves on its own).",
+  "hotkey_doh_cache": "Hotkey 'k': DoH cache {state} (mirrors --doh-cache).",
+  "select_hint": "Type the number/letter of an item, then press Enter. Backspace deletes the last character, any other key cancels.",
+  "select_buffer": "Your choice: {buf}",
+  "select_bad": "There is no item '{buf}' - cancelled.",
+  "locked_note": "Note {_e}: the live vpn-serverlist marks almost every country record 'locked', and Firefox serves them anyway — locked records are INCLUDED by default since v5.0 (--exclude-locked restores the old filtering).",
   "upstream_override": "Upstream override: all locations use {host}:{port} instead of the per-city hosts.",
   "engine_started": "{engine} engine started: {n} local proxies on {listen}",
   "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]",
@@ -786,8 +1328,8 @@ STR = {
   "no_free_ports": "No free ports for local proxies (all candidate ports are busy).",
   "no_servers_to_serve": "No upstream servers to serve: the probe dropped everything (use --probe-fail keep) or the server list is empty.",
   "tls_plain_http": "upstream answered in plaintext (not TLS): {text}",
-  "answer_no_words": "n, no, н, нет",
-  "answer_yes_words": "y, yes, д, да",
+  "answer_no_words": "n, no, Ð½, Ð½ÐµÑ",
+  "answer_yes_words": "y, yes, Ð´, Ð´Ð°",
   "deps_manual_hint": "Install manually {_e}: {cmd}",
   "singbox_missing": "sing-box not found in PATH. Install it (https://sing-box.sagernet.org/installation/) or use --local-proxy-engine builtin.",
   "token_updated_builtin": "builtin engine: new proxyPass applied live (new connections use it, no restart needed).",
@@ -801,30 +1343,30 @@ STR = {
   "unexpected_error": "Unexpected error: {err!r} - retrying in 30s.",
   "next_refresh": "Next refresh {_e} in {sec}s ({at} UTC).",
   "confirm_exit_hint": "Press Ctrl+C to stop.",
-  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  ♻️ r - re-login now, wiping ALL saved data (--relogin)\n  🧹 c - clear ALL saved data & restart (--clear-cache)\n  🔄 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  🔀 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  📂 o - open the sing-box config directory (or the main config directory)\n  📋 v - copy a LOCAL proxy address:port\n  📋 b - copy an UPSTREAM proxy address:port\n  🔢 t - show & copy the current TOTP code\n  🎫 j - show & copy the current proxyPass JWT\n  🖼️ g - load a QR image with the 2FA secret on the fly (--qr)\n  👤 u - show & copy the login (email)\n  🔑 p - show & copy the password\n  📦 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  ⤴️ s - reinstall sing-box from scratch (--reinstall-singbox)\n  🎨 m - switch the color theme dark <-> light (--theme)\n  🌈 n - toggle the colored log output on/off (--no-color)\n  📄 1-9 - open a config file in the system default editor\n  ⏹️ q - stop.",
-  "hotkey_relogin": "Hotkey 'r' ♻️: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
-  "hotkey_clear": "Hotkey 'c' 🧹: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
+  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  ♻️ r - re-login now, wiping ALL saved data (--relogin)\n  🧹 c - clear ALL saved data & restart (--clear-cache)\n  🔄 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  🔀 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  🌐 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  💾 k - toggle the DoH cache on/off (--doh-cache)\n  📂 o - open the sing-box config directory (or the main config directory)\n  📋 v - copy a LOCAL proxy address:port\n  📋 b - copy an UPSTREAM proxy address:port\n  🔢 t - show & copy the current TOTP code\n  🎫 j - show & copy the current proxyPass JWT\n  🖼️ g - load a QR image with the 2FA secret on the fly (--qr)\n  👤 u - show & copy the login (email)\n  🔑 p - show & copy the password\n  📦 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  ⤴️ s - reinstall sing-box from scratch (--reinstall-singbox)\n  🎨 m - switch the color theme dark <-> light (--theme)\n  🌈 n - toggle the colored log output on/off (--no-color)\n  📄 1-9 - open a config file in the system default editor\n  🦊 f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  🧾 x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  ⏹️ q - stop.",
+  "hotkey_relogin": "Hotkey 'r' â»ï¸: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
+  "hotkey_clear": "Hotkey 'c' ð§¹: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
   "hotkey_engine": "Hotkey 'e': switching the engine to {engine} - local proxies will restart with it.",
   "hotkey_listen": "Hotkey 'l': listeners will now bind on {host} - local proxies will restart with it.",
-  "hotkey_totp": "Hotkey 't' 🔢: current TOTP code - also copied to the clipboard.",
+  "hotkey_totp": "Hotkey 't' ð¢: current TOTP code - also copied to the clipboard.",
   "hotkey_jwt": "Current proxyPass JWT {_e} - also copied to the clipboard:",
-  "hotkey_jwt_none": "Hotkey 'j' 🎫: no proxyPass token yet - it appears right after the successful sign-in.",
-  "hotkey_totp_none": "Hotkey 't' 🔢: no TOTP secret is available. Reason: {reason}. The TOTP secret is stored in credentials.json and gets there only after a sign-in with --qr <QR image> or --totp-secret <base32> (or the MOZVPN_TOTP_SECRET environment variable).",
+  "hotkey_jwt_none": "Hotkey 'j' ð«: no proxyPass token yet - it appears right after the successful sign-in.",
+  "hotkey_totp_none": "Hotkey 't' ð¢: no TOTP secret is available. Reason: {reason}. The TOTP secret is stored in credentials.json and gets there only after a sign-in with --qr <QR image> or --totp-secret <base32> (or the MOZVPN_TOTP_SECRET environment variable).",
   "totp_none_reason_nocreds": "credentials.json has not been created yet - no sign-in with saved credentials has happened on this machine",
   "totp_none_reason_nosecret": "credentials.json exists but contains no totp_secret field - the saved sign-in was made without --qr / --totp-secret, or the account has no TOTP 2FA enabled",
-  "hotkey_open_dir_fallback": "Hotkey 'o' 📂: the sing-box config directory does not exist yet (it is created when the singbox engine runs) - opened the main config directory instead {_e}: {path}",
+  "hotkey_open_dir_fallback": "Hotkey 'o' ð: the sing-box config directory does not exist yet (it is created when the singbox engine runs) - opened the main config directory instead {_e}: {path}",
   "hotkey_files_hint": "Config files: press the number to open the file in the system default editor.",
   "hotkey_file_entry": "  {n} - {path}",
   "hotkey_open": "Opened in the system default editor {_e}: {path}",
   "hotkey_open_dir": "Opened the config directory in the system file manager {_e}: {path}",
   "hotkey_open_fail": "Could not open {path}: {err}",
   "hotkey_open_missing": "File does not exist: {path}",
-  "hotkey_copy_local_hint": "Copy a LOCAL proxy address to the clipboard - press its number:",
-  "hotkey_copy_remote_hint": "Copy an UPSTREAM proxy address to the clipboard - press its number:",
+  "hotkey_copy_local_hint": "Copy a LOCAL proxy address to the clipboard - type its number/letter, then press Enter:",
+  "hotkey_copy_remote_hint": "Copy an UPSTREAM proxy address to the clipboard - type its number/letter, then press Enter:",
   "hotkey_copy_entry": "  {n} - {addr} ({label})",
   "hotkey_copied": "Copied to the clipboard {_e}: {text}",
   "hotkey_copy_fail": "Clipboard is not available on this system: {err}",
-  "hotkey_copy_cancel": "Copy cancelled - press v or b again to retry.",
+  "hotkey_copy_cancel": "Selection cancelled - press v, b or h again to retry.",
   "hotkey_stop": "Hotkey 'q': stop requested.",
   "retry_wait": "Sign-in did not succeed this time - it usually works on the second attempt. PLEASE WAIT: the login/password/TOTP prompt will appear again automatically, no script restart needed.",
   "retry_in": "Next sign-in attempt in:",
@@ -836,9 +1378,9 @@ STR = {
   "deps_pkg_ok": "  {_e} {pkg} - OK",
   "deps_pkg_fail": "  {_e} {pkg} - FAILED",
   "deps_conflict_fail": "Packages that could not be installed: {pkgs}. See the pip errors above.",
-  "hotkey_theme": "Hotkey 'm' 🎨: switched the theme to {theme} (--theme).",
+  "hotkey_theme": "Hotkey 'm' ð¨: switched the theme to {theme} (--theme).",
   "color_enabled": "Colored log output enabled {_e} (hotkey 'n' / --no-color toggles).",
-  "hotkey_color": "Hotkey 'n' 🌈: colored log output {state} (mirrors --no-color).",
+  "hotkey_color": "Hotkey 'n' ð: colored log output {state} (mirrors --no-color).",
   "color_state_on": "enabled",
   "color_state_off": "disabled",
   "deps_header": "Python dependencies used by this script {_e}:",
@@ -882,8 +1424,8 @@ STR = {
   "hotkey_password_none": "No saved password: sign in first (--password or the interactive prompt).",
   "hotkey_deps_reinstalled": "Dependencies reinstalled {_e}.",
   "protocol_summary": "Upstream protocol summary {_e}: {m} upstream(s) via MASQUE (HTTP/3 CONNECT-UDP - the priority protocol), {c} upstream(s) via HTTP CONNECT (HTTPS proxy tunnel over TLS - the fallback used when MASQUE did not carry data).",
-  "proto_chosen_masque": "Protocol for {host}:{port}: masque (HTTP/3 CONNECT-UDP) - the PRIORITY protocol; the MASQUE tunnel carried data.",
-  "proto_fallback_connect": "Protocol for {host}:{port}: HTTP CONNECT - fallback from masque, which is unavailable here: {reason}",
+  "proto_chosen_masque": "Protocol for {hp}: masque (HTTP/3 CONNECT-UDP) - the PRIORITY protocol; the MASQUE tunnel carried data.",
+  "proto_fallback_connect": "Protocol for {hp}: HTTP CONNECT - fallback from masque, which is unavailable here: {reason}",
   "proto_masque_no_lib": "masque needs the aioquic package - it is not installed, so every upstream will use the HTTP CONNECT fallback.",
   "test_commands_header": "To test the LOCAL proxies, use these commands {_e}:",
   "test_commands_hidden": "curl test commands are hidden {_e} - enable them with --show-test-commands (env MOZVPN_SHOW_TEST_COMMANDS=1).",
@@ -912,232 +1454,265 @@ STR = {
   "builtin_no_token": "proxyPass token not available yet",
 },
 "ru": {
-  "engine_selected": "Движок локальных прокси {_e}: {engine}",
-  "config_files_header": "Файлы конфигурации и кэшей, которые использует скрипт {_e}:",
-  "config_file_entry": "  {_e} {path} — {status}",
-  "config_file_exists": "{size} байт, изменён {mtime} UTC",
-  "config_file_dir": "каталог, {n} элементов",
-  "config_file_missing": "ещё не создан",
-  "engine_builtin": "builtin (встроенный движок: каждый апстрим обслуживается как MASQUE или HTTP CONNECT, с автоматическим фолбэком)",
-  "engine_singbox": "sing-box (внешний бинарник, апстримы MASQUE/HTTP CONNECT)",
-  "lang_selected": "Язык вывода: {lang}",
-  "color_disabled": "Цветной вывод отключён.",
-  "cache_cleared": "Каталог кэша удалён: {path}",
-  "cache_clear_failed": "Не удалось удалить каталог кэша {path}: {err}",
-  "cache_nothing": "Каталог кэша не существует, чистить нечего.",
-  "cached_session": "Кэшированная сессия ({email}) {_e}. --relogin для нового входа.",
-  "enter_email": "Email аккаунта Mozilla: ",
-  "enter_password": "Пароль: ",
-  "email_missing": "Email не задан (нет ни аргумента, ни кэша).",
-  "password_missing": "Пароль не задан (нет ни аргумента, ни кэша реквизитов).",
-  "signing_in": "Вход в Mozilla Accounts...",
-  "session_cached": "sessionToken закэширован {_e}: {path}",
-  "stretch_version": "Версия key-stretching аккаунта: {version}",
-  "stretch_v2_note": " (650k итераций PBKDF2)",
-  "clock_skew": "Часы ПК расходятся с серверами Mozilla на {offset} с; TOTP будет считаться по серверному времени.",
-  "account_not_found": "Аккаунт не найден.",
-  "wrong_password": "Неверный пароль (errno 103). Если входили через Google/Apple — сначала задайте пароль: accounts.firefox.com → Настройки.",
-  "login_blocked": "ВХОД ВРЕМЕННО ЗАБЛОКИРОВАН ({source}): слишком много неудачных попыток подряд (неверный пароль и/или коды 2FA).{wait}\nЭто НЕ удаление и НЕ вечная блокировка. Вход восстанавливается ПОДТВЕРЖДЕНИЕМ ПО EMAIL:\n  1) Проверьте почту аккаунта (и папку «Спам»): Mozilla отправила письмо\n     («New sign-in to Firefox» / «Confirm your sign-in» / код подтверждения).\n  2) Откройте письмо и подтвердите вход (кнопка или код на accounts.firefox.com).\n  3) После этого повторите запуск (в режиме --watch скрипт повторит сам).",
-  "retry_after": " Сервер просит повторить не раньше чем через ~{sec} с.",
-  "blocked_extra_method": " Сервер требует подтверждение методом '{method}'.",
-  "login_error": "Ошибка входа ({status}): {msg}",
-  "server_wants_method": "Сервер запросил подтверждение входа методом '{method}' (причина: {reason}). Для TOTP-аккаунтов сервер принимает /session/verify/totp независимо от заявленного метода — пробую TOTP.",
-  "totp_prompt": "Код двухфакторной аутентификации (TOTP): ",
-  "totp_digits_only": "Код должен состоять только из цифр.",
-  "totp_not_enabled": "У аккаунта на сервере TOTP не включён (TOTP_TOKEN_NOT_FOUND) — TOTP-верификация невозможна.",
-  "totp_rejected_window": "Сервер отклонил код. Проверьте, что секрет совпадает с приложением-аутентификатором (в т.ч. не пересоздавался ли 2FA после сохранения QR).{clock} Жду следующее окно ...",
-  "totp_rejected_final": "Код 2FA не подошёл три раза подряд (в разных временных окнах). Сверьте TOTP-секрет с приложением: перезапустите с --qr <свежий QR> — возможно, 2FA пересоздавался и qr.png устарел.",
-  "totp_unknown_error": "Ошибка проверки 2FA ({status}): {data} (проверьте sessionToken / аккаунт)",
-  "totp_code_current": "Текущий TOTP-код: {code} (действует ещё {sec} с{offset})",
-  "totp_code_generated": "Сгенерирован TOTP-код: {code} (окно {period} с, осталось {left} с)",
-  "clock_offset_note": ", смещение часов {offset} с",
-  "email_unverified": "Email аккаунта не подтверждён (регистрация). Подтвердите email по ссылке из письма Mozilla, затем повторите вход.",
-  "email_confirm_required": "Требуется подтверждение входа по email, а у аккаунта не включён TOTP (иначе скрипт верифицировал бы сессию сам). Что делать:\n  1) Откройте почту, найдите письмо Mozilla «New sign-in to Firefox» и подтвердите вход\n     (либо введите код из письма на accounts.firefox.com);\n  2) после этого повторите запуск — сессия станет доверенной;\n  3) либо включите TOTP в настройках аккаунта (Two-step authentication);\n  4) либо войдите в браузере Firefox и запустите с --session-token <hex>.",
-  "session_unverified": "Сессия не подтверждена (метод: {method}, причина: {reason}).",
-  "totp_missing": "Аккаунт требует 2FA, а TOTP-секрет неизвестен. Запустите с --qr <картинка> или --totp-secret.",
-  "oauth_fetching": "Получение OAuth-токена (grant fxa-credentials, scope 'profile https://identity.mozilla.com/apps/vpn')...",
-  "oauth_scope_fallback": "Основной scope отклонён сервером, использован '{scope}'.",
-  "oauth_scope_denied": "Scope '{scope}' не разрешён (errno 114), пробую следующий ...",
-  "oauth_all_scopes_denied": "OAuth: все scope отклонены сервером (errno 114). Последняя ошибка: {err}",
-  "oauth_session_invalid": "sessionToken недействителен/истёк (errno {errno}) — требуется перелогин.",
-  "oauth_error": "OAuth-токен не получен ({status}): {data}",
-  "guardian_activating": "Активация Guardian и получение proxyPass...",
-  "guardian_enrolled": "Guardian: enroll выполнен (HTTP {status}).",
-  "guardian_enroll_failed": "/fpn/activate → HTTP {status} {detail} (продолжаю: токен Guardian выдаёт и без enroll'а)",
-  "guardian_403": "proxyPass не получен (HTTP 403, no_entitlement).\nЭто НЕ ошибка входа: OAuth-токен принят, но у аккаунта нет энтайтлмента Firefox IP Protection (Built-in VPN).\nВозможные причины и что делать:\n  1) Функция ещё не включена в вашем браузере: откройте Firefox 149+ → значок VPN\n     на тулбаре → включите один раз до «зелёного индикатора» (первое включение\n     подключает энтайтлмент к аккаунту).\n  2) Built-in VPN beta выкатывается по регионам (на 2026-09: US/UK/DE/FR). Вне списка —\n     403 останется независимо от скрипта.\n  3) Если вход в Mozilla-аккаунт был через Google/Apple или аккаунт новый —\n     дождитесь полной активации аккаунта и повторите.",
-  "guardian_401": "proxyPass не получен (HTTP 401, reauth_required): сессия/FxA-токен отклонены Guardian'ом — требуется перелогин.",
-  "guardian_429": "proxyPass не получен (HTTP 429): квота исчерпана, повторите через {retry} с.",
-  "guardian_451": "proxyPass не получен (HTTP 451): регион недоступен.",
-  "guardian_error": "proxyPass не получен (HTTP {status}): {detail}",
-  "guardian_no_token": "В ответе Guardian нет поля 'token': {data}",
-  "quota_unlimited": "Квота: безлимитная (x-quota-unlimited: true).",
-  "quota_left": "Квота: осталось {left} из {limit}{reset}.",
-  "serverlist_fetching": "Загрузка списка серверов (Remote Settings: vpn-serverlist)...",
-  "serverlist_failed": "Список серверов не загружен ни из Remote Settings (vpn-serverlist), ни от Guardian (/api/v2/servers).",
-  "serverlist_done": "Стран: {countries}, пригодных серверов: {servers}",
-  "proxypass_received": "proxyPass получен {_e}, действителен до: {until} (exp {exp} UTC)",
-  "proxypass_jwt": "Свежий proxyPass JWT:",
-  "session_token_print": "sessionToken (для повторных запусков):",
-  "json_saved": "JSON сохранён {_e}: {path}",
-  "qr_need_zxing": "Для чтения QR нужен пакет zxing-cpp:\n    pip install zxing-cpp pyotp Pillow",
-  "qr_need_pillow": "Для открытия QR-файла нужен пакет Pillow:\n    pip install Pillow",
-  "qr_not_found": "QR-файл не найден: {path}",
-  "qr_open_failed": "Не удалось открыть картинку {path}: {err}",
-  "qr_none_found": "QR-код не найден в файле: {path}",
-  "qr_no_otpauth": "В файле {path} нет otpauth:// QR-кода: {sample}",
-  "qr_not_totp": "QR не является TOTP (otpauth://totp): {sample}",
-  "qr_no_secret": "В QR отсутствует параметр secret: {sample}",
-  "qr_secret_empty": "Пустой TOTP-секрет.",
-  "qr_secret_bad32": "TOTP-секрет не является корректным base32: {err}",
-  "totp_need_pyotp": "Для генерации TOTP нужен пакет pyotp:\n    pip install pyotp",
-  "totp_bad_algo": "Неизвестный TOTP-алгоритм: {algo} (ожидался SHA1/SHA256/SHA512)",
-  "totp_bad_params": "Некорректные параметры TOTP: digits={digits}, period={period}",
-  "totp_init_failed": "Не удалось инициализировать TOTP из секрета: {err}",
-  "qr_saved": "TOTP-секрет сохранён в {path} (mode 600); параметры: {digits} цифр, окно {period} с, {algo}.",
-  "qr_saved_note": "Коды 2FA теперь генерируются автоматически (pyotp) по времени серверов Mozilla.",
-  "qr_verify_q": "Совпадает ли он с кодом в приложении-аутентификаторе? [Y/n]: ",
-  "qr_verify_mismatch": "Вставьте TOTP-секрет (base32) из приложения или путь к другой QR-картинке (Enter — отмена): ",
-  "qr_verify_cancelled": "Отменено: секрет из QR не совпал с приложением.\nЕсли 2FA пересоздавался — скачайте свежий QR: accounts.firefox.com → Настройки → Two-step authentication.",
-  "qr_code_for_review": "Код из распознанного QR (для сверки, вопрос не задаётся, --qr-verify чтобы включить): {code}, действует ещё {sec} с",
-  "proxy_check_started": "Параллельная проверка {n} апстрим-прокси через '{service}' ({url}) ...",
-  "proxy_check_summary_ok": "Проверка: {n}/{total} апстримов пропустили данные ({list})",
-  "proxy_check_summary_fail": "Проверка: {n}/{total} апстримов не пропустили данные ({list})",
-  "proxy_check_masque_ok": "Проверка: {host}:{port} — туннель MASQUE (HTTP/3 CONNECT-UDP) пропустил данные",
-  "proxy_check_masque_fallback": "Проверка: MASQUE на {host}:{port} не подтверждён — этот апстрим будет использовать HTTP CONNECT",
-  "proxy_check_connect_ok": "Проверка: {host}:{port} — туннель CONNECT пропустил данные (внешний IP {ip})",
-  "proxy_check_connect_fail": "Проверка: {host}:{port} — данные через туннель не прошли; апстрим всё равно используется",
-  "proxy_check_disabled": "Предварительная проверка прокси отключена (--no-proxy-check): использую все апстримы из списка как есть.",
-  "upstream_override": "Переопределение апстрима: все локации используют {host}:{port} вместо городских хостов.",
-  "engine_started": "Движок {engine} запущен: {n} локальных прокси на {listen}",
+  "engine_selected": "ÐÐ²Ð¸Ð¶Ð¾Ðº Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ {_e}: {engine}",
+  "config_files_header": "Ð¤Ð°Ð¹Ð»Ñ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸ Ð¸ ÐºÑÑÐµÐ¹, ÐºÐ¾ÑÐ¾ÑÑÐµ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐµÑ ÑÐºÑÐ¸Ð¿Ñ {_e}:",
+  "config_file_entry": "  {_e} {path} â {status}",
+  "config_file_exists": "{size} Ð±Ð°Ð¹Ñ, Ð¸Ð·Ð¼ÐµÐ½ÑÐ½ {mtime} UTC",
+  "config_file_dir": "ÐºÐ°ÑÐ°Ð»Ð¾Ð³, {n} ÑÐ»ÐµÐ¼ÐµÐ½ÑÐ¾Ð²",
+  "config_file_missing": "ÐµÑÑ Ð½Ðµ ÑÐ¾Ð·Ð´Ð°Ð½",
+  "engine_builtin": "builtin (Ð²ÑÑÑÐ¾ÐµÐ½Ð½ÑÐ¹ Ð´Ð²Ð¸Ð¶Ð¾Ðº: ÐºÐ°Ð¶Ð´ÑÐ¹ Ð°Ð¿ÑÑÑÐ¸Ð¼ Ð¾Ð±ÑÐ»ÑÐ¶Ð¸Ð²Ð°ÐµÑÑÑ ÐºÐ°Ðº MASQUE Ð¸Ð»Ð¸ HTTP CONNECT, Ñ Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¸Ð¼ ÑÐ¾Ð»Ð±ÑÐºÐ¾Ð¼)",
+  "engine_singbox": "sing-box (Ð²Ð½ÐµÑÐ½Ð¸Ð¹ Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº, Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ MASQUE/HTTP CONNECT)",
+  "lang_selected": "Ð¯Ð·ÑÐº Ð²ÑÐ²Ð¾Ð´Ð°: {lang}",
+  "color_disabled": "Ð¦Ð²ÐµÑÐ½Ð¾Ð¹ Ð²ÑÐ²Ð¾Ð´ Ð¾ÑÐºÐ»ÑÑÑÐ½.",
+  "cache_cleared": "ÐÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÑÑÐ° ÑÐ´Ð°Ð»ÑÐ½: {path}",
+  "cache_clear_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÐ´Ð°Ð»Ð¸ÑÑ ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÑÑÐ° {path}: {err}",
+  "cache_nothing": "ÐÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÑÑÐ° Ð½Ðµ ÑÑÑÐµÑÑÐ²ÑÐµÑ, ÑÐ¸ÑÑÐ¸ÑÑ Ð½ÐµÑÐµÐ³Ð¾.",
+  "cached_session": "ÐÑÑÐ¸ÑÐ¾Ð²Ð°Ð½Ð½Ð°Ñ ÑÐµÑÑÐ¸Ñ ({email}) {_e}. --relogin Ð´Ð»Ñ Ð½Ð¾Ð²Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°.",
+  "enter_email": "Email Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Mozilla: ",
+  "enter_password": "ÐÐ°ÑÐ¾Ð»Ñ: ",
+  "email_missing": "Email Ð½Ðµ Ð·Ð°Ð´Ð°Ð½ (Ð½ÐµÑ Ð½Ð¸ Ð°ÑÐ³ÑÐ¼ÐµÐ½ÑÐ°, Ð½Ð¸ ÐºÑÑÐ°).",
+  "password_missing": "ÐÐ°ÑÐ¾Ð»Ñ Ð½Ðµ Ð·Ð°Ð´Ð°Ð½ (Ð½ÐµÑ Ð½Ð¸ Ð°ÑÐ³ÑÐ¼ÐµÐ½ÑÐ°, Ð½Ð¸ ÐºÑÑÐ° ÑÐµÐºÐ²Ð¸Ð·Ð¸ÑÐ¾Ð²).",
+  "signing_in": "ÐÑÐ¾Ð´ Ð² Mozilla Accounts...",
+  "session_cached": "sessionToken Ð·Ð°ÐºÑÑÐ¸ÑÐ¾Ð²Ð°Ð½ {_e}: {path}",
+  "stretch_version": "ÐÐµÑÑÐ¸Ñ key-stretching Ð°ÐºÐºÐ°ÑÐ½ÑÐ°: {version}",
+  "stretch_v2_note": " (650k Ð¸ÑÐµÑÐ°ÑÐ¸Ð¹ PBKDF2)",
+  "clock_skew": "Ð§Ð°ÑÑ ÐÐ ÑÐ°ÑÑÐ¾Ð´ÑÑÑÑ Ñ ÑÐµÑÐ²ÐµÑÐ°Ð¼Ð¸ Mozilla Ð½Ð° {offset} Ñ; TOTP Ð±ÑÐ´ÐµÑ ÑÑÐ¸ÑÐ°ÑÑÑÑ Ð¿Ð¾ ÑÐµÑÐ²ÐµÑÐ½Ð¾Ð¼Ñ Ð²ÑÐµÐ¼ÐµÐ½Ð¸.",
+  "account_not_found": "ÐÐºÐºÐ°ÑÐ½Ñ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½.",
+  "wrong_password": "ÐÐµÐ²ÐµÑÐ½ÑÐ¹ Ð¿Ð°ÑÐ¾Ð»Ñ (errno 103). ÐÑÐ»Ð¸ Ð²ÑÐ¾Ð´Ð¸Ð»Ð¸ ÑÐµÑÐµÐ· Google/Apple â ÑÐ½Ð°ÑÐ°Ð»Ð° Ð·Ð°Ð´Ð°Ð¹ÑÐµ Ð¿Ð°ÑÐ¾Ð»Ñ: accounts.firefox.com â ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸.",
+  "login_blocked": "ÐÐ¥ÐÐ ÐÐ ÐÐÐÐÐÐ ÐÐÐÐÐÐÐÐ ÐÐÐÐ ({source}): ÑÐ»Ð¸ÑÐºÐ¾Ð¼ Ð¼Ð½Ð¾Ð³Ð¾ Ð½ÐµÑÐ´Ð°ÑÐ½ÑÑ Ð¿Ð¾Ð¿ÑÑÐ¾Ðº Ð¿Ð¾Ð´ÑÑÐ´ (Ð½ÐµÐ²ÐµÑÐ½ÑÐ¹ Ð¿Ð°ÑÐ¾Ð»Ñ Ð¸/Ð¸Ð»Ð¸ ÐºÐ¾Ð´Ñ 2FA).{wait}\nÐ­ÑÐ¾ ÐÐ ÑÐ´Ð°Ð»ÐµÐ½Ð¸Ðµ Ð¸ ÐÐ Ð²ÐµÑÐ½Ð°Ñ Ð±Ð»Ð¾ÐºÐ¸ÑÐ¾Ð²ÐºÐ°. ÐÑÐ¾Ð´ Ð²Ð¾ÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÐµÑÑÑ ÐÐÐÐ¢ÐÐÐ ÐÐÐÐÐÐÐ ÐÐ EMAIL:\n  1) ÐÑÐ¾Ð²ÐµÑÑÑÐµ Ð¿Ð¾ÑÑÑ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° (Ð¸ Ð¿Ð°Ð¿ÐºÑ Â«Ð¡Ð¿Ð°Ð¼Â»): Mozilla Ð¾ÑÐ¿ÑÐ°Ð²Ð¸Ð»Ð° Ð¿Ð¸ÑÑÐ¼Ð¾\n     (Â«New sign-in to FirefoxÂ» / Â«Confirm your sign-inÂ» / ÐºÐ¾Ð´ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ).\n  2) ÐÑÐºÑÐ¾Ð¹ÑÐµ Ð¿Ð¸ÑÑÐ¼Ð¾ Ð¸ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÐµ Ð²ÑÐ¾Ð´ (ÐºÐ½Ð¾Ð¿ÐºÐ° Ð¸Ð»Ð¸ ÐºÐ¾Ð´ Ð½Ð° accounts.firefox.com).\n  3) ÐÐ¾ÑÐ»Ðµ ÑÑÐ¾Ð³Ð¾ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ Ð·Ð°Ð¿ÑÑÐº (Ð² ÑÐµÐ¶Ð¸Ð¼Ðµ --watch ÑÐºÑÐ¸Ð¿Ñ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸Ñ ÑÐ°Ð¼).",
+  "retry_after": " Ð¡ÐµÑÐ²ÐµÑ Ð¿ÑÐ¾ÑÐ¸Ñ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÑ Ð½Ðµ ÑÐ°Ð½ÑÑÐµ ÑÐµÐ¼ ÑÐµÑÐµÐ· ~{sec} Ñ.",
+  "blocked_extra_method": " Ð¡ÐµÑÐ²ÐµÑ ÑÑÐµÐ±ÑÐµÑ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð¼ÐµÑÐ¾Ð´Ð¾Ð¼ '{method}'.",
+  "login_error": "ÐÑÐ¸Ð±ÐºÐ° Ð²ÑÐ¾Ð´Ð° ({status}): {msg}",
+  "server_wants_method": "Ð¡ÐµÑÐ²ÐµÑ Ð·Ð°Ð¿ÑÐ¾ÑÐ¸Ð» Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð²ÑÐ¾Ð´Ð° Ð¼ÐµÑÐ¾Ð´Ð¾Ð¼ '{method}' (Ð¿ÑÐ¸ÑÐ¸Ð½Ð°: {reason}). ÐÐ»Ñ TOTP-Ð°ÐºÐºÐ°ÑÐ½ÑÐ¾Ð² ÑÐµÑÐ²ÐµÑ Ð¿ÑÐ¸Ð½Ð¸Ð¼Ð°ÐµÑ /session/verify/totp Ð½ÐµÐ·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ Ð¾Ñ Ð·Ð°ÑÐ²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ Ð¼ÐµÑÐ¾Ð´Ð° â Ð¿ÑÐ¾Ð±ÑÑ TOTP.",
+  "totp_prompt": "ÐÐ¾Ð´ Ð´Ð²ÑÑÑÐ°ÐºÑÐ¾ÑÐ½Ð¾Ð¹ Ð°ÑÑÐµÐ½ÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¸Ð¸ (TOTP): ",
+  "totp_digits_only": "ÐÐ¾Ð´ Ð´Ð¾Ð»Ð¶ÐµÐ½ ÑÐ¾ÑÑÐ¾ÑÑÑ ÑÐ¾Ð»ÑÐºÐ¾ Ð¸Ð· ÑÐ¸ÑÑ.",
+  "totp_not_enabled": "Ð£ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ð° ÑÐµÑÐ²ÐµÑÐµ TOTP Ð½Ðµ Ð²ÐºÐ»ÑÑÑÐ½ (TOTP_TOKEN_NOT_FOUND) â TOTP-Ð²ÐµÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¸Ñ Ð½ÐµÐ²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð°.",
+  "totp_rejected_window": "Ð¡ÐµÑÐ²ÐµÑ Ð¾ÑÐºÐ»Ð¾Ð½Ð¸Ð» ÐºÐ¾Ð´. ÐÑÐ¾Ð²ÐµÑÑÑÐµ, ÑÑÐ¾ ÑÐµÐºÑÐµÑ ÑÐ¾Ð²Ð¿Ð°Ð´Ð°ÐµÑ Ñ Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸ÐµÐ¼-Ð°ÑÑÐµÐ½ÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¾ÑÐ¾Ð¼ (Ð² Ñ.Ñ. Ð½Ðµ Ð¿ÐµÑÐµÑÐ¾Ð·Ð´Ð°Ð²Ð°Ð»ÑÑ Ð»Ð¸ 2FA Ð¿Ð¾ÑÐ»Ðµ ÑÐ¾ÑÑÐ°Ð½ÐµÐ½Ð¸Ñ QR).{clock} ÐÐ´Ñ ÑÐ»ÐµÐ´ÑÑÑÐµÐµ Ð¾ÐºÐ½Ð¾ ...",
+  "totp_rejected_final": "ÐÐ¾Ð´ 2FA Ð½Ðµ Ð¿Ð¾Ð´Ð¾ÑÑÐ» ÑÑÐ¸ ÑÐ°Ð·Ð° Ð¿Ð¾Ð´ÑÑÐ´ (Ð² ÑÐ°Ð·Ð½ÑÑ Ð²ÑÐµÐ¼ÐµÐ½Ð½ÑÑ Ð¾ÐºÐ½Ð°Ñ). Ð¡Ð²ÐµÑÑÑÐµ TOTP-ÑÐµÐºÑÐµÑ Ñ Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸ÐµÐ¼: Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÐ¸ÑÐµ Ñ --qr <ÑÐ²ÐµÐ¶Ð¸Ð¹ QR> â Ð²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð¾, 2FA Ð¿ÐµÑÐµÑÐ¾Ð·Ð´Ð°Ð²Ð°Ð»ÑÑ Ð¸ qr.png ÑÑÑÐ°ÑÐµÐ».",
+  "totp_unknown_error": "ÐÑÐ¸Ð±ÐºÐ° Ð¿ÑÐ¾Ð²ÐµÑÐºÐ¸ 2FA ({status}): {data} (Ð¿ÑÐ¾Ð²ÐµÑÑÑÐµ sessionToken / Ð°ÐºÐºÐ°ÑÐ½Ñ)",
+  "totp_code_current": "Ð¢ÐµÐºÑÑÐ¸Ð¹ TOTP-ÐºÐ¾Ð´: {code} (Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ ÐµÑÑ {sec} Ñ{offset})",
+  "totp_code_generated": "Ð¡Ð³ÐµÐ½ÐµÑÐ¸ÑÐ¾Ð²Ð°Ð½ TOTP-ÐºÐ¾Ð´: {code} (Ð¾ÐºÐ½Ð¾ {period} Ñ, Ð¾ÑÑÐ°Ð»Ð¾ÑÑ {left} Ñ)",
+  "clock_offset_note": ", ÑÐ¼ÐµÑÐµÐ½Ð¸Ðµ ÑÐ°ÑÐ¾Ð² {offset} Ñ",
+  "email_unverified": "Email Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ (ÑÐµÐ³Ð¸ÑÑÑÐ°ÑÐ¸Ñ). ÐÐ¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÐµ email Ð¿Ð¾ ÑÑÑÐ»ÐºÐµ Ð¸Ð· Ð¿Ð¸ÑÑÐ¼Ð° Mozilla, Ð·Ð°ÑÐµÐ¼ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ Ð²ÑÐ¾Ð´.",
+  "email_confirm_required": "Ð¢ÑÐµÐ±ÑÐµÑÑÑ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð²ÑÐ¾Ð´Ð° Ð¿Ð¾ email, Ð° Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ðµ Ð²ÐºÐ»ÑÑÑÐ½ TOTP (Ð¸Ð½Ð°ÑÐµ ÑÐºÑÐ¸Ð¿Ñ Ð²ÐµÑÐ¸ÑÐ¸ÑÐ¸ÑÐ¾Ð²Ð°Ð» Ð±Ñ ÑÐµÑÑÐ¸Ñ ÑÐ°Ð¼). Ð§ÑÐ¾ Ð´ÐµÐ»Ð°ÑÑ:\n  1) ÐÑÐºÑÐ¾Ð¹ÑÐµ Ð¿Ð¾ÑÑÑ, Ð½Ð°Ð¹Ð´Ð¸ÑÐµ Ð¿Ð¸ÑÑÐ¼Ð¾ Mozilla Â«New sign-in to FirefoxÂ» Ð¸ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÐµ Ð²ÑÐ¾Ð´\n     (Ð»Ð¸Ð±Ð¾ Ð²Ð²ÐµÐ´Ð¸ÑÐµ ÐºÐ¾Ð´ Ð¸Ð· Ð¿Ð¸ÑÑÐ¼Ð° Ð½Ð° accounts.firefox.com);\n  2) Ð¿Ð¾ÑÐ»Ðµ ÑÑÐ¾Ð³Ð¾ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ Ð·Ð°Ð¿ÑÑÐº â ÑÐµÑÑÐ¸Ñ ÑÑÐ°Ð½ÐµÑ Ð´Ð¾Ð²ÐµÑÐµÐ½Ð½Ð¾Ð¹;\n  3) Ð»Ð¸Ð±Ð¾ Ð²ÐºÐ»ÑÑÐ¸ÑÐµ TOTP Ð² Ð½Ð°ÑÑÑÐ¾Ð¹ÐºÐ°Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° (Two-step authentication);\n  4) Ð»Ð¸Ð±Ð¾ Ð²Ð¾Ð¹Ð´Ð¸ÑÐµ Ð² Ð±ÑÐ°ÑÐ·ÐµÑÐµ Firefox Ð¸ Ð·Ð°Ð¿ÑÑÑÐ¸ÑÐµ Ñ --session-token <hex>.",
+  "session_unverified": "Ð¡ÐµÑÑÐ¸Ñ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð° (Ð¼ÐµÑÐ¾Ð´: {method}, Ð¿ÑÐ¸ÑÐ¸Ð½Ð°: {reason}).",
+  "totp_missing": "ÐÐºÐºÐ°ÑÐ½Ñ ÑÑÐµÐ±ÑÐµÑ 2FA, Ð° TOTP-ÑÐµÐºÑÐµÑ Ð½ÐµÐ¸Ð·Ð²ÐµÑÑÐµÐ½. ÐÐ°Ð¿ÑÑÑÐ¸ÑÐµ Ñ --qr <ÐºÐ°ÑÑÐ¸Ð½ÐºÐ°> Ð¸Ð»Ð¸ --totp-secret.",
+  "oauth_fetching": "ÐÐ¾Ð»ÑÑÐµÐ½Ð¸Ðµ OAuth-ÑÐ¾ÐºÐµÐ½Ð° (grant fxa-credentials, scope 'profile https://identity.mozilla.com/apps/vpn')...",
+  "oauth_scope_fallback": "ÐÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ scope Ð¾ÑÐºÐ»Ð¾Ð½ÑÐ½ ÑÐµÑÐ²ÐµÑÐ¾Ð¼, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°Ð½ '{scope}'.",
+  "oauth_scope_denied": "Scope '{scope}' Ð½Ðµ ÑÐ°Ð·ÑÐµÑÑÐ½ (errno 114), Ð¿ÑÐ¾Ð±ÑÑ ÑÐ»ÐµÐ´ÑÑÑÐ¸Ð¹ ...",
+  "oauth_all_scopes_denied": "OAuth: Ð²ÑÐµ scope Ð¾ÑÐºÐ»Ð¾Ð½ÐµÐ½Ñ ÑÐµÑÐ²ÐµÑÐ¾Ð¼ (errno 114). ÐÐ¾ÑÐ»ÐµÐ´Ð½ÑÑ Ð¾ÑÐ¸Ð±ÐºÐ°: {err}",
+  "oauth_session_invalid": "sessionToken Ð½ÐµÐ´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÐµÐ½/Ð¸ÑÑÑÐº (errno {errno}) â ÑÑÐµÐ±ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ»Ð¾Ð³Ð¸Ð½.",
+  "oauth_error": "OAuth-ÑÐ¾ÐºÐµÐ½ Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ ({status}): {data}",
+  "guardian_activating": "ÐÐºÑÐ¸Ð²Ð°ÑÐ¸Ñ Guardian Ð¸ Ð¿Ð¾Ð»ÑÑÐµÐ½Ð¸Ðµ proxyPass...",
+  "guardian_enrolled": "Guardian: enroll Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½ (HTTP {status}).",
+  "guardian_enroll_failed": "/fpn/activate â HTTP {status} {detail} (Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð°Ñ: ÑÐ¾ÐºÐµÐ½ Guardian Ð²ÑÐ´Ð°ÑÑ Ð¸ Ð±ÐµÐ· enroll'Ð°)",
+  "guardian_403": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 403, no_entitlement).\nÐ­ÑÐ¾ ÐÐ Ð¾ÑÐ¸Ð±ÐºÐ° Ð²ÑÐ¾Ð´Ð°: OAuth-ÑÐ¾ÐºÐµÐ½ Ð¿ÑÐ¸Ð½ÑÑ, Ð½Ð¾ Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½ÐµÑ ÑÐ½ÑÐ°Ð¹ÑÐ»Ð¼ÐµÐ½ÑÐ° Firefox IP Protection (Built-in VPN).\nÐÐ¾Ð·Ð¼Ð¾Ð¶Ð½ÑÐµ Ð¿ÑÐ¸ÑÐ¸Ð½Ñ Ð¸ ÑÑÐ¾ Ð´ÐµÐ»Ð°ÑÑ:\n  1) Ð¤ÑÐ½ÐºÑÐ¸Ñ ÐµÑÑ Ð½Ðµ Ð²ÐºÐ»ÑÑÐµÐ½Ð° Ð² Ð²Ð°ÑÐµÐ¼ Ð±ÑÐ°ÑÐ·ÐµÑÐµ: Ð¾ÑÐºÑÐ¾Ð¹ÑÐµ Firefox 149+ â Ð·Ð½Ð°ÑÐ¾Ðº VPN\n     Ð½Ð° ÑÑÐ»Ð±Ð°ÑÐµ â Ð²ÐºÐ»ÑÑÐ¸ÑÐµ Ð¾Ð´Ð¸Ð½ ÑÐ°Ð· Ð´Ð¾ Â«Ð·ÐµÐ»ÑÐ½Ð¾Ð³Ð¾ Ð¸Ð½Ð´Ð¸ÐºÐ°ÑÐ¾ÑÐ°Â» (Ð¿ÐµÑÐ²Ð¾Ðµ Ð²ÐºÐ»ÑÑÐµÐ½Ð¸Ðµ\n     Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ°ÐµÑ ÑÐ½ÑÐ°Ð¹ÑÐ»Ð¼ÐµÐ½Ñ Ðº Ð°ÐºÐºÐ°ÑÐ½ÑÑ).\n  2) Built-in VPN beta Ð²ÑÐºÐ°ÑÑÐ²Ð°ÐµÑÑÑ Ð¿Ð¾ ÑÐµÐ³Ð¸Ð¾Ð½Ð°Ð¼ (Ð½Ð° 2026-09: US/UK/DE/FR). ÐÐ½Ðµ ÑÐ¿Ð¸ÑÐºÐ° â\n     403 Ð¾ÑÑÐ°Ð½ÐµÑÑÑ Ð½ÐµÐ·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ Ð¾Ñ ÑÐºÑÐ¸Ð¿ÑÐ°.\n  3) ÐÑÐ»Ð¸ Ð²ÑÐ¾Ð´ Ð² Mozilla-Ð°ÐºÐºÐ°ÑÐ½Ñ Ð±ÑÐ» ÑÐµÑÐµÐ· Google/Apple Ð¸Ð»Ð¸ Ð°ÐºÐºÐ°ÑÐ½Ñ Ð½Ð¾Ð²ÑÐ¹ â\n     Ð´Ð¾Ð¶Ð´Ð¸ÑÐµÑÑ Ð¿Ð¾Ð»Ð½Ð¾Ð¹ Ð°ÐºÑÐ¸Ð²Ð°ÑÐ¸Ð¸ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð¸ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ.",
+  "guardian_401": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 401, reauth_required): ÑÐµÑÑÐ¸Ñ/FxA-ÑÐ¾ÐºÐµÐ½ Ð¾ÑÐºÐ»Ð¾Ð½ÐµÐ½Ñ Guardian'Ð¾Ð¼ â ÑÑÐµÐ±ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ»Ð¾Ð³Ð¸Ð½.",
+  "guardian_429": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 429): ÐºÐ²Ð¾ÑÐ° Ð¸ÑÑÐµÑÐ¿Ð°Ð½Ð°, Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ ÑÐµÑÐµÐ· {retry} Ñ.",
+  "guardian_451": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 451): ÑÐµÐ³Ð¸Ð¾Ð½ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½.",
+  "guardian_error": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP {status}): {detail}",
+  "guardian_no_token": "Ð Ð¾ÑÐ²ÐµÑÐµ Guardian Ð½ÐµÑ Ð¿Ð¾Ð»Ñ 'token': {data}",
+  "quota_unlimited": "ÐÐ²Ð¾ÑÐ°: Ð±ÐµÐ·Ð»Ð¸Ð¼Ð¸ÑÐ½Ð°Ñ (x-quota-unlimited: true).",
+  "quota_left": "ÐÐ²Ð¾ÑÐ°: Ð¾ÑÑÐ°Ð»Ð¾ÑÑ {left} Ð¸Ð· {limit}{reset}.",
+  "serverlist_fetching": "ÐÐ°Ð³ÑÑÐ·ÐºÐ° ÑÐ¿Ð¸ÑÐºÐ° ÑÐµÑÐ²ÐµÑÐ¾Ð² (Remote Settings: vpn-serverlist)...",
+  "serverlist_failed": "Ð¡Ð¿Ð¸ÑÐ¾Ðº ÑÐµÑÐ²ÐµÑÐ¾Ð² Ð½Ðµ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½ Ð½Ð¸ Ð¸Ð· Remote Settings (vpn-serverlist), Ð½Ð¸ Ð¾Ñ Guardian (/api/v2/servers).",
+  "serverlist_done": "Ð¡ÑÑÐ°Ð½: {countries}, Ð¿ÑÐ¸Ð³Ð¾Ð´Ð½ÑÑ ÑÐµÑÐ²ÐµÑÐ¾Ð²: {servers}",
+  "proxypass_received": "proxyPass Ð¿Ð¾Ð»ÑÑÐµÐ½ {_e}, Ð´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÐµÐ½ Ð´Ð¾: {until} (exp {exp} UTC)",
+  "proxypass_jwt": "Ð¡Ð²ÐµÐ¶Ð¸Ð¹ proxyPass JWT:",
+  "session_token_print": "sessionToken (Ð´Ð»Ñ Ð¿Ð¾Ð²ÑÐ¾ÑÐ½ÑÑ Ð·Ð°Ð¿ÑÑÐºÐ¾Ð²):",
+  "json_saved": "JSON ÑÐ¾ÑÑÐ°Ð½ÑÐ½ {_e}: {path}",
+  "qr_need_zxing": "ÐÐ»Ñ ÑÑÐµÐ½Ð¸Ñ QR Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ zxing-cpp:\n    pip install zxing-cpp pyotp Pillow",
+  "qr_need_pillow": "ÐÐ»Ñ Ð¾ÑÐºÑÑÑÐ¸Ñ QR-ÑÐ°Ð¹Ð»Ð° Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ Pillow:\n    pip install Pillow",
+  "qr_not_found": "QR-ÑÐ°Ð¹Ð» Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½: {path}",
+  "qr_open_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¾ÑÐºÑÑÑÑ ÐºÐ°ÑÑÐ¸Ð½ÐºÑ {path}: {err}",
+  "qr_none_found": "QR-ÐºÐ¾Ð´ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½ Ð² ÑÐ°Ð¹Ð»Ðµ: {path}",
+  "qr_no_otpauth": "Ð ÑÐ°Ð¹Ð»Ðµ {path} Ð½ÐµÑ otpauth:// QR-ÐºÐ¾Ð´Ð°: {sample}",
+  "qr_not_totp": "QR Ð½Ðµ ÑÐ²Ð»ÑÐµÑÑÑ TOTP (otpauth://totp): {sample}",
+  "qr_no_secret": "Ð QR Ð¾ÑÑÑÑÑÑÐ²ÑÐµÑ Ð¿Ð°ÑÐ°Ð¼ÐµÑÑ secret: {sample}",
+  "qr_secret_empty": "ÐÑÑÑÐ¾Ð¹ TOTP-ÑÐµÐºÑÐµÑ.",
+  "qr_secret_bad32": "TOTP-ÑÐµÐºÑÐµÑ Ð½Ðµ ÑÐ²Ð»ÑÐµÑÑÑ ÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐ¼ base32: {err}",
+  "totp_need_pyotp": "ÐÐ»Ñ Ð³ÐµÐ½ÐµÑÐ°ÑÐ¸Ð¸ TOTP Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ pyotp:\n    pip install pyotp",
+  "totp_bad_algo": "ÐÐµÐ¸Ð·Ð²ÐµÑÑÐ½ÑÐ¹ TOTP-Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼: {algo} (Ð¾Ð¶Ð¸Ð´Ð°Ð»ÑÑ SHA1/SHA256/SHA512)",
+  "totp_bad_params": "ÐÐµÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐµ Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÑ TOTP: digits={digits}, period={period}",
+  "totp_init_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¸Ð½Ð¸ÑÐ¸Ð°Ð»Ð¸Ð·Ð¸ÑÐ¾Ð²Ð°ÑÑ TOTP Ð¸Ð· ÑÐµÐºÑÐµÑÐ°: {err}",
+  "qr_saved": "TOTP-ÑÐµÐºÑÐµÑ ÑÐ¾ÑÑÐ°Ð½ÑÐ½ Ð² {path} (mode 600); Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÑ: {digits} ÑÐ¸ÑÑ, Ð¾ÐºÐ½Ð¾ {period} Ñ, {algo}.",
+  "qr_saved_note": "ÐÐ¾Ð´Ñ 2FA ÑÐµÐ¿ÐµÑÑ Ð³ÐµÐ½ÐµÑÐ¸ÑÑÑÑÑÑ Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¸ (pyotp) Ð¿Ð¾ Ð²ÑÐµÐ¼ÐµÐ½Ð¸ ÑÐµÑÐ²ÐµÑÐ¾Ð² Mozilla.",
+  "qr_verify_q": "Ð¡Ð¾Ð²Ð¿Ð°Ð´Ð°ÐµÑ Ð»Ð¸ Ð¾Ð½ Ñ ÐºÐ¾Ð´Ð¾Ð¼ Ð² Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸Ð¸-Ð°ÑÑÐµÐ½ÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¾ÑÐµ? [Y/n]: ",
+  "qr_verify_mismatch": "ÐÑÑÐ°Ð²ÑÑÐµ TOTP-ÑÐµÐºÑÐµÑ (base32) Ð¸Ð· Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸Ñ Ð¸Ð»Ð¸ Ð¿ÑÑÑ Ðº Ð´ÑÑÐ³Ð¾Ð¹ QR-ÐºÐ°ÑÑÐ¸Ð½ÐºÐµ (Enter â Ð¾ÑÐ¼ÐµÐ½Ð°): ",
+  "qr_verify_cancelled": "ÐÑÐ¼ÐµÐ½ÐµÐ½Ð¾: ÑÐµÐºÑÐµÑ Ð¸Ð· QR Ð½Ðµ ÑÐ¾Ð²Ð¿Ð°Ð» Ñ Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸ÐµÐ¼.\nÐÑÐ»Ð¸ 2FA Ð¿ÐµÑÐµÑÐ¾Ð·Ð´Ð°Ð²Ð°Ð»ÑÑ â ÑÐºÐ°ÑÐ°Ð¹ÑÐµ ÑÐ²ÐµÐ¶Ð¸Ð¹ QR: accounts.firefox.com â ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸ â Two-step authentication.",
+  "qr_code_for_review": "ÐÐ¾Ð´ Ð¸Ð· ÑÐ°ÑÐ¿Ð¾Ð·Ð½Ð°Ð½Ð½Ð¾Ð³Ð¾ QR (Ð´Ð»Ñ ÑÐ²ÐµÑÐºÐ¸, Ð²Ð¾Ð¿ÑÐ¾Ñ Ð½Ðµ Ð·Ð°Ð´Ð°ÑÑÑÑ, --qr-verify ÑÑÐ¾Ð±Ñ Ð²ÐºÐ»ÑÑÐ¸ÑÑ): {code}, Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ ÐµÑÑ {sec} Ñ",
+  "proxy_check_started": "ÐÐ°ÑÐ°Ð»Ð»ÐµÐ»ÑÐ½Ð°Ñ Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° {n} Ð°Ð¿ÑÑÑÐ¸Ð¼-Ð¿ÑÐ¾ÐºÑÐ¸ ÑÐµÑÐµÐ· '{service}' ({url}) ...",
+  "proxy_check_summary_ok": "Проверка: {n}/{total} апстримов пропустили данные",
+  "proxy_check_summary_fail": "Проверка: {n}/{total} апстримов пропустили данные; {n_fail} не пропустили — они всё равно используются ({breakdown})",
+  "probe_reason_tls": "TLS к апстриму не удался (сеть или сторона эгресса)",
+  "probe_reason_timeout": "таймаут",
+  "probe_reason_declined": "эгресс отклонил туннель CONNECT",
+  "probe_reason_refused": "в соединении отказано",
+  "probe_reason_reset": "соединение сброшено",
+  "probe_reason_unreachable": "сеть недоступна",
+  "probe_reason_echo": "ответ echo-сервиса не разобран",
+  "probe_reason_other": "другая транспортная ошибка",
+  "proxy_check_masque_ok": "ÐÑÐ¾Ð²ÐµÑÐºÐ°: {hp} â ÑÑÐ½Ð½ÐµÐ»Ñ MASQUE (HTTP/3 CONNECT-UDP) Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ",
+  "proxy_check_masque_fallback": "ÐÑÐ¾Ð²ÐµÑÐºÐ°: MASQUE Ð½Ð° {hp} Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ â ÑÑÐ¾Ñ Ð°Ð¿ÑÑÑÐ¸Ð¼ Ð±ÑÐ´ÐµÑ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÑ HTTP CONNECT",
+  "proxy_check_connect_ok": "ÐÑÐ¾Ð²ÐµÑÐºÐ°: {hp} â ÑÑÐ½Ð½ÐµÐ»Ñ CONNECT Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ (Ð²Ð½ÐµÑÐ½Ð¸Ð¹ IP {ip})",
+  "proxy_check_connect_fail": "Проверка: {hp} — данные через туннель не прошли ({reason}); апстрим всё равно используется",
+  "proxy_check_disabled": "ÐÑÐµÐ´Ð²Ð°ÑÐ¸ÑÐµÐ»ÑÐ½Ð°Ñ Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° Ð¿ÑÐ¾ÐºÑÐ¸ Ð¾ÑÐºÐ»ÑÑÐµÐ½Ð° (--no-proxy-check): Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÑ Ð²ÑÐµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ Ð¸Ð· ÑÐ¿Ð¸ÑÐºÐ° ÐºÐ°Ðº ÐµÑÑÑ.",
+  "doh_selected": "DNS-резолвер {_e}: {provider} ({url}) — хосты апстримов Fastly резолвятся ТОЛЬКО через DoH (как TRR в Firefox); если этот провайдер недоступен, цепочка откатывается к остальным DoH-провайдерам, системный резолвер — ПОСЛЕДНЕЕ средство.",
+  "doh_system": "DoH отключён {_e} — хосты апстримов резолвит СИСТЕМНЫЙ DNS (отравленный/гео-неверный ответ может увести на чужой PoP Fastly, обычно американский). Используйте --doh <провайдер> или клавишу 'h'.",
+  "doh_system_short": "системный DNS (DoH выключен)",
+  "doh_chain": "Цепочка DoH (проверяется слева направо): {chain} — системный резолвер ПОСЛЕДНЕЕ средство. Строка выводится один раз при старте; отдельные DNS-запросы во время работы в лог не пишутся.",
+  "geo_echo_no_geo": "Проверка гео пропущена: echo-сервис «{service}» возвращает только IP. Используйте --ip-echo-service ipinfo по умолчанию (ipinfo.io/json) — его единственный ответ содержит и IP, и страну/город выхода.",
+  "foxyproxy_no_proxies": "Экспорт FoxyProxy пропущен: локальные прокси сейчас не запущены.",
+  "foxyproxy_export_cancel": "Экспорт FoxyProxy отменён — путь сохранения не выбран.",
+  "foxyproxy_export_done": "Файл настроек FoxyProxy записан: {path} ({n} прокси, формат: {format})",
+  "foxyproxy_export_fail": "Ошибка экспорта настроек FoxyProxy: {err}",
+  "foxyproxy_import_hint": "Импорт в FoxyProxy Standard: файл ({format}) импортируется ЛЮБЫМ путём - кнопка 'Import' вверху страницы Options (рядом с Export) ИЛИ вкладка Import -> 'Import from older versions'. После импорта нажмите 'Save', чтобы прокси сохранились.",
+  "foxyproxy_path_prompt": "Введите путь для сохранения файла настроек FoxyProxy (по умолчанию: {name}): ",
+  "foxyproxy_format_current": "комбинированный settings JSON (актуальный v8+/v9.x 'data' + записи FoxyProxy 6/7 - импортируется ЛЮБЫМ путём FoxyProxy)",
+  "foxyproxy_format_legacy": "устаревший settings JSON (НАСТОЯЩИЙ формат экспорта FoxyProxy 6/7 - для 'Import from older versions')",
+  "doh_cache_state_on": "Кэш DoH {_e}: ВКЛЮЧЁН — ответы кэшируются {ttl} с (клавиша 'k' или --no-doh-cache отключает).",
+  "doh_cache_state_off": "Кэш DoH {_e}: ВЫКЛЮЧЕН (по умолчанию) — каждый запрос идёт в DoH-цепочку напрямую (клавиша 'k' или --doh-cache включает).",
+  "doh_geo_mismatch": "Проверка гео: {hp} выходит в {geo} ({city}), а локация — {cc} ({cname}). Апстрим достигается по неверному маршруту (обычно из-за гео-неверного DNS-ответа); маршрут по IPv6 может при этом показывать правильную страну.",
+  "doh_geo_ok": "Проверка гео: {hp} выходит в {geo} ({city}) — совпадает с локацией {cc}.",
+  "doh_menu_hint": "Выберите DNS-резолвер {_e} — введите его номер/букву и нажмите Enter (Backspace удаляет символ, любая другая клавиша отменяет):",
+  "doh_menu_entry": "  {n} - {name}{url}",
+  "hotkey_doh": "Клавиша 'h': DNS-резолвер переключён на {provider} — новые подключения к апстримам используют его сразу (движок sing-box резолвит сам).",
+  "hotkey_doh_cache": "Клавиша 'k': кэш DoH {state} (зеркалит --doh-cache).",
+  "select_hint": "Введите номер/букву пункта и нажмите Enter. Backspace удаляет последний символ, любая другая клавиша отменяет выбор.",
+  "select_buffer": "Ваш выбор: {buf}",
+  "select_bad": "Пункта '{buf}' нет — отменено.",
+  "locked_note": "Примечание {_e}: в живой коллекции vpn-serverlist почти все страны помечены 'locked', и Firefox их всё равно обслуживает — с v5.0 записи locked включены ПО УМОЛЧАНИЮ (--exclude-locked возвращает старый фильтр).",
+  "upstream_override": "ÐÐµÑÐµÐ¾Ð¿ÑÐµÐ´ÐµÐ»ÐµÐ½Ð¸Ðµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ð°: Ð²ÑÐµ Ð»Ð¾ÐºÐ°ÑÐ¸Ð¸ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÑÑ {host}:{port} Ð²Ð¼ÐµÑÑÐ¾ Ð³Ð¾ÑÐ¾Ð´ÑÐºÐ¸Ñ ÑÐ¾ÑÑÐ¾Ð².",
+  "engine_started": "ÐÐ²Ð¸Ð¶Ð¾Ðº {engine} Ð·Ð°Ð¿ÑÑÐµÐ½: {n} Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ Ð½Ð° {listen}",
   "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]",
-  "port_busy": "Порт {port} занят — пропускаю {label} (занят чужим процессом?).",
-  "no_free_ports": "Нет свободных портов для локальных прокси (все порты-кандидаты заняты).",
-  "no_servers_to_serve": "Нет апстрим-серверов для обслуживания: проверка отсеяла всё (используйте --probe-fail keep) либо список серверов пуст.",
-  "tls_plain_http": "апстрим ответил открытым текстом (не TLS): {text}",
-  "answer_no_words": "n, no, н, нет",
-  "answer_yes_words": "y, yes, д, да",
+  "port_busy": "ÐÐ¾ÑÑ {port} Ð·Ð°Ð½ÑÑ â Ð¿ÑÐ¾Ð¿ÑÑÐºÐ°Ñ {label} (Ð·Ð°Ð½ÑÑ ÑÑÐ¶Ð¸Ð¼ Ð¿ÑÐ¾ÑÐµÑÑÐ¾Ð¼?).",
+  "no_free_ports": "ÐÐµÑ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½ÑÑ Ð¿Ð¾ÑÑÐ¾Ð² Ð´Ð»Ñ Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ (Ð²ÑÐµ Ð¿Ð¾ÑÑÑ-ÐºÐ°Ð½Ð´Ð¸Ð´Ð°ÑÑ Ð·Ð°Ð½ÑÑÑ).",
+  "no_servers_to_serve": "ÐÐµÑ Ð°Ð¿ÑÑÑÐ¸Ð¼-ÑÐµÑÐ²ÐµÑÐ¾Ð² Ð´Ð»Ñ Ð¾Ð±ÑÐ»ÑÐ¶Ð¸Ð²Ð°Ð½Ð¸Ñ: Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° Ð¾ÑÑÐµÑÐ»Ð° Ð²ÑÑ (Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ --probe-fail keep) Ð»Ð¸Ð±Ð¾ ÑÐ¿Ð¸ÑÐ¾Ðº ÑÐµÑÐ²ÐµÑÐ¾Ð² Ð¿ÑÑÑ.",
+  "tls_plain_http": "Ð°Ð¿ÑÑÑÐ¸Ð¼ Ð¾ÑÐ²ÐµÑÐ¸Ð» Ð¾ÑÐºÑÑÑÑÐ¼ ÑÐµÐºÑÑÐ¾Ð¼ (Ð½Ðµ TLS): {text}",
+  "answer_no_words": "n, no, Ð½, Ð½ÐµÑ",
+  "answer_yes_words": "y, yes, Ð´, Ð´Ð°",
   "deps_manual_hint": "Install manually {_e}: {cmd}",
-  "singbox_missing": "sing-box не найден в PATH. Установите его (https://sing-box.sagernet.org/installation/) или используйте --local-proxy-engine builtin.",
-  "token_updated_builtin": "builtin: новый proxyPass применён «на лету» (новые подключения используют его, рестарт не нужен).",
-  "token_updated_singbox": "sing-box: новый proxyPass -> новые конфиги + рестарт процессов ...",
-  "singbox_stopped": "sing-box остановлен: {label} ({listen}:{port})",
-  "singbox_died": "sing-box {label} (порт {port}) завершился (код {code}).",
-  "proxy_stopping": "Остановка локальных прокси ...",
-  "proxy_stopped": "Локальные прокси остановлены.",
-  "relogin_needed": "Требуется перелогин — пробую по сохранённым реквизитам ...",
-  "blocked_wait": "Вход временно заблокирован — жду 10 минут перед следующей попыткой (см. инструкцию по подтверждению выше).",
-  "unexpected_error": "Непредвиденная ошибка: {err!r} — повторю через 30 с.",
-  "next_refresh": "Следующее обновление {_e} через {sec} с ({at} UTC).",
-  "confirm_exit_hint": "Ctrl+C для остановки.",
-  "hotkeys_hint": "Горячие клавиши (каждая соответствует параметру скрипта):\n  ♻️ r — перелогин сейчас с полным удалением всех сохранённых данных (--relogin)\n  🧹 c — полностью очистить все сохранённые данные и перезапустить (--clear-cache)\n  🔄 e — сменить движок прокси builtin/sing-box (--local-proxy-engine)\n  🔀 l — сменить адрес прослушивания 127.0.0.1 <-> 0.0.0.0 (--listen)\n  📂 o — открыть каталог конфигураций sing-box (или основной каталог конфигурации)\n  📋 v — скопировать адрес:порт ЛОКАЛЬНОГО прокси\n  📋 b — скопировать адрес:порт АПСТРИМ-прокси\n  🔢 t — показать и скопировать текущий код TOTP\n  🎫 j — показать и скопировать текущий proxyPass JWT\n  🖼️ g — загрузить QR-картинку с секретом 2FA на лету (--qr)\n  👤 u — показать и скопировать логин (email)\n  🔑 p — показать и скопировать пароль\n  📦 d — переустановить ВСЕ Python-зависимости с нуля (--reinstall-deps)\n  ⤴️ s — переустановить sing-box с нуля (--reinstall-singbox)\n  🎨 m — переключить цветовую тему тёмная <-> светлая (--theme)\n  🌈 n — включить/отключить цветной вывод в лог (--no-color)\n  📄 1-9 — открыть файл конфига в системном редакторе по умолчанию\n  ⏹️ q — остановка.",
-  "hotkey_relogin": "Клавиша 'r' ♻️: ПОЛНОЕ удаление всех сохранённых данных — кэшей, креденшелсов, конфигов sing-box — затем свежий вход.",
-  "hotkey_clear": "Клавиша 'c' 🧹: все сохранённые данные удалены (кэши, креденшелсы, конфиги sing-box) — перезапускаюсь с чистого состояния.",
-  "hotkey_engine": "Клавиша 'e': переключаю движок на {engine} — локальные прокси перезапустятся с ним.",
-  "hotkey_listen": "Клавиша 'l': прослушивание теперь на {host} — локальные прокси перезапустятся с ним.",
-  "hotkey_totp": "Клавиша 't' 🔢: текущий код TOTP — также скопирован в буфер обмена.",
-  "hotkey_jwt": "Текущий proxyPass JWT {_e} — также скопирован в буфер обмена:",
-  "hotkey_jwt_none": "Клавиша 'j' 🎫: токена proxyPass ещё нет — он появится сразу после успешного входа.",
-  "hotkey_totp_none": "Клавиша 't' 🔢: секрет TOTP недоступен. Причина: {reason}. Секрет TOTP хранится в credentials.json и попадает туда только после входа с --qr <QR-картинка> или --totp-secret <base32> (либо через переменную окружения MOZVPN_TOTP_SECRET).",
-  "totp_none_reason_nocreds": "файл credentials.json ещё не создан — на этой машине ещё не было входа с сохранением реквизитов",
-  "totp_none_reason_nosecret": "credentials.json существует, но поля totp_secret в нём нет — сохранённый вход был выполнен без --qr / --totp-secret, либо у аккаунта не включена 2FA (TOTP)",
-  "hotkey_open_dir_fallback": "Клавиша 'o' 📂: каталог конфигураций sing-box ещё не существует (он создаётся при работе движка singbox) — вместо него открыт основной каталог конфигурации {_e}: {path}",
-  "hotkey_files_hint": "Файлы конфигурации: нажмите номер, чтобы открыть файл в системном редакторе по умолчанию.",
+  "singbox_missing": "sing-box Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½ Ð² PATH. Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÐµ ÐµÐ³Ð¾ (https://sing-box.sagernet.org/installation/) Ð¸Ð»Ð¸ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ --local-proxy-engine builtin.",
+  "token_updated_builtin": "builtin: Ð½Ð¾Ð²ÑÐ¹ proxyPass Ð¿ÑÐ¸Ð¼ÐµÐ½ÑÐ½ Â«Ð½Ð° Ð»ÐµÑÑÂ» (Ð½Ð¾Ð²ÑÐµ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐµÐ½Ð¸Ñ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÑÑ ÐµÐ³Ð¾, ÑÐµÑÑÐ°ÑÑ Ð½Ðµ Ð½ÑÐ¶ÐµÐ½).",
+  "token_updated_singbox": "sing-box: Ð½Ð¾Ð²ÑÐ¹ proxyPass -> Ð½Ð¾Ð²ÑÐµ ÐºÐ¾Ð½ÑÐ¸Ð³Ð¸ + ÑÐµÑÑÐ°ÑÑ Ð¿ÑÐ¾ÑÐµÑÑÐ¾Ð² ...",
+  "singbox_stopped": "sing-box Ð¾ÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½: {label} ({listen}:{port})",
+  "singbox_died": "sing-box {label} (Ð¿Ð¾ÑÑ {port}) Ð·Ð°Ð²ÐµÑÑÐ¸Ð»ÑÑ (ÐºÐ¾Ð´ {code}).",
+  "proxy_stopping": "ÐÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ ...",
+  "proxy_stopped": "ÐÐ¾ÐºÐ°Ð»ÑÐ½ÑÐµ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¾ÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ.",
+  "relogin_needed": "Ð¢ÑÐµÐ±ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ»Ð¾Ð³Ð¸Ð½ â Ð¿ÑÐ¾Ð±ÑÑ Ð¿Ð¾ ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐ¼ ÑÐµÐºÐ²Ð¸Ð·Ð¸ÑÐ°Ð¼ ...",
+  "blocked_wait": "ÐÑÐ¾Ð´ Ð²ÑÐµÐ¼ÐµÐ½Ð½Ð¾ Ð·Ð°Ð±Ð»Ð¾ÐºÐ¸ÑÐ¾Ð²Ð°Ð½ â Ð¶Ð´Ñ 10 Ð¼Ð¸Ð½ÑÑ Ð¿ÐµÑÐµÐ´ ÑÐ»ÐµÐ´ÑÑÑÐµÐ¹ Ð¿Ð¾Ð¿ÑÑÐºÐ¾Ð¹ (ÑÐ¼. Ð¸Ð½ÑÑÑÑÐºÑÐ¸Ñ Ð¿Ð¾ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ Ð²ÑÑÐµ).",
+  "unexpected_error": "ÐÐµÐ¿ÑÐµÐ´Ð²Ð¸Ð´ÐµÐ½Ð½Ð°Ñ Ð¾ÑÐ¸Ð±ÐºÐ°: {err!r} â Ð¿Ð¾Ð²ÑÐ¾ÑÑ ÑÐµÑÐµÐ· 30 Ñ.",
+  "next_refresh": "Ð¡Ð»ÐµÐ´ÑÑÑÐµÐµ Ð¾Ð±Ð½Ð¾Ð²Ð»ÐµÐ½Ð¸Ðµ {_e} ÑÐµÑÐµÐ· {sec} Ñ ({at} UTC).",
+  "confirm_exit_hint": "Ctrl+C Ð´Ð»Ñ Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸.",
+  "hotkeys_hint": "Горячие клавиши (каждая соответствует параметру скрипта):\n  ♻️ r — перелогин сейчас с полным удалением всех сохранённых данных (--relogin)\n  🧹 c — полностью очистить все сохранённые данные и перезапустить (--clear-cache)\n  🔄 e — сменить движок прокси builtin/sing-box (--local-proxy-engine)\n  🔀 l — сменить адрес прослушивания 127.0.0.1 <-> 0.0.0.0 (--listen)\n  🌐 h — выбрать DNS-резолвер: провайдеры DoH / системный DNS (--doh)\n  💾 k — включить/отключить кэш DoH (--doh-cache)\n  📂 o — открыть каталог конфигураций sing-box (или основной каталог конфигурации)\n  📋 v — скопировать адрес:порт ЛОКАЛЬНОГО прокси\n  📋 b — скопировать адрес:порт АПСТРИМ-прокси\n  🔢 t — показать и скопировать текущий код TOTP\n  🎫 j — показать и скопировать текущий proxyPass JWT\n  🖼️ g — загрузить QR-картинку с секретом 2FA на лету (--qr)\n  👤 u — показать и скопировать логин (email)\n  🔑 p — показать и скопировать пароль\n  📦 d — переустановить ВСЕ Python-зависимости с нуля (--reinstall-deps)\n  ⤴️ s — переустановить sing-box с нуля (--reinstall-singbox)\n  🎨 m — переключить цветовую тему тёмная <-> светлая (--theme)\n  🌈 n — включить/отключить цветной вывод в лог (--no-color)\n  📄 1-9 — открыть файл конфига в системном редакторе по умолчанию\n  🦊 f — экспортировать ВСЕ локальные прокси в настройки FoxyProxy Standard (комбинированный файл: импортируется ЛЮБЫМ путём FoxyProxy) (--foxyproxy-export)\n  🧾 x — экспортировать ВСЕ локальные прокси в УСТАРЕВШИЙ (legacy) settings JSON (НАСТОЯЩИЙ формат экспорта FoxyProxy 6/7, для 'Import from older versions') (--foxyproxy-legacy-export)\n  ⏹️ q — остановка.",
+  "hotkey_relogin": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'r' â»ï¸: ÐÐÐÐÐÐ ÑÐ´Ð°Ð»ÐµÐ½Ð¸Ðµ Ð²ÑÐµÑ ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÑ Ð´Ð°Ð½Ð½ÑÑ â ÐºÑÑÐµÐ¹, ÐºÑÐµÐ´ÐµÐ½ÑÐµÐ»ÑÐ¾Ð², ÐºÐ¾Ð½ÑÐ¸Ð³Ð¾Ð² sing-box â Ð·Ð°ÑÐµÐ¼ ÑÐ²ÐµÐ¶Ð¸Ð¹ Ð²ÑÐ¾Ð´.",
+  "hotkey_clear": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'c' ð§¹: Ð²ÑÐµ ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐµ Ð´Ð°Ð½Ð½ÑÐµ ÑÐ´Ð°Ð»ÐµÐ½Ñ (ÐºÑÑÐ¸, ÐºÑÐµÐ´ÐµÐ½ÑÐµÐ»ÑÑ, ÐºÐ¾Ð½ÑÐ¸Ð³Ð¸ sing-box) â Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÐºÐ°ÑÑÑ Ñ ÑÐ¸ÑÑÐ¾Ð³Ð¾ ÑÐ¾ÑÑÐ¾ÑÐ½Ð¸Ñ.",
+  "hotkey_engine": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'e': Ð¿ÐµÑÐµÐºÐ»ÑÑÐ°Ñ Ð´Ð²Ð¸Ð¶Ð¾Ðº Ð½Ð° {engine} â Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÐµ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÑÑÑÑ Ñ Ð½Ð¸Ð¼.",
+  "hotkey_listen": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'l': Ð¿ÑÐ¾ÑÐ»ÑÑÐ¸Ð²Ð°Ð½Ð¸Ðµ ÑÐµÐ¿ÐµÑÑ Ð½Ð° {host} â Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÐµ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÑÑÑÑ Ñ Ð½Ð¸Ð¼.",
+  "hotkey_totp": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 't' ð¢: ÑÐµÐºÑÑÐ¸Ð¹ ÐºÐ¾Ð´ TOTP â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°.",
+  "hotkey_jwt": "Ð¢ÐµÐºÑÑÐ¸Ð¹ proxyPass JWT {_e} â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°:",
+  "hotkey_jwt_none": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'j' ð«: ÑÐ¾ÐºÐµÐ½Ð° proxyPass ÐµÑÑ Ð½ÐµÑ â Ð¾Ð½ Ð¿Ð¾ÑÐ²Ð¸ÑÑÑ ÑÑÐ°Ð·Ñ Ð¿Ð¾ÑÐ»Ðµ ÑÑÐ¿ÐµÑÐ½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°.",
+  "hotkey_totp_none": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 't' ð¢: ÑÐµÐºÑÐµÑ TOTP Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½. ÐÑÐ¸ÑÐ¸Ð½Ð°: {reason}. Ð¡ÐµÐºÑÐµÑ TOTP ÑÑÐ°Ð½Ð¸ÑÑÑ Ð² credentials.json Ð¸ Ð¿Ð¾Ð¿Ð°Ð´Ð°ÐµÑ ÑÑÐ´Ð° ÑÐ¾Ð»ÑÐºÐ¾ Ð¿Ð¾ÑÐ»Ðµ Ð²ÑÐ¾Ð´Ð° Ñ --qr <QR-ÐºÐ°ÑÑÐ¸Ð½ÐºÐ°> Ð¸Ð»Ð¸ --totp-secret <base32> (Ð»Ð¸Ð±Ð¾ ÑÐµÑÐµÐ· Ð¿ÐµÑÐµÐ¼ÐµÐ½Ð½ÑÑ Ð¾ÐºÑÑÐ¶ÐµÐ½Ð¸Ñ MOZVPN_TOTP_SECRET).",
+  "totp_none_reason_nocreds": "ÑÐ°Ð¹Ð» credentials.json ÐµÑÑ Ð½Ðµ ÑÐ¾Ð·Ð´Ð°Ð½ â Ð½Ð° ÑÑÐ¾Ð¹ Ð¼Ð°ÑÐ¸Ð½Ðµ ÐµÑÑ Ð½Ðµ Ð±ÑÐ»Ð¾ Ð²ÑÐ¾Ð´Ð° Ñ ÑÐ¾ÑÑÐ°Ð½ÐµÐ½Ð¸ÐµÐ¼ ÑÐµÐºÐ²Ð¸Ð·Ð¸ÑÐ¾Ð²",
+  "totp_none_reason_nosecret": "credentials.json ÑÑÑÐµÑÑÐ²ÑÐµÑ, Ð½Ð¾ Ð¿Ð¾Ð»Ñ totp_secret Ð² Ð½ÑÐ¼ Ð½ÐµÑ â ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐ¹ Ð²ÑÐ¾Ð´ Ð±ÑÐ» Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½ Ð±ÐµÐ· --qr / --totp-secret, Ð»Ð¸Ð±Ð¾ Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ðµ Ð²ÐºÐ»ÑÑÐµÐ½Ð° 2FA (TOTP)",
+  "hotkey_open_dir_fallback": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'o' ð: ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¹ sing-box ÐµÑÑ Ð½Ðµ ÑÑÑÐµÑÑÐ²ÑÐµÑ (Ð¾Ð½ ÑÐ¾Ð·Ð´Ð°ÑÑÑÑ Ð¿ÑÐ¸ ÑÐ°Ð±Ð¾ÑÐµ Ð´Ð²Ð¸Ð¶ÐºÐ° singbox) â Ð²Ð¼ÐµÑÑÐ¾ Ð½ÐµÐ³Ð¾ Ð¾ÑÐºÑÑÑ Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸ {_e}: {path}",
+  "hotkey_files_hint": "Ð¤Ð°Ð¹Ð»Ñ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸: Ð½Ð°Ð¶Ð¼Ð¸ÑÐµ Ð½Ð¾Ð¼ÐµÑ, ÑÑÐ¾Ð±Ñ Ð¾ÑÐºÑÑÑÑ ÑÐ°Ð¹Ð» Ð² ÑÐ¸ÑÑÐµÐ¼Ð½Ð¾Ð¼ ÑÐµÐ´Ð°ÐºÑÐ¾ÑÐµ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ.",
   "hotkey_file_entry": "  {n} - {path}",
-  "hotkey_open": "Открыл в системном редакторе по умолчанию {_e}: {path}",
-  "hotkey_open_dir": "Открыл каталог конфигураций в системном файловом менеджере {_e}: {path}",
-  "hotkey_open_fail": "Не удалось открыть {path}: {err}",
-  "hotkey_open_missing": "Файл не существует: {path}",
-  "hotkey_copy_local_hint": "Скопировать адрес ЛОКАЛЬНОГО прокси в буфер обмена — нажмите его номер:",
-  "hotkey_copy_remote_hint": "Скопировать адрес АПСТРИМ-прокси в буфер обмена — нажмите его номер:",
+  "hotkey_open": "ÐÑÐºÑÑÐ» Ð² ÑÐ¸ÑÑÐµÐ¼Ð½Ð¾Ð¼ ÑÐµÐ´Ð°ÐºÑÐ¾ÑÐµ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ {_e}: {path}",
+  "hotkey_open_dir": "ÐÑÐºÑÑÐ» ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¹ Ð² ÑÐ¸ÑÑÐµÐ¼Ð½Ð¾Ð¼ ÑÐ°Ð¹Ð»Ð¾Ð²Ð¾Ð¼ Ð¼ÐµÐ½ÐµÐ´Ð¶ÐµÑÐµ {_e}: {path}",
+  "hotkey_open_fail": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¾ÑÐºÑÑÑÑ {path}: {err}",
+  "hotkey_open_missing": "Ð¤Ð°Ð¹Ð» Ð½Ðµ ÑÑÑÐµÑÑÐ²ÑÐµÑ: {path}",
+  "hotkey_copy_local_hint": "Скопировать адрес ЛОКАЛЬНОГО прокси в буфер обмена — введите его номер/букву и нажмите Enter:",
+  "hotkey_copy_remote_hint": "Скопировать адрес АПСТРИМ-прокси в буфер обмена — введите его номер/букву и нажмите Enter:",
   "hotkey_copy_entry": "  {n} - {addr} ({label})",
-  "hotkey_copied": "Скопировал в буфер обмена {_e}: {text}",
-  "hotkey_copy_fail": "Буфер обмена недоступен в этой системе: {err}",
-  "hotkey_copy_cancel": "Копирование отменено — нажмите v или b, чтобы повторить.",
-  "hotkey_stop": "Клавиша 'q': запрошена остановка.",
-  "retry_wait": "Вход не удался с первого раза — обычно получается со второго. ПОДОЖДИТЕ: запрос логина/пароля/TOTP появится снова автоматически, перезапуск скрипта не нужен.",
-  "retry_in": "Следующая попытка входа через:",
-  "theme_switched": "Тема переключена {_e}: {theme}",
-  "theme_bg_forced": "Фон окна консоли ПРИНУДИТЕЛЬНО установлен {_e}: {bg} (escape-последовательность OSC 11 — тема теперь перекрашивает и само окно, а не только строки лога).",
-  "theme_bg_exit": "При выходе фон консоли по умолчанию будет восстановлен {_e} (OSC 111). Если ваш терминал игнорирует этот сброс, верните цвет окна в настройках его профиля.",
-  "deps_fallback_each": "Установка одной командой не удалась (конфликт зависимостей pip) {_e} — повторяю каждый пакет отдельно БЕЗ --force-reinstall: принудительная установка общих зависимостей в точные версии — обычная причина конфликтов.",
-  "deps_fallback_nodeps": "{pkg}: всё ещё конфликт {_e} — крайняя мера: pip install {pkg} --no-deps (уже установленное дерево зависимостей удовлетворяет импорты).",
-  "deps_pkg_ok": "  {_e} {pkg} — OK",
-  "deps_pkg_fail": "  {_e} {pkg} — НЕ УДАЛОСЬ",
-  "deps_conflict_fail": "Не удалось установить пакеты: {pkgs}. См. ошибки pip выше.",
-  "hotkey_theme": "Клавиша 'm' 🎨: тема переключена на {theme} (--theme).",
-  "color_enabled": "Цветной вывод включён {_e} (переключается клавишей 'n' / --no-color).",
-  "hotkey_color": "Клавиша 'n' 🌈: цветной вывод {state} (зеркалит --no-color).",
-  "color_state_on": "включён",
-  "color_state_off": "отключён",
-  "deps_header": "Python-зависимости, которые использует этот скрипт {_e}:",
-  "singbox_dep_header": "Внешняя зависимость (не pip-пакет) {_e}:",
-  "singbox_dep_ok": "  {_e} sing-box — установлен: {path} (версия {version})",
-  "singbox_dep_missing": "  {_e} sing-box — НЕ установлен (необязателен: нужен только для движка 'singbox'; встроенный движок полностью работает без него)",
-  "deps_entry_ok": "  {_e} {pip:<12} (модуль {module:<10}) {version:<12} — установлен",
-  "deps_entry_missing": "  {_e} {pip:<12} (модуль {module:<10}) — НЕ установлен{need}",
-  "deps_need_required": " — НУЖЕН для TOTP/QR",
-  "deps_need_optional": " — необязательный (реальный MASQUE / проверка HTTP-3)",
-  "deps_missing_note": "Отсутствуют зависимости: {list}.",
-  "deps_install_q": "Установить недостающие зависимости сейчас через pip ({cmd})? [Y/n]: ",
-  "deps_installing": "Устанавливаю зависимости {_e}: {pkgs} ...",
-  "deps_install_ok": "Зависимости успешно установлены {_e}.",
-  "deps_install_fail": "pip завершился с ошибкой (код {code}): {err}",
-  "deps_frozen_note": "Скрипт скомпилирован в бинарник (frozen) — автоматическая установка невозможна. Установите вручную: {cmd}",
-  "deps_install_declined": "Зависимости не установлены — продолжаю без них.",
-  "deps_reinstall_header": "Переустанавливаю ВСЕ Python-зависимости с нуля {_e}: {pkgs}",
-  "deps_reinstall_ok": "Все зависимости успешно переустановлены {_e}.",
-  "deps_reinstall_fail": "Переустановка зависимостей не удалась (код {code}): {err}",
-  "deps_reinstall_skip_frozen": "Скрипт — скомпилированный бинарник (frozen): переустановка через pip невозможна, зависимости встроены в бинарник.",
-  "singbox_install_header": "sing-box не установлен {_e}. Скрипт ПОЛНОСТЬЮ работает и без него: встроенный движок обслуживает те же апстримы (MASQUE / HTTP CONNECT) внутри этого Python-процесса. sing-box нужен только для движка 'singbox'.",
-  "singbox_install_q": "Установить sing-box сейчас? [y/N]: ",
-  "singbox_install_cmd": "Команда установки для этой системы {_e}: {cmd}",
-  "singbox_install_manual": "Ручная установка: откройте {url} — официальная страница установки sing-box.",
-  "singbox_install_started": "Устанавливаю sing-box {_e}: {cmd}",
-  "singbox_install_ok": "sing-box успешно установлен {_e}: {path}",
-  "singbox_install_fail": "Установка sing-box не удалась (код {code}): {err}",
-  "singbox_install_declined": "Установка sing-box отклонена {_e} — выбор запомнен, вопрос больше не будет задаваться (кроме случая, когда вы выберете движок singbox, а sing-box всё ещё не установлен).",
-  "singbox_windows_hint": "Windows: скачайте релиз sing-box с {url} , распакуйте и добавьте в PATH, затем перезапустите скрипт.",
-  "singbox_reinstall_header": "Переустанавливаю sing-box с нуля {_e} ...",
-  "singbox_reinstall_ok": "sing-box переустановлен {_e}: {path}",
-  "singbox_reinstall_fail": "Переустановка sing-box не удалась (код {code}): {err}",
-  "singbox_engine_still_missing": "sing-box по-прежнему не установлен — остаюсь на встроенном движке.",
-  "hotkey_qr_prompt": "Путь к QR-картинке с кодом 2FA (TOTP) (Enter — отмена): ",
-  "hotkey_qr_loaded": "QR загружен {_e}: {path}. Секрет TOTP сохранён; текущий код: {code} (действует ещё {sec} с).",
-  "hotkey_qr_fail": "Не удалось загрузить QR: {err}",
-  "hotkey_login": "Логин (email) {_e}: {email} — также скопирован в буфер обмена.",
-  "hotkey_login_none": "Сохранённого логина нет: сначала выполните вход (--email или интерактивный запрос).",
-  "hotkey_password": "Пароль {_e}: {password} — также скопирован в буфер обмена.",
-  "hotkey_password_none": "Сохранённого пароля нет: сначала выполните вход (--password или интерактивный запрос).",
-  "hotkey_deps_reinstalled": "Зависимости переустановлены {_e}.",
-  "protocol_summary": "Сводка по протоколам апстримов {_e}: {m} апстрим(ов) через MASQUE (HTTP/3 CONNECT-UDP — приоритетный протокол), {c} апстрим(ов) через HTTP CONNECT (туннель HTTPS-прокси поверх TLS — откат, когда MASQUE не пропустил данные).",
-  "proto_chosen_masque": "Протокол для {host}:{port}: masque (HTTP/3 CONNECT-UDP) — приоритетный протокол; туннель MASQUE пропустил данные.",
-  "proto_fallback_connect": "Протокол для {host}:{port}: HTTP CONNECT — откат с masque, который здесь недоступен: {reason}",
-  "proto_masque_no_lib": "Для masque нужен пакет aioquic — он не установлен, поэтому все апстримы будут использовать откат HTTP CONNECT.",
-  "test_commands_header": "Чтобы протестировать ЛОКАЛЬНЫЕ прокси, используйте эти команды {_e}:",
-  "test_commands_hidden": "Тестовые команды curl скрыты {_e} — включите их параметром --show-test-commands (env MOZVPN_SHOW_TEST_COMMANDS=1).",
+  "hotkey_copied": "Ð¡ÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð» Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð° {_e}: {text}",
+  "hotkey_copy_fail": "ÐÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð° Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½ Ð² ÑÑÐ¾Ð¹ ÑÐ¸ÑÑÐµÐ¼Ðµ: {err}",
+  "hotkey_copy_cancel": "Выбор отменён — нажмите v, b или h, чтобы повторить.",
+  "hotkey_stop": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'q': Ð·Ð°Ð¿ÑÐ¾ÑÐµÐ½Ð° Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ°.",
+  "retry_wait": "ÐÑÐ¾Ð´ Ð½Ðµ ÑÐ´Ð°Ð»ÑÑ Ñ Ð¿ÐµÑÐ²Ð¾Ð³Ð¾ ÑÐ°Ð·Ð° â Ð¾Ð±ÑÑÐ½Ð¾ Ð¿Ð¾Ð»ÑÑÐ°ÐµÑÑÑ ÑÐ¾ Ð²ÑÐ¾ÑÐ¾Ð³Ð¾. ÐÐÐÐÐÐÐÐ¢Ð: Ð·Ð°Ð¿ÑÐ¾Ñ Ð»Ð¾Ð³Ð¸Ð½Ð°/Ð¿Ð°ÑÐ¾Ð»Ñ/TOTP Ð¿Ð¾ÑÐ²Ð¸ÑÑÑ ÑÐ½Ð¾Ð²Ð° Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¸, Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÐº ÑÐºÑÐ¸Ð¿ÑÐ° Ð½Ðµ Ð½ÑÐ¶ÐµÐ½.",
+  "retry_in": "Ð¡Ð»ÐµÐ´ÑÑÑÐ°Ñ Ð¿Ð¾Ð¿ÑÑÐºÐ° Ð²ÑÐ¾Ð´Ð° ÑÐµÑÐµÐ·:",
+  "theme_switched": "Ð¢ÐµÐ¼Ð° Ð¿ÐµÑÐµÐºÐ»ÑÑÐµÐ½Ð° {_e}: {theme}",
+  "theme_bg_forced": "Ð¤Ð¾Ð½ Ð¾ÐºÐ½Ð° ÐºÐ¾Ð½ÑÐ¾Ð»Ð¸ ÐÐ ÐÐÐ£ÐÐÐ¢ÐÐÐ¬ÐÐ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}: {bg} (escape-Ð¿Ð¾ÑÐ»ÐµÐ´Ð¾Ð²Ð°ÑÐµÐ»ÑÐ½Ð¾ÑÑÑ OSC 11 â ÑÐµÐ¼Ð° ÑÐµÐ¿ÐµÑÑ Ð¿ÐµÑÐµÐºÑÐ°ÑÐ¸Ð²Ð°ÐµÑ Ð¸ ÑÐ°Ð¼Ð¾ Ð¾ÐºÐ½Ð¾, Ð° Ð½Ðµ ÑÐ¾Ð»ÑÐºÐ¾ ÑÑÑÐ¾ÐºÐ¸ Ð»Ð¾Ð³Ð°).",
+  "theme_bg_exit": "ÐÑÐ¸ Ð²ÑÑÐ¾Ð´Ðµ ÑÐ¾Ð½ ÐºÐ¾Ð½ÑÐ¾Ð»Ð¸ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ Ð±ÑÐ´ÐµÑ Ð²Ð¾ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e} (OSC 111). ÐÑÐ»Ð¸ Ð²Ð°Ñ ÑÐµÑÐ¼Ð¸Ð½Ð°Ð» Ð¸Ð³Ð½Ð¾ÑÐ¸ÑÑÐµÑ ÑÑÐ¾Ñ ÑÐ±ÑÐ¾Ñ, Ð²ÐµÑÐ½Ð¸ÑÐµ ÑÐ²ÐµÑ Ð¾ÐºÐ½Ð° Ð² Ð½Ð°ÑÑÑÐ¾Ð¹ÐºÐ°Ñ ÐµÐ³Ð¾ Ð¿ÑÐ¾ÑÐ¸Ð»Ñ.",
+  "deps_fallback_each": "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð¾Ð´Ð½Ð¾Ð¹ ÐºÐ¾Ð¼Ð°Ð½Ð´Ð¾Ð¹ Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ pip) {_e} â Ð¿Ð¾Ð²ÑÐ¾ÑÑÑ ÐºÐ°Ð¶Ð´ÑÐ¹ Ð¿Ð°ÐºÐµÑ Ð¾ÑÐ´ÐµÐ»ÑÐ½Ð¾ ÐÐÐ --force-reinstall: Ð¿ÑÐ¸Ð½ÑÐ´Ð¸ÑÐµÐ»ÑÐ½Ð°Ñ ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð¾Ð±ÑÐ¸Ñ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ Ð² ÑÐ¾ÑÐ½ÑÐµ Ð²ÐµÑÑÐ¸Ð¸ â Ð¾Ð±ÑÑÐ½Ð°Ñ Ð¿ÑÐ¸ÑÐ¸Ð½Ð° ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑÐ¾Ð².",
+  "deps_fallback_nodeps": "{pkg}: Ð²ÑÑ ÐµÑÑ ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑ {_e} â ÐºÑÐ°Ð¹Ð½ÑÑ Ð¼ÐµÑÐ°: pip install {pkg} --no-deps (ÑÐ¶Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ð½Ð¾Ðµ Ð´ÐµÑÐµÐ²Ð¾ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ ÑÐ´Ð¾Ð²Ð»ÐµÑÐ²Ð¾ÑÑÐµÑ Ð¸Ð¼Ð¿Ð¾ÑÑÑ).",
+  "deps_pkg_ok": "  {_e} {pkg} â OK",
+  "deps_pkg_fail": "  {_e} {pkg} â ÐÐ Ð£ÐÐÐÐÐ¡Ð¬",
+  "deps_conflict_fail": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ Ð¿Ð°ÐºÐµÑÑ: {pkgs}. Ð¡Ð¼. Ð¾ÑÐ¸Ð±ÐºÐ¸ pip Ð²ÑÑÐµ.",
+  "hotkey_theme": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'm' ð¨: ÑÐµÐ¼Ð° Ð¿ÐµÑÐµÐºÐ»ÑÑÐµÐ½Ð° Ð½Ð° {theme} (--theme).",
+  "color_enabled": "Ð¦Ð²ÐµÑÐ½Ð¾Ð¹ Ð²ÑÐ²Ð¾Ð´ Ð²ÐºÐ»ÑÑÑÐ½ {_e} (Ð¿ÐµÑÐµÐºÐ»ÑÑÐ°ÐµÑÑÑ ÐºÐ»Ð°Ð²Ð¸ÑÐµÐ¹ 'n' / --no-color).",
+  "hotkey_color": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'n' ð: ÑÐ²ÐµÑÐ½Ð¾Ð¹ Ð²ÑÐ²Ð¾Ð´ {state} (Ð·ÐµÑÐºÐ°Ð»Ð¸Ñ --no-color).",
+  "color_state_on": "Ð²ÐºÐ»ÑÑÑÐ½",
+  "color_state_off": "Ð¾ÑÐºÐ»ÑÑÑÐ½",
+  "deps_header": "Python-Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸, ÐºÐ¾ÑÐ¾ÑÑÐµ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐµÑ ÑÑÐ¾Ñ ÑÐºÑÐ¸Ð¿Ñ {_e}:",
+  "singbox_dep_header": "ÐÐ½ÐµÑÐ½ÑÑ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÑ (Ð½Ðµ pip-Ð¿Ð°ÐºÐµÑ) {_e}:",
+  "singbox_dep_ok": "  {_e} sing-box â ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½: {path} (Ð²ÐµÑÑÐ¸Ñ {version})",
+  "singbox_dep_missing": "  {_e} sing-box â ÐÐ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ (Ð½ÐµÐ¾Ð±ÑÐ·Ð°ÑÐµÐ»ÐµÐ½: Ð½ÑÐ¶ÐµÐ½ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð´Ð²Ð¸Ð¶ÐºÐ° 'singbox'; Ð²ÑÑÑÐ¾ÐµÐ½Ð½ÑÐ¹ Ð´Ð²Ð¸Ð¶Ð¾Ðº Ð¿Ð¾Ð»Ð½Ð¾ÑÑÑÑ ÑÐ°Ð±Ð¾ÑÐ°ÐµÑ Ð±ÐµÐ· Ð½ÐµÐ³Ð¾)",
+  "deps_entry_ok": "  {_e} {pip:<12} (Ð¼Ð¾Ð´ÑÐ»Ñ {module:<10}) {version:<12} â ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½",
+  "deps_entry_missing": "  {_e} {pip:<12} (Ð¼Ð¾Ð´ÑÐ»Ñ {module:<10}) â ÐÐ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½{need}",
+  "deps_need_required": " â ÐÐ£ÐÐÐ Ð´Ð»Ñ TOTP/QR",
+  "deps_need_optional": " â Ð½ÐµÐ¾Ð±ÑÐ·Ð°ÑÐµÐ»ÑÐ½ÑÐ¹ (ÑÐµÐ°Ð»ÑÐ½ÑÐ¹ MASQUE / Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° HTTP-3)",
+  "deps_missing_note": "ÐÑÑÑÑÑÑÐ²ÑÑÑ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸: {list}.",
+  "deps_install_q": "Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ Ð½ÐµÐ´Ð¾ÑÑÐ°ÑÑÐ¸Ðµ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ ÑÐµÐ¹ÑÐ°Ñ ÑÐµÑÐµÐ· pip ({cmd})? [Y/n]: ",
+  "deps_installing": "Ð£ÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ {_e}: {pkgs} ...",
+  "deps_install_ok": "ÐÐ°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ ÑÑÐ¿ÐµÑÐ½Ð¾ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ {_e}.",
+  "deps_install_fail": "pip Ð·Ð°Ð²ÐµÑÑÐ¸Ð»ÑÑ Ñ Ð¾ÑÐ¸Ð±ÐºÐ¾Ð¹ (ÐºÐ¾Ð´ {code}): {err}",
+  "deps_frozen_note": "Ð¡ÐºÑÐ¸Ð¿Ñ ÑÐºÐ¾Ð¼Ð¿Ð¸Ð»Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº (frozen) â Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ°Ñ ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð½ÐµÐ²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð°. Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÐµ Ð²ÑÑÑÐ½ÑÑ: {cmd}",
+  "deps_install_declined": "ÐÐ°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ â Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð°Ñ Ð±ÐµÐ· Ð½Ð¸Ñ.",
+  "deps_reinstall_header": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ ÐÐ¡Ð Python-Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ñ Ð½ÑÐ»Ñ {_e}: {pkgs}",
+  "deps_reinstall_ok": "ÐÑÐµ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ ÑÑÐ¿ÐµÑÐ½Ð¾ Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ {_e}.",
+  "deps_reinstall_fail": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð´ {code}): {err}",
+  "deps_reinstall_skip_frozen": "Ð¡ÐºÑÐ¸Ð¿Ñ â ÑÐºÐ¾Ð¼Ð¿Ð¸Ð»Ð¸ÑÐ¾Ð²Ð°Ð½Ð½ÑÐ¹ Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº (frozen): Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° ÑÐµÑÐµÐ· pip Ð½ÐµÐ²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð°, Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ð²ÑÑÑÐ¾ÐµÐ½Ñ Ð² Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº.",
+  "singbox_install_header": "sing-box Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}. Ð¡ÐºÑÐ¸Ð¿Ñ ÐÐÐÐÐÐ¡Ð¢Ð¬Ð® ÑÐ°Ð±Ð¾ÑÐ°ÐµÑ Ð¸ Ð±ÐµÐ· Ð½ÐµÐ³Ð¾: Ð²ÑÑÑÐ¾ÐµÐ½Ð½ÑÐ¹ Ð´Ð²Ð¸Ð¶Ð¾Ðº Ð¾Ð±ÑÐ»ÑÐ¶Ð¸Ð²Ð°ÐµÑ ÑÐµ Ð¶Ðµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ (MASQUE / HTTP CONNECT) Ð²Ð½ÑÑÑÐ¸ ÑÑÐ¾Ð³Ð¾ Python-Ð¿ÑÐ¾ÑÐµÑÑÐ°. sing-box Ð½ÑÐ¶ÐµÐ½ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð´Ð²Ð¸Ð¶ÐºÐ° 'singbox'.",
+  "singbox_install_q": "Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ sing-box ÑÐµÐ¹ÑÐ°Ñ? [y/N]: ",
+  "singbox_install_cmd": "ÐÐ¾Ð¼Ð°Ð½Ð´Ð° ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ Ð´Ð»Ñ ÑÑÐ¾Ð¹ ÑÐ¸ÑÑÐµÐ¼Ñ {_e}: {cmd}",
+  "singbox_install_manual": "Ð ÑÑÐ½Ð°Ñ ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ°: Ð¾ÑÐºÑÐ¾Ð¹ÑÐµ {url} â Ð¾ÑÐ¸ÑÐ¸Ð°Ð»ÑÐ½Ð°Ñ ÑÑÑÐ°Ð½Ð¸ÑÐ° ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ sing-box.",
+  "singbox_install_started": "Ð£ÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ sing-box {_e}: {cmd}",
+  "singbox_install_ok": "sing-box ÑÑÐ¿ÐµÑÐ½Ð¾ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}: {path}",
+  "singbox_install_fail": "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ° sing-box Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð´ {code}): {err}",
+  "singbox_install_declined": "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ° sing-box Ð¾ÑÐºÐ»Ð¾Ð½ÐµÐ½Ð° {_e} â Ð²ÑÐ±Ð¾Ñ Ð·Ð°Ð¿Ð¾Ð¼Ð½ÐµÐ½, Ð²Ð¾Ð¿ÑÐ¾Ñ Ð±Ð¾Ð»ÑÑÐµ Ð½Ðµ Ð±ÑÐ´ÐµÑ Ð·Ð°Ð´Ð°Ð²Ð°ÑÑÑÑ (ÐºÑÐ¾Ð¼Ðµ ÑÐ»ÑÑÐ°Ñ, ÐºÐ¾Ð³Ð´Ð° Ð²Ñ Ð²ÑÐ±ÐµÑÐµÑÐµ Ð´Ð²Ð¸Ð¶Ð¾Ðº singbox, Ð° sing-box Ð²ÑÑ ÐµÑÑ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½).",
+  "singbox_windows_hint": "Windows: ÑÐºÐ°ÑÐ°Ð¹ÑÐµ ÑÐµÐ»Ð¸Ð· sing-box Ñ {url} , ÑÐ°ÑÐ¿Ð°ÐºÑÐ¹ÑÐµ Ð¸ Ð´Ð¾Ð±Ð°Ð²ÑÑÐµ Ð² PATH, Ð·Ð°ÑÐµÐ¼ Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÐ¸ÑÐµ ÑÐºÑÐ¸Ð¿Ñ.",
+  "singbox_reinstall_header": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ sing-box Ñ Ð½ÑÐ»Ñ {_e} ...",
+  "singbox_reinstall_ok": "sing-box Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}: {path}",
+  "singbox_reinstall_fail": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° sing-box Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð´ {code}): {err}",
+  "singbox_engine_still_missing": "sing-box Ð¿Ð¾-Ð¿ÑÐµÐ¶Ð½ÐµÐ¼Ñ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ â Ð¾ÑÑÐ°ÑÑÑ Ð½Ð° Ð²ÑÑÑÐ¾ÐµÐ½Ð½Ð¾Ð¼ Ð´Ð²Ð¸Ð¶ÐºÐµ.",
+  "hotkey_qr_prompt": "ÐÑÑÑ Ðº QR-ÐºÐ°ÑÑÐ¸Ð½ÐºÐµ Ñ ÐºÐ¾Ð´Ð¾Ð¼ 2FA (TOTP) (Enter â Ð¾ÑÐ¼ÐµÐ½Ð°): ",
+  "hotkey_qr_loaded": "QR Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½ {_e}: {path}. Ð¡ÐµÐºÑÐµÑ TOTP ÑÐ¾ÑÑÐ°Ð½ÑÐ½; ÑÐµÐºÑÑÐ¸Ð¹ ÐºÐ¾Ð´: {code} (Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ ÐµÑÑ {sec} Ñ).",
+  "hotkey_qr_fail": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð·Ð°Ð³ÑÑÐ·Ð¸ÑÑ QR: {err}",
+  "hotkey_login": "ÐÐ¾Ð³Ð¸Ð½ (email) {_e}: {email} â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°.",
+  "hotkey_login_none": "Ð¡Ð¾ÑÑÐ°Ð½ÑÐ½Ð½Ð¾Ð³Ð¾ Ð»Ð¾Ð³Ð¸Ð½Ð° Ð½ÐµÑ: ÑÐ½Ð°ÑÐ°Ð»Ð° Ð²ÑÐ¿Ð¾Ð»Ð½Ð¸ÑÐµ Ð²ÑÐ¾Ð´ (--email Ð¸Ð»Ð¸ Ð¸Ð½ÑÐµÑÐ°ÐºÑÐ¸Ð²Ð½ÑÐ¹ Ð·Ð°Ð¿ÑÐ¾Ñ).",
+  "hotkey_password": "ÐÐ°ÑÐ¾Ð»Ñ {_e}: {password} â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°.",
+  "hotkey_password_none": "Ð¡Ð¾ÑÑÐ°Ð½ÑÐ½Ð½Ð¾Ð³Ð¾ Ð¿Ð°ÑÐ¾Ð»Ñ Ð½ÐµÑ: ÑÐ½Ð°ÑÐ°Ð»Ð° Ð²ÑÐ¿Ð¾Ð»Ð½Ð¸ÑÐµ Ð²ÑÐ¾Ð´ (--password Ð¸Ð»Ð¸ Ð¸Ð½ÑÐµÑÐ°ÐºÑÐ¸Ð²Ð½ÑÐ¹ Ð·Ð°Ð¿ÑÐ¾Ñ).",
+  "hotkey_deps_reinstalled": "ÐÐ°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ {_e}.",
+  "protocol_summary": "Ð¡Ð²Ð¾Ð´ÐºÐ° Ð¿Ð¾ Ð¿ÑÐ¾ÑÐ¾ÐºÐ¾Ð»Ð°Ð¼ Ð°Ð¿ÑÑÑÐ¸Ð¼Ð¾Ð² {_e}: {m} Ð°Ð¿ÑÑÑÐ¸Ð¼(Ð¾Ð²) ÑÐµÑÐµÐ· MASQUE (HTTP/3 CONNECT-UDP â Ð¿ÑÐ¸Ð¾ÑÐ¸ÑÐµÑÐ½ÑÐ¹ Ð¿ÑÐ¾ÑÐ¾ÐºÐ¾Ð»), {c} Ð°Ð¿ÑÑÑÐ¸Ð¼(Ð¾Ð²) ÑÐµÑÐµÐ· HTTP CONNECT (ÑÑÐ½Ð½ÐµÐ»Ñ HTTPS-Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿Ð¾Ð²ÐµÑÑ TLS â Ð¾ÑÐºÐ°Ñ, ÐºÐ¾Ð³Ð´Ð° MASQUE Ð½Ðµ Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ).",
+  "proto_chosen_masque": "ÐÑÐ¾ÑÐ¾ÐºÐ¾Ð» Ð´Ð»Ñ {hp}: masque (HTTP/3 CONNECT-UDP) â Ð¿ÑÐ¸Ð¾ÑÐ¸ÑÐµÑÐ½ÑÐ¹ Ð¿ÑÐ¾ÑÐ¾ÐºÐ¾Ð»; ÑÑÐ½Ð½ÐµÐ»Ñ MASQUE Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ.",
+  "proto_fallback_connect": "ÐÑÐ¾ÑÐ¾ÐºÐ¾Ð» Ð´Ð»Ñ {hp}: HTTP CONNECT â Ð¾ÑÐºÐ°Ñ Ñ masque, ÐºÐ¾ÑÐ¾ÑÑÐ¹ Ð·Ð´ÐµÑÑ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½: {reason}",
+  "proto_masque_no_lib": "ÐÐ»Ñ masque Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ aioquic â Ð¾Ð½ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½, Ð¿Ð¾ÑÑÐ¾Ð¼Ñ Ð²ÑÐµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ Ð±ÑÐ´ÑÑ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÑ Ð¾ÑÐºÐ°Ñ HTTP CONNECT.",
+  "test_commands_header": "Ð§ÑÐ¾Ð±Ñ Ð¿ÑÐ¾ÑÐµÑÑÐ¸ÑÐ¾Ð²Ð°ÑÑ ÐÐÐÐÐÐ¬ÐÐ«Ð Ð¿ÑÐ¾ÐºÑÐ¸, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ ÑÑÐ¸ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ {_e}:",
+  "test_commands_hidden": "Ð¢ÐµÑÑÐ¾Ð²ÑÐµ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ curl ÑÐºÑÑÑÑ {_e} â Ð²ÐºÐ»ÑÑÐ¸ÑÐµ Ð¸Ñ Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÐ¾Ð¼ --show-test-commands (env MOZVPN_SHOW_TEST_COMMANDS=1).",
   "test_command_local": "  {_e} {cmd}   [{label}, {proto}]",
-  "test_commands_remote_header": "Чтобы протестировать АПСТРИМ (удалённые) прокси напрямую, используйте эти команды:",
+  "test_commands_remote_header": "Ð§ÑÐ¾Ð±Ñ Ð¿ÑÐ¾ÑÐµÑÑÐ¸ÑÐ¾Ð²Ð°ÑÑ ÐÐÐ¡Ð¢Ð ÐÐ (ÑÐ´Ð°Ð»ÑÐ½Ð½ÑÐµ) Ð¿ÑÐ¾ÐºÑÐ¸ Ð½Ð°Ð¿ÑÑÐ¼ÑÑ, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ ÑÑÐ¸ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ:",
   "test_command_remote": "  {_e} {cmd}   [{label}]",
-  "clear_will_remove_header": "Клавиша 'c' / 'r' / --clear-cache / --relogin удалит ВСЁ это {_e}:",
+  "clear_will_remove_header": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'c' / 'r' / --clear-cache / --relogin ÑÐ´Ð°Ð»Ð¸Ñ ÐÐ¡Ð ÑÑÐ¾ {_e}:",
   "clear_will_remove_entry": "  - {path}",
-  "clear_will_remove_dir": "  - {path} (весь каталог конфигурации — всё перечисленное выше находится внутри него)",
-  "clear_wiped_note": "Удалено: кэши сессии, сохранённые креденшелсы (email/пароль/секрет TOTP), cookie Fastly и конфиги sing-box. При свежем входе логин-данные запросятся заново.",
-  "jwt_decoded_header": "Расшифрованный proxyPass JWT {_e}:",
+  "clear_will_remove_dir": "  - {path} (Ð²ÐµÑÑ ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸ â Ð²ÑÑ Ð¿ÐµÑÐµÑÐ¸ÑÐ»ÐµÐ½Ð½Ð¾Ðµ Ð²ÑÑÐµ Ð½Ð°ÑÐ¾Ð´Ð¸ÑÑÑ Ð²Ð½ÑÑÑÐ¸ Ð½ÐµÐ³Ð¾)",
+  "clear_wiped_note": "Ð£Ð´Ð°Ð»ÐµÐ½Ð¾: ÐºÑÑÐ¸ ÑÐµÑÑÐ¸Ð¸, ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐµ ÐºÑÐµÐ´ÐµÐ½ÑÐµÐ»ÑÑ (email/Ð¿Ð°ÑÐ¾Ð»Ñ/ÑÐµÐºÑÐµÑ TOTP), cookie Fastly Ð¸ ÐºÐ¾Ð½ÑÐ¸Ð³Ð¸ sing-box. ÐÑÐ¸ ÑÐ²ÐµÐ¶ÐµÐ¼ Ð²ÑÐ¾Ð´Ðµ Ð»Ð¾Ð³Ð¸Ð½-Ð´Ð°Ð½Ð½ÑÐµ Ð·Ð°Ð¿ÑÐ¾ÑÑÑÑÑ Ð·Ð°Ð½Ð¾Ð²Ð¾.",
+  "jwt_decoded_header": "Ð Ð°ÑÑÐ¸ÑÑÐ¾Ð²Ð°Ð½Ð½ÑÐ¹ proxyPass JWT {_e}:",
   "jwt_decoded_part": "  {part} {json}",
-  "jwt_decoded_exp": "  exp (действителен до): {time} UTC   iat (выдан): {iat} UTC",
-  "confirm_exit_prompt": "Получен Ctrl+C. Нажмите Ctrl+C ещё раз в течение 5 с для подтверждения выхода, или подождите, чтобы продолжить.",
-  "confirm_exit_abort": "Выход отменён, продолжаю.",
-  "sigterm": "Получен сигнал завершения, останавливаюсь.",
-  "recommended_server": "Рекомендованный сервер: {country} / {city}",
+  "jwt_decoded_exp": "  exp (Ð´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÐµÐ½ Ð´Ð¾): {time} UTC   iat (Ð²ÑÐ´Ð°Ð½): {iat} UTC",
+  "confirm_exit_prompt": "ÐÐ¾Ð»ÑÑÐµÐ½ Ctrl+C. ÐÐ°Ð¶Ð¼Ð¸ÑÐµ Ctrl+C ÐµÑÑ ÑÐ°Ð· Ð² ÑÐµÑÐµÐ½Ð¸Ðµ 5 Ñ Ð´Ð»Ñ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ Ð²ÑÑÐ¾Ð´Ð°, Ð¸Ð»Ð¸ Ð¿Ð¾Ð´Ð¾Ð¶Ð´Ð¸ÑÐµ, ÑÑÐ¾Ð±Ñ Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð¸ÑÑ.",
+  "confirm_exit_abort": "ÐÑÑÐ¾Ð´ Ð¾ÑÐ¼ÐµÐ½ÑÐ½, Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð°Ñ.",
+  "sigterm": "ÐÐ¾Ð»ÑÑÐµÐ½ ÑÐ¸Ð³Ð½Ð°Ð» Ð·Ð°Ð²ÐµÑÑÐµÐ½Ð¸Ñ, Ð¾ÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÑÑÑ.",
+  "recommended_server": "Ð ÐµÐºÐ¾Ð¼ÐµÐ½Ð´Ð¾Ð²Ð°Ð½Ð½ÑÐ¹ ÑÐµÑÐ²ÐµÑ: {country} / {city}",
   "curl_hint": "    {_e} curl -x https://{host}:{port} --proxy-header \"Proxy-Authorization: Bearer {token}\" {echo}",
-  "test_running": "Тест {host}:{port} ...",
-  "test_external_ip": "Внешний IP: {ip}",
-  "waf_406": "HTTP 406 от *.firefox.com даже после автоматического решения challenge.\nПохоже, Fastly изменил разметку/алгоритм challenge. Сверьте regex'ы:\n  - github.com/pagpeter/fastly-antibot (pkg/solver/solver.go — regex'ы script id и token)\n  - PR #22 в Mikescher/firefox-sync-client (syncclient/fastly.go — порт этого алгоритма)\nФолбэк — переиспользуйте сессию Firefox:\n  1) Войдите в Mozilla-аккаунт в браузере Firefox (2FA вводится там).\n  2) Извлеките sessionToken из профиля, например утилитой firefox_decrypt\n     (github.com/unode/firefox_decrypt): запись «Firefox Accounts credentials»\n     хранит JSON с полем sessionToken.\n  3) Запустите:  python3 mozvpn.py --session-token <hex> --email you@example.com",
-  "session_token_hex": "sessionToken должен быть hex-строкой.",
-  "masque_no_aioquic": "aioquic не установлен",
+  "test_running": "Ð¢ÐµÑÑ {host}:{port} ...",
+  "test_external_ip": "ÐÐ½ÐµÑÐ½Ð¸Ð¹ IP: {ip}",
+  "waf_406": "HTTP 406 Ð¾Ñ *.firefox.com Ð´Ð°Ð¶Ðµ Ð¿Ð¾ÑÐ»Ðµ Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¾Ð³Ð¾ ÑÐµÑÐµÐ½Ð¸Ñ challenge.\nÐÐ¾ÑÐ¾Ð¶Ðµ, Fastly Ð¸Ð·Ð¼ÐµÐ½Ð¸Ð» ÑÐ°Ð·Ð¼ÐµÑÐºÑ/Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼ challenge. Ð¡Ð²ÐµÑÑÑÐµ regex'Ñ:\n  - github.com/pagpeter/fastly-antibot (pkg/solver/solver.go â regex'Ñ script id Ð¸ token)\n  - PR #22 Ð² Mikescher/firefox-sync-client (syncclient/fastly.go â Ð¿Ð¾ÑÑ ÑÑÐ¾Ð³Ð¾ Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼Ð°)\nÐ¤Ð¾Ð»Ð±ÑÐº â Ð¿ÐµÑÐµÐ¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ ÑÐµÑÑÐ¸Ñ Firefox:\n  1) ÐÐ¾Ð¹Ð´Ð¸ÑÐµ Ð² Mozilla-Ð°ÐºÐºÐ°ÑÐ½Ñ Ð² Ð±ÑÐ°ÑÐ·ÐµÑÐµ Firefox (2FA Ð²Ð²Ð¾Ð´Ð¸ÑÑÑ ÑÐ°Ð¼).\n  2) ÐÐ·Ð²Ð»ÐµÐºÐ¸ÑÐµ sessionToken Ð¸Ð· Ð¿ÑÐ¾ÑÐ¸Ð»Ñ, Ð½Ð°Ð¿ÑÐ¸Ð¼ÐµÑ ÑÑÐ¸Ð»Ð¸ÑÐ¾Ð¹ firefox_decrypt\n     (github.com/unode/firefox_decrypt): Ð·Ð°Ð¿Ð¸ÑÑ Â«Firefox Accounts credentialsÂ»\n     ÑÑÐ°Ð½Ð¸Ñ JSON Ñ Ð¿Ð¾Ð»ÐµÐ¼ sessionToken.\n  3) ÐÐ°Ð¿ÑÑÑÐ¸ÑÐµ:  python3 mozvpn.py --session-token <hex> --email you@example.com",
+  "session_token_hex": "sessionToken Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ hex-ÑÑÑÐ¾ÐºÐ¾Ð¹.",
+  "masque_no_aioquic": "aioquic Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½",
   "masque_probe_error": "{err}",
-  "builtin_connect_failed": "Не удалось подключиться к апстриму: {err}",
-  "builtin_no_token": "proxyPass-токен ещё не получен",
+  "builtin_connect_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ¸ÑÑÑÑ Ðº Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ: {err}",
+  "builtin_no_token": "proxyPass-ÑÐ¾ÐºÐµÐ½ ÐµÑÑ Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½",
 },
 }
 
@@ -1187,6 +1762,26 @@ _EMOJI = {
     "proxy_check_masque_fallback": "\U0001F501 ",  # arrows (protocol switch)
     "proxy_check_connect_fail": "\u2753 ",   # question mark (unconfirmed, served anyway)
     "proxy_check_disabled": "\U0001F6AB ",   # prohibited (check off)
+    "doh_selected": "\U0001F310 ",       # globe (DNS resolver)
+    "doh_system": "\U0001F310 ",
+    "doh_chain": "\U0001F517 ",           # link (fallback chain)
+    "doh_geo_mismatch": "\U0001F5FA ",   # world map (geo check)
+    "doh_geo_ok": "\U0001F5FA ",
+    "hotkey_doh": "\U0001F310 ",
+    "locked_note": "\U00002139 ",
+    "geo_echo_no_geo": "\U0001F5FA ",     # geo check skipped note
+    "foxyproxy_no_proxies": "\U0001F98A ",   # fox
+    "foxyproxy_export_done": "\U0001F98A ",  # fox
+    "foxyproxy_export_cancel": "\U0001F98A ",
+    "foxyproxy_import_hint": "\U0001F98A ",
+    "doh_cache_state_on": "\U0001F4BE ",
+    "doh_cache_state_off": "\U0001F4BE ",
+    "doh_menu_hint": "\U0001F310 ",
+    "doh_menu_entry": "\U0001F310 ",
+    "hotkey_doh_cache": "\U0001F4BE ",
+    "select_hint": "\u2328 ",
+    "select_buffer": "\u2328 ",
+    "select_bad": "\U0000274C ",
     "upstream_override": "\U0001F9ED ",      # compass (route override)
     "next_refresh": "\u23F3 ",              # hourglass
     "confirm_exit_prompt": "\u2753 ",
@@ -1368,6 +1963,35 @@ _EMOJI = {
     "no_free_ports": "\u274C ",
     "no_servers_to_serve": "\u274C ",
     "singbox_missing": "\u274C ",
+    # v5.2 (req. 2): emoji for the messages that had none
+    "answer_no_words": "\U0001F937 ",        # shrug
+    "answer_yes_words": "\U0001F44D ",       # thumbs up
+    "blocked_extra_method": "\U0001F6A8 ",   # police light (WAF block)
+    "builtin_connect_failed": "\U0001F6A8 ",
+    "builtin_no_token": "\U0001F6A8 ",
+    "cache_clear_failed": "\u274C ",
+    "cache_cleared": "\U0001F9F9 ",          # broom (cache wiped)
+    "cache_nothing": "\U0001F937 ",
+    "clock_skew": "\U0001F557 ",             # clock (time skew)
+    "config_file_dir": "\U0001F4C1 ",        # folder
+    "config_file_exists": "\U0001F4C1 ",
+    "config_file_missing": "\U0001F4C1 ",
+    "deps_need_optional": "\U0001F9EA ",     # test tube (optional dep)
+    "deps_need_required": "\U0001F9EA ",
+    "engine_builtin": "\U0001F534 ",         # red circle (builtin engine)
+    "engine_singbox": "\U0001F7E0 ",        # orange circle (sing-box)
+    "enter_email": "\U0001F4E9 ",           # inbox tray (prompt)
+    "enter_password": "\U0001F510 ",        # lock with key
+    "masque_no_aioquic": "\U0001F4E6 ",     # package (lib missing)
+    "masque_probe_error": "\u274C ",
+    "qr_verify_mismatch": "\u274C ",
+    "qr_verify_q": "\U0001F5B3 ",            # question (ask)
+    "retry_after": "\U000023F3 ",            # hourglass
+    "server_wants_method": "\U0001F4E4 ",   # outbox (server requires)
+    "stretch_v2_note": "\U00002139 ",
+    "tls_plain_http": "\U000026A0 ",
+    "totp_none_reason_nocreds": "\U0001F510 ",
+    "totp_none_reason_nosecret": "\U0001F510 ",
 }
 
 def tr(key: str, **kw) -> str:
@@ -1496,12 +2120,14 @@ def set_theme(name: str):
 # hostnames[:port], protocol names, sizes, UTC times, n/total counters.
 _RE_TOKENS = re.compile(
     r'(?P<url>\bhttps?://[^\s,;)"\']+)'
+    r'|(?P<email>\b[\w.+-]+@[\w-]+(?:\.[A-Za-z]{2,})+\b)'
     r'|(?P<jwt>\b[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{20,}){2,}\b)'
     r'|(?P<path>(?:[A-Za-z]:)?[\\/][\w .-]*(?:[\\/][\w .-]+)+'
     r'|~?/[\w.-]*(?:/[\w.-]+)+)'
     r'|(?P<ip>\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b)'
     r'|(?P<host>\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+'
     r'[A-Za-z]{2,}(?::\d{1,5})?(?![\w.-]))'
+    r'|(?P<cc>\b[A-Z]{2}\b)'
     r'|(?P<proto>\b(?:connect-udp|connect-ip|masque|connect)\b)'
     r'|(?P<flag>(?<=\s)--[\w][\w-]*)'
     r'|(?P<key>(?<=\')[a-z0-9](?=\')|(?<=\s)[1-9]-[1-9](?=\s[-\u2014]\s)|(?<=\s)[a-z0-9](?=\s[-\u2014]\s))'
@@ -2715,6 +3341,15 @@ def normalize_serverlist(records, firefox_version: str,
                                "cityCode": first["cityCode"],
                                "servers": [s for c in cities_out.values()
                                            for s in c["servers"]]}
+            # v5.0: the recommended anycast egress (p.m1.fastly-masque.net)
+            # is served as its OWN location too - one more local proxy,
+            # exactly like Firefox's 'Recommended' server choice.
+            rec_c = countries.setdefault("REC", {
+                "countryCode": "REC",
+                "countryName": r.get("name") or "Recommended",
+                "locked": locked,
+                "cities": {}})
+            rec_c["cities"].update(cities_out)
             continue
         c = countries.setdefault(cc, {
             "countryCode": cc,
@@ -2832,12 +3467,19 @@ def _peek_plain(raw: socket.socket) -> str:
 def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
     """TCP + TLS to the egress with a fallback matrix of ClientHello profiles.
     Raises the last error, annotated with a plaintext peek when the peer
-    answered something that was not TLS at all."""
+    answered something that was not TLS at all.
+    v5.6 probe speedup: the hostname is resolved ONCE before the profile
+    loop and the resolved IP list is reused by every profile attempt -
+    previously each of the 4 attempts ran a FRESH DoH resolution (and the
+    in-probe echo fallback 4 more), which with the DoH cache off and a
+    slow/blocked first DoH provider added many seconds to EVERY probe
+    (the '10+ seconds' live-run complaint)."""
     last_err = None
+    ips = resolve_host(host)          # v5.6: resolve once, reuse below
     for name, ctx in _tls_profiles():
         raw = None
         try:
-            raw = socket.create_connection((host, port), timeout=timeout)
+            raw = _connect_resolved_ips(ips, host, port, timeout)
             raw.settimeout(timeout)
             return ctx.wrap_socket(raw, server_hostname=host)
         except Exception as e:
@@ -2852,15 +3494,77 @@ def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
                 pass
     raise last_err if last_err else MozVpnError(f"TLS to {host}:{port} failed")
 
-def _http_ip_request_over_tunnel(tunnel: "ssl.SSLSocket", host_header: str) -> str:
+def _http_dechunked_body(raw: bytes) -> tuple:
+    """v5.4: split a raw HTTP/1.1 response into (status, headers, body)
+    with a REAL parser - not the naive 'split once on \\r\\n\\r\\n' of
+    v5.2/v5.3. Handles Content-Length AND 'Transfer-Encoding: chunked'
+    (RFC 9112 section 7.1 - the standard HTTP/1.1 framing): ipinfo.io
+    answers /json with a chunked body, so the old parser handed the
+    JSON decoder a body polluted with hex chunk-size lines and the
+    probe failed on EVERY upstream (live log 2026-09-25: 33/33 'data
+    check not passed'). Returns (status_line, header_dict, body_bytes);
+    ('', {}, b'') when the response is unusable."""
+    parts = raw.split(b"\r\n\r\n", 1)
+    if len(parts) != 2:
+        return "", {}, b""
+    head, rest = parts
+    head_lines = head.split(b"\r\n")
+    if not head_lines:
+        return "", {}, b""
+    status = head_lines[0].decode("latin-1", "replace")
+    headers = {}
+    for line in head_lines[1:]:
+        if b":" in line:
+            k, v = line.split(b":", 1)
+            headers[k.decode("latin-1").strip().lower()] = \
+                v.decode("latin-1").strip()
+    if headers.get("transfer-encoding", "").lower().find("chunked") >= 0:
+        body = b""
+        buf = rest
+        while True:
+            # chunk-size line (may carry chunk extensions after ';')
+            cut = buf.find(b"\r\n")
+            if cut < 0:
+                break
+            size_token = buf[:cut].split(b";")[0].strip()
+            try:
+                size = int(size_token, 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            chunk = buf[cut + 2:cut + 2 + size]
+            buf = buf[cut + 2 + size + 2:] if len(buf) >= cut + 2 + size + 2 \
+                else b""
+            body += chunk
+            if len(body) > 262144:
+                break
+        return status, headers, body
+    cl = headers.get("content-length")
+    if cl and cl.isdigit():
+        n = int(cl)
+        if n <= len(rest):
+            return status, headers, rest[:n]
+        return status, headers, rest
+    # no framing info: read-to-EOF body is whatever we collected
+    return status, headers, rest
+
+def _http_ip_request_over_tunnel(tunnel: "ssl.SSLSocket", host_header: str,
+                                 path: str = "/") -> str:
     """Send a plain HTTP/1.1 GET through an established (decrypted) TLS tunnel
-    and return the body. Used to verify data actually flows through a proxy."""
-    req_bytes = (f"GET / HTTP/1.1\r\nHost: {host_header}\r\n"
-                 "User-Agent: curl/8.0\r\nAccept: */*\r\n"
+    and return the body. Used to verify data actually flows through a proxy.
+    v5.4: 'Accept-Encoding: identity' prevents a gzip body the JSON parser
+    cannot read; the response is parsed by _http_dechunked_body() so chunked
+    replies (ipinfo.io/json) decode correctly; the wait was 15 s -> 10 s so a
+    dead upstream fails the probe faster (the 'very long probes' complaint
+    of the live run)."""
+    req_bytes = (f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\n"
+                 "User-Agent: Mozilla/5.0 (mozvpn probe)\r\n"
+                 "Accept: */*\r\nAccept-Encoding: identity\r\n"
                  "Connection: close\r\n\r\n").encode()
     tunnel.sendall(req_bytes)
     chunks = []
-    tunnel.settimeout(15)
+    tunnel.settimeout(6)
     try:
         while True:
             b = tunnel.recv(4096)
@@ -2871,27 +3575,28 @@ def _http_ip_request_over_tunnel(tunnel: "ssl.SSLSocket", host_header: str) -> s
                 break
     except socket.timeout:
         pass
-    raw = b"".join(chunks)
-    parts = raw.split(b"\r\n\r\n", 1)
-    return parts[1].decode("utf-8", "replace").strip() if len(parts) == 2 else ""
+    status, headers, body = _http_dechunked_body(b"".join(chunks))
+    return body.decode("utf-8", "replace").strip() if body else ""
 
-def probe_connect(server: dict, token: str, echo_url: str) -> "tuple[bool, str]":
-    """Probe one upstream via HTTP CONNECT: open TLS to the egress, send
-    CONNECT <echo-host>:443 with Proxy-Authorization: Bearer <proxyPass>,
-    then run a real HTTPS request to the IP-echo service through the tunnel.
-    Returns (ok, detail). Data must actually flow - a bare 200 is not enough."""
-    u = urlparse(echo_url)
-    echo_host = u.hostname
-    echo_port = u.port or 443
+def _hp(host: str, port, width: int = 34) -> str:
+    """v5.2 (req. 1): 'host:port' padded with spaces to a FIXED width, so
+    the per-upstream probe / geo / protocol log lines all start their
+    message text in the SAME column regardless of the hostname length."""
+    return f"{host}:{port}".ljust(width)
+
+def _connect_tunnel_open(server: dict, token: str,
+                         dst_host: str, dst_port: int):
+    """v5.4 helper: TLS to the egress + HTTP CONNECT to dst_host:dst_port.
+    Returns (tls_socket, None) or (None, error_detail)."""
     try:
         tls = _tls_connect(server["protocolHost"], server["protocolPort"],
-                           timeout=15)
+                           timeout=5)
     except Exception as e:
-        return False, f"TLS to upstream failed: {e}"
+        return None, f"TLS to upstream failed: {e}"
     try:
-        tls.settimeout(20)
-        connect_req = (f"CONNECT {echo_host}:{echo_port} HTTP/1.1\r\n"
-                       f"Host: {echo_host}:{echo_port}\r\n"
+        tls.settimeout(6)
+        connect_req = (f"CONNECT {dst_host}:{dst_port} HTTP/1.1\r\n"
+                       f"Host: {dst_host}:{dst_port}\r\n"
                        f"Proxy-Authorization: Bearer {token}\r\n"
                        "Proxy-Connection: keep-alive\r\n\r\n")
         tls.sendall(connect_req.encode())
@@ -2903,16 +3608,133 @@ def probe_connect(server: dict, token: str, echo_url: str) -> "tuple[bool, str]"
             resp += chunk
         first_line = resp.split(b"\r\n", 1)[0].decode("latin-1", "replace")
         if " 200" not in first_line:
-            return False, f"CONNECT refused: {first_line}"
-        # 200 alone proves nothing: verify real data transfer through the tunnel
-        inner = _ssl_ctx().wrap_socket(tls, server_hostname=echo_host)
-        body = _http_ip_request_over_tunnel(inner, echo_host)
-        # The response must look like an IPv4/IPv6 address
-        if re.fullmatch(r"[0-9a-fA-F.:]+", body or ""):
-            return True, body
-        return False, f"no IP in echo response: {body[:60]!r}"
+            try:
+                tls.close()
+            except Exception:
+                pass
+            return None, f"CONNECT refused: {first_line}"
+        return tls, None
     except Exception as e:
-        return False, f"{e!r}"
+        try:
+            tls.close()
+        except Exception:
+            pass
+        return None, f"{e!r}"
+
+def probe_connect(server: dict, token: str, echo_url: str
+                  ) -> "tuple[bool, str, str | None, str | None]":
+    """Probe one upstream via HTTP CONNECT with a SINGLE request (v5.2,
+    req. 3): open TLS to the egress, send CONNECT <echo-host>:443 with
+    Proxy-Authorization: Bearer <proxyPass>, then run ONE real HTTPS
+    request to the IP-echo service through the tunnel. With the default
+    echo service (ipinfo.io/json) the SAME single response carries the
+    external IP AND the exit geo (country ISO code + city); a plain-IP
+    echo service (ipify etc.) returns the IP only and geo stays None.
+    v5.4: if the primary echo body cannot be parsed (a CDN-side change,
+    an unexpected encoding, a truncated chunked body), ONE retry goes to
+    https://checkip.amazonaws.com - a plain-text 'x.x.x.x\\n' endpoint
+    with no JSON and no chunking - through a FRESH tunnel, so one flaky
+    echo service can no longer fail all probes (live log 2026-09-25:
+    33/33 'data check not passed' while the tunnels were fine).
+    Returns (ok, ip, geo_country, geo_city). Data must actually flow -
+    a bare 200 is not enough."""
+    u = urlparse(echo_url)
+    echo_host = u.hostname
+    echo_port = u.port or 443
+    echo_path = u.path or "/"
+
+    def _one_echo(dst_host: str, dst_port: int, path: str
+                  ) -> "tuple[bool, str, str | None, str | None]":
+        """One full attempt: fresh tunnel to dst_host, one HTTPS request,
+        parse the body. Returns (ok, ip, geo, city); geo only from a JSON
+        echo that carries country/city fields."""
+        tls, err = _connect_tunnel_open(server, token, dst_host, dst_port)
+        if tls is None:
+            return False, err, None, None
+        try:
+            # 200 alone proves nothing: verify real data transfer through
+            # the tunnel
+            inner = _ssl_ctx().wrap_socket(tls, server_hostname=dst_host)
+            body = _http_ip_request_over_tunnel(inner, dst_host, path)
+            ip = geo = city = None
+            try:
+                data = json.loads(body)
+                if isinstance(data, dict) and data.get("ip"):
+                    ip = str(data["ip"]).strip()
+                    geo = (str(data.get("country") or "").strip().upper()
+                           or None)
+                    city = (str(data.get("city") or "").strip() or None)
+            except Exception:
+                pass
+            if ip is None and re.fullmatch(r"[0-9a-fA-F.:]+", body or ""):
+                ip = body.strip()
+            if ip:
+                return True, ip, geo, city
+            return False, f"no IP in echo response: {body[:60]!r}", None, None
+        except Exception as e:
+            return False, f"{e!r}", None, None
+        finally:
+            try:
+                tls.close()
+            except Exception:
+                pass
+
+    ok, ip, geo, city = _one_echo(echo_host, echo_port, echo_path)
+    if ok:
+        return ok, ip, geo, city
+    primary_detail = ip
+    # v5.6 probe speedup: the fallback makes sense ONLY when a tunnel was
+    # established but the echo BODY could not be parsed (the v5.4 purpose:
+    # one flaky echo service must not fail all probes). When the failure is
+    # at the TLS/CONNECT stage (a filtering network), a second tunnel to
+    # checkip.amazonaws.com fails IDENTICALLY - it only doubled the probe
+    # time, so it is skipped.
+    if not str(primary_detail).startswith("no IP in echo response"):
+        return False, str(primary_detail)[:120], None, None
+    # v5.4 in-probe fallback: the primary echo answer was unusable ->
+    # ONE retry through the guaranteed plain-text endpoint (fresh tunnel).
+    ok2, ip2, _geo2, _city2 = _one_echo("checkip.amazonaws.com", 443, "/")
+    if ok2:
+        return True, ip2, None, None
+    return False, f"primary: {str(primary_detail)[:60]} | fallback: " \
+                  f"{str(ip2)[:60]}", None, None
+
+def probe_geo(server: dict, token: str) -> "tuple[str | None, str | None]":
+    """v5.0: open a CONNECT tunnel to ipinfo.io and read the JSON with the
+    country and city of the egress PoP. Returns (country_code, city);
+    (None, None) when the check could not run. v5.2: the default probe
+    now gets the geo from the SAME single ipinfo.io/json answer (one
+    request per upstream, req. 3), so this function is NOT called on the
+    regular path anymore - it is KEPT as working functionality for
+    custom scripts and possible future use (e.g. a manual re-check of a
+    suspect egress)."""
+    try:
+        tls = _tls_connect(server["protocolHost"], server["protocolPort"],
+                           timeout=8)
+    except Exception:
+        return None, None
+    try:
+        tls.settimeout(10)
+        req = ("CONNECT ipinfo.io:443 HTTP/1.1\r\nHost: ipinfo.io:443\r\n"
+               f"Proxy-Authorization: Bearer {token}\r\n"
+               "Proxy-Connection: keep-alive\r\n\r\n")
+        tls.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = tls.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        if b" 200" not in resp.split(b"\r\n", 1)[0]:
+            return None, None
+        inner = _ssl_ctx().wrap_socket(tls, server_hostname="ipinfo.io")
+        body = _http_ip_request_over_tunnel(inner, "ipinfo.io")
+        data = json.loads(body)
+        country = str(data.get("country") or "").strip().upper() or None
+        city = str(data.get("city") or "").strip() or None
+        return country, city
+    except Exception:
+        return None, None
     finally:
         try:
             tls.close()
@@ -2966,10 +3788,11 @@ def probe_masque(server: dict, token: str, echo_url: str) -> "tuple[bool, str]":
                 h3.send_headers(stream_id=stream_id, headers=headers, end_stream=True)
                 client.transmit()
                 # Data-transfer verification: keep the QUIC session alive for a
-                # few seconds. A server that does not support connect-udp resets
+                # few seconds (v5.4: 8 -> 5, the live-run 'long probes'
+                # complaint). A server that does not support connect-udp resets
                 # the stream / closes the connection; if the session survives
                 # and headers were sent, we treat the probe as successful.
-                deadline = time.time() + 8
+                deadline = time.time() + 5
                 closed = False
                 while time.time() < deadline:
                     await asyncio.sleep(0.1)
@@ -2992,19 +3815,48 @@ def check_upstream(server: dict, token: str, echo_url: str) -> dict:
         ok_m, detail_m = probe_masque(server, token, echo_url)
         if ok_m:
             return {"server": server, "protocol": PROTO_MASQUE,
-                    "ok": True, "detail": detail_m}
+                    "ok": True, "detail": detail_m,
+                    "geo": None, "geoCity": None}
         # MASQUE failed -> automatic fallback to HTTP CONNECT (req. 2)
         fallback = dict(server, protocol=PROTO_CONNECT)
-        ok_c, detail_c = probe_connect(fallback, token, echo_url)
+        ok_c, detail_c, geo_c, city_c = probe_connect(fallback, token, echo_url)
         return {"server": fallback, "protocol": PROTO_CONNECT,
                 "ok": ok_c, "detail": detail_c,
+                "geo": geo_c, "geoCity": city_c,
                 "masque_fallback_reason": detail_m}
-    ok_c, detail_c = probe_connect(server, token, echo_url)
+    ok_c, detail_c, geo_c, city_c = probe_connect(server, token, echo_url)
     return {"server": server, "protocol": PROTO_CONNECT,
-            "ok": ok_c, "detail": detail_c}
+            "ok": ok_c, "detail": detail_c,
+            "geo": geo_c, "geoCity": city_c}
+
+def _probe_reason_public(detail: str) -> str:
+    """v5.8: map a raw probe-failure detail to a short human-readable
+    reason class for the ONE compact probe summary line. The raw
+    exception reprs (SSLError(1, '[SSL: UNEXPECTED_MESSAGE] unexpected
+    message ...')) scare the user without helping: a probe failure is an
+    expected outcome when the local network or the egress side blocks
+    the tunnel, and the upstream is served anyway (the default). The
+    full raw detail of every probe stays in the result dicts / the JSON
+    output; only the console wording becomes friendly."""
+    d = str(detail or "").lower()
+    if "connect refused" in d:
+        return tr("probe_reason_declined")
+    if "timed out" in d or "timeout" in d:
+        return tr("probe_reason_timeout")
+    if "ssl" in d or "tls" in d or "handshake" in d or "certificate" in d:
+        return tr("probe_reason_tls")
+    if "refused" in d:
+        return tr("probe_reason_refused")
+    if "reset" in d:
+        return tr("probe_reason_reset")
+    if "unreachable" in d:
+        return tr("probe_reason_unreachable")
+    if "no ip in echo response" in d:
+        return tr("probe_reason_echo")
+    return tr("probe_reason_other")
 
 def probe_upstreams_parallel(servers: list, token: str, echo_url: str,
-                             echo_name: str, max_workers: int = 16) -> list:
+                             echo_name: str, max_workers: int = 32) -> list:
     """Probe all upstreams in parallel (req. 7) and return the list of result
     dicts. Logging is done AFTER all checks complete as grouped summary
     lines so parallel output does not interleave."""
@@ -3024,59 +3876,296 @@ def probe_upstreams_parallel(servers: list, token: str, echo_url: str,
             except Exception as e:
                 results.append({"server": None, "protocol": PROTO_CONNECT,
                                 "ok": False, "detail": repr(e)})
-    # Aggregate summary output
+    # v5.8: the probe result is ONE compact message about ALL upstreams
+    # (the live v5.7 run printed one fail line per upstream - 33 lines
+    # with raw SSLError reprs - plus two long host-list summary lines).
+    # The per-upstream protocol details stay in the result dicts (and the
+    # JSON output); the console gets: one ok line when everything passed,
+    # otherwise ONE info line with the pass count and a grouped,
+    # human-readable breakdown of the failure reasons. A failed probe is
+    # NOT a script error - the upstream is served anyway by default, so
+    # the wording stays neutral (info level, never err/warn).
     ok_list = [r for r in results if r["ok"]]
     fail_list = [r for r in results if not r["ok"]]
-    for r in ok_list:
-        s = r["server"]
-        if r["protocol"] == PROTO_MASQUE:
-            ok(tr("proxy_check_masque_ok", host=s["protocolHost"],
-                  port=s["protocolPort"]))
-            ok(tr("proto_chosen_masque", host=s["protocolHost"],
-                  port=s["protocolPort"]))
-        else:
-            ok(tr("proxy_check_connect_ok", host=s["protocolHost"],
-                  port=s["protocolPort"], ip=r["detail"]))
-        if r.get("masque_fallback_reason"):
-            info(tr("proxy_check_masque_fallback",
-                    host=s["protocolHost"], port=s["protocolPort"]))
-            info(tr("proto_fallback_connect",
-                    host=s["protocolHost"], port=s["protocolPort"],
-                    reason=str(r["masque_fallback_reason"])[:80]))
-    # A failed probe is NOT a script error - it is an informational result
-    # of the check (the upstream stays in the served list by default), so
-    # these lines use the info level and neutral wording, never err/warn.
-    # The raw transport exception is deliberately NOT printed: it is the
-    # expected outcome when the local network filters the egress.
-    for r in fail_list:
-        if r["server"] is None:
-            info(tr("proxy_check_connect_fail", host="?", port="?"))
-            continue
-        s = r["server"]
-        info(tr("proxy_check_connect_fail", host=s["protocolHost"],
-               port=s["protocolPort"]))
-        if r.get("masque_fallback_reason"):
-            info(tr("proto_fallback_connect",
-                    host=s["protocolHost"], port=s["protocolPort"],
-                    reason=str(r["masque_fallback_reason"])[:80]))
     ok_n, total = len(ok_list), len(results)
     if fail_list:
-        info(tr("proxy_check_summary_fail",
-                n=len(fail_list), total=total,
-                list=", ".join(f"{r['server']['protocolHost']}"
-                               for r in fail_list if r["server"]) or "?"))
-    ok(tr("proxy_check_summary_ok", n=ok_n, total=total,
-          list=", ".join(f"{r['server']['protocolHost']}[{r['protocol']}]"
-                         for r in ok_list) or "-"))
+        counts = {}
+        for r in fail_list:
+            reason = _probe_reason_public(str(r.get("detail") or ""))
+            counts[reason] = counts.get(reason, 0) + 1
+        breakdown = ", ".join(f"{n}x {reason}"
+                              for reason, n in sorted(counts.items(),
+                                                     key=lambda kv: -kv[1]))
+        info(tr("proxy_check_summary_fail", n=ok_n, total=total,
+                n_fail=len(fail_list), breakdown=breakdown))
+    else:
+        ok(tr("proxy_check_summary_ok", n=ok_n, total=total))
     return results
+
+# ---------------------------------------------------------------------------
+# FoxyProxy Standard export (v5.7): settings files for the local proxies
+# started by THIS script, for FoxyProxy Standard v9.8 (the current AMO
+# release; verified against the official sources at
+# github.com/foxyproxy/browser-extension, src/content/*.js, v9.8):
+#   - The v5.6 LEGACY export used a 'proxySettings' ARRAY - but
+#     migrate.js convert7() extracts proxies ONLY from TOP-LEVEL object
+#     keys (Object.values(pref).filter(i => i && ['address','type']
+#     .some(p => Object.hasOwn(i, p)))), so a 'proxySettings' array is
+#     silently dropped -> FoxyProxy showed an EMPTY proxy list after
+#     'Import from older versions'. v5.7: the legacy file is the REAL
+#     FoxyProxy 6/7 shape - every proxy as its own top-level 'k<id>'
+#     key (exactly how the FoxyProxy 6/7 export stores them) plus the
+#     {mode, sync, logging} keys; convert7() then finds every proxy.
+#   - The CURRENT-format 'Import' button (options.js: FS.import ->
+#     JSON.parse -> Object.assign(pref, data)) takes the pref keys as
+#     they are, so the v5.7 current-format file is COMBINED: the full
+#     current pref shape ({mode, sync, autoBackup, passthrough, theme,
+#     container, commands, data: [...]}) PLUS the same proxies as
+#     top-level 'k<id>' entries - it imports via ANY FoxyProxy import
+#     path (the 'Import' button reads 'data', 'Import from older
+#     versions' reads the 'k<id>' entries), so a wrong picker can no
+#     longer produce an empty list.
+#   - After ANY import the user must click 'Save' (the FoxyProxy import
+#     only renders the settings into the UI; Save persists them) - the
+#     import hint and the hotkey help both say it now.
+#   - cc values are sanitized to the schema (^([A-Z]{2}|)$): the
+#     recommended-location record ('REC') becomes '' (no flag icon),
+#     'UK' becomes 'GB' (convert7() maps UK -> GB as well).
+# ---------------------------------------------------------------------------
+
+FOXYPROXY_COLORS = ["#0055E5", "#00C853", "#D50000", "#AA00FF", "#FF6D00",
+                    "#00B8D4", "#C62828", "#6A1B9A", "#2E7D32", "#F57F17"]
+
+def _foxyproxy_cc(p: dict) -> str:
+    """v5.7: a schema-valid country code for FoxyProxy: two uppercase
+    letters or '' (the 'REC' recommended-location record and any other
+    non-ISO value -> ''), 'UK' -> 'GB' (convert7() maps UK -> GB too)."""
+    cc = str(p.get("countryCode") or "").strip().upper()
+    if len(cc) != 2 or not cc.isalpha():
+        return ""
+    return "GB" if cc == "UK" else cc
+
+def _foxyproxy_title(p: dict) -> str:
+    """v5.7: one title builder for BOTH export formats (so the same
+    proxy always has the same name in FoxyProxy, whatever file was
+    imported): 'mozvpn <CC> <city|label> [<local port>]'."""
+    return (f"mozvpn {_foxyproxy_cc(p)} "
+            f"{p.get('city') or p.get('label') or ''} [{p['port']}]")
+
+def _foxyproxy_v67_entries(proxies: list, listen_host: str) -> list:
+    """v5.7: the FoxyProxy 6/7 proxy entries - [(key, entry), ...] with
+    the entry in the exact shape migrate.js convert7() consumes: a
+    top-level 'k<id>' key whose value carries {title, type: 1 (http),
+    address, port (NUMBER), username, password, cc, color, active,
+    proxyDNS, whitePatterns[{title, active, pattern, type: 1 (wildcard),
+    protocols: 1 (all)}], blackPatterns[...], index, id}; id == the key
+    (that is how the FoxyProxy 6/7 export names them)."""
+    def _pat(pattern: str, title: str) -> dict:
+        # convert7() pattern item: type 1 = wildcard, protocols 1 = all
+        return {"title": title, "active": True, "pattern": pattern,
+                "type": 1, "protocols": 1}
+    entries = []
+    for i, p in enumerate(proxies):
+        name = _foxyproxy_title(p)
+        key = f"k{int(hashlib.sha256(name.encode()).hexdigest(), 16) % 10**17}"
+        entries.append((key, {
+            "title": name,
+            "type": 1,                  # PROXY_TYPE_HTTP (convert7 typeSet)
+            "address": listen_host,
+            "port": int(p["port"]),
+            "username": "",
+            "password": "",
+            "cc": _foxyproxy_cc(p),
+            "color": FOXYPROXY_COLORS[i % len(FOXYPROXY_COLORS)],
+            "active": True,
+            "proxyDNS": False,          # HTTP proxy: DNS stays local
+            "whitePatterns": [_pat("*", "all")],
+            "blackPatterns": [
+                _pat("localhost", "localhost"),
+                _pat("127.0.0.1", "127.0.0.1"),
+                _pat("::1", "::1"),
+                _pat("10.*", "10.*"),
+                _pat("172.16.*", "172.16.*"),
+                _pat("192.168.*", "192.168.*"),
+            ],
+            "index": i,
+            "id": key,
+        }))
+    return entries
+
+def foxyproxy_settings_json(proxies: list, listen_host: str) -> str:
+    """v5.7: build the FoxyProxy Standard settings JSON for the top
+    'Import' button of the Options page - and, being COMBINED, for ANY
+    FoxyProxy import path. Part 1 (current v8+/v9.x pref shape, verified
+    against src/content/schema.json of the v9.8 sources): {mode, sync,
+    autoBackup, passthrough, theme, container, commands, data: [{active,
+    title, type ('http'), hostname, port (STRING), username, password,
+    cc, city, color, pac, pacString, proxyDNS, include[], exclude[],
+    tabProxy[]}]}. Part 2: the SAME proxies as top-level 'k<id>' entries
+    (the FoxyProxy 6/7 shape) so 'Import from older versions'
+    (migrate.js convert7) finds them too - Object.assign(pref, data)
+    copies the extra keys harmlessly. 'mode': 'disable' = import without
+    surprise traffic rerouting; the user then picks a proxy from the
+    FoxyProxy toolbar popup."""
+    data = []
+    for i, p in enumerate(proxies):
+        data.append({
+            "active": True,
+            "title": _foxyproxy_title(p),
+            "type": "http",
+            "hostname": listen_host,
+            "port": str(p["port"]),          # schema: port is a STRING
+            "username": "",
+            "password": "",
+            "cc": _foxyproxy_cc(p),          # schema: '' or two letters
+            "city": str(p.get("city") or ""),
+            "color": FOXYPROXY_COLORS[i % len(FOXYPROXY_COLORS)],
+            "pac": "",
+            "pacString": "",
+            "proxyDNS": False,               # HTTP proxy -> DNS stays local
+            "include": [],
+            "exclude": [
+                {"type": "wildcard", "title": "localhost",
+                 "pattern": "localhost", "active": True},
+                {"type": "wildcard", "title": "127.0.0.1",
+                 "pattern": "127.0.0.1", "active": True},
+                {"type": "wildcard", "title": "::1",
+                 "pattern": "::1", "active": True},
+                {"type": "wildcard", "title": "10.*",
+                 "pattern": "10.*", "active": True},
+                {"type": "wildcard", "title": "172.16.*",
+                 "pattern": "172.16.*", "active": True},
+                {"type": "wildcard", "title": "192.168.*",
+                 "pattern": "192.168.*", "active": True},
+            ],
+            "tabProxy": [],
+        })
+    settings = {"mode": "disable", "sync": False, "autoBackup": False,
+                "passthrough": ("localhost, 127.0.0.1, ::1, "
+                                "10.0.0.0/8, 172.16.0.0/12, "
+                                "192.168.0.0/16, 169.254.0.0/16"),
+                "theme": "", "container": {}, "commands": {},
+                "data": data}
+    # Part 2: the same proxies in the FoxyProxy 6/7 shape, top-level -
+    # the ONLY place convert7() looks for proxies.
+    for key, entry in _foxyproxy_v67_entries(proxies, listen_host):
+        settings[key] = entry
+    return json.dumps(settings, indent=2, ensure_ascii=False)
+
+def foxyproxy_legacy_json(proxies: list, listen_host: str) -> str:
+    """v5.7: build the LEGACY FoxyProxy settings JSON - the REAL FoxyProxy
+    6/7 'FoxyProxy_YYYY-MM-DD.json' export shape, which is what FoxyProxy
+    Standard v8+/9.x ACTUALLY parses on 'Import from older versions'
+    (verified against the official extension sources, v9.8: fs.js reads
+    the file with JSON.parse only - it accepts just the text/plain and
+    application/json MIME types - and migrate.js convert7() extracts the
+    proxies ONLY from TOP-LEVEL object keys whose values carry
+    'address' and 'type', i.e. the 'k<id>' entries - a 'proxySettings'
+    ARRAY, as the v5.6 export wrote it, is silently DROPPED and the
+    imported list is EMPTY). The file therefore carries {mode, sync,
+    logging} plus every proxy as its own top-level 'k<id>' key; the old
+    FoxyProxy 4.x foxyproxy.xml cannot be imported by FoxyProxy 9.x at
+    all (the official help: the XML must first pass through FoxyProxy
+    7.5.1). 'mode': 'disable' - convert7() leaves it as-is, so no proxy
+    is auto-enabled on import."""
+    settings = {"mode": "disable", "sync": False,
+                "logging": {"active": True, "maxSize": 500}}
+    for key, entry in _foxyproxy_v67_entries(proxies, listen_host):
+        settings[key] = entry
+    return json.dumps(settings, indent=2, ensure_ascii=False)
+
+def _foxyproxy_save_dialog(default_name: str, ext: str) -> "str | None":
+    """v5.5: native OS 'Save as...' dialog. Uses tkinter when available
+    (Windows/macOS/Linux with a desktop), otherwise a plain input() prompt.
+    Returns the chosen path or None when cancelled."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        path = filedialog.asksaveasfilename(
+            defaultextension=ext, initialfile=default_name,
+            title="Save FoxyProxy settings",
+            filetypes=[("FoxyProxy settings", f"*{ext}"), ("All files", "*.*")])
+        root.destroy()
+        return path or None
+    except Exception:
+        # No GUI stack (headless / no python3-tk) - console fallback.
+        try:
+            raw = input(tr("foxyproxy_path_prompt", name=default_name)).strip()
+            return raw or None
+        except Exception:
+            return None
+
+def export_foxyproxy(args, proxies: list, listen_host: str,
+                    legacy: bool = False) -> "str | None":
+    """v5.5: write ONE FoxyProxy settings file for the CURRENTLY RUNNING
+    local proxies. Destination: the --foxyproxy-out / --foxyproxy-legacy-out
+    path when given (NO dialog, req. 3), otherwise the OS save dialog.
+    Returns the written path or None on failure/cancel."""
+    if not proxies:
+        info(tr("foxyproxy_no_proxies"))
+        return None
+    today = time.strftime("%Y-%m-%d")
+    if legacy:
+        out_arg = getattr(args, "foxyproxy_legacy_out", None)
+        default_name = f"foxyproxy-legacy_{today}.json"
+        content = foxyproxy_legacy_json(proxies, listen_host)
+        fmt = tr("foxyproxy_format_legacy")
+    else:
+        out_arg = getattr(args, "foxyproxy_out", None)
+        default_name = f"FoxyProxy-settings_{today}.json"
+        content = foxyproxy_settings_json(proxies, listen_host)
+        fmt = tr("foxyproxy_format_current")
+    if out_arg:
+        path = out_arg
+    else:
+        path = _foxyproxy_save_dialog(default_name, ".json")
+    if not path:
+        info(tr("foxyproxy_export_cancel"))
+        return None
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+    except Exception as e:
+        err(tr("foxyproxy_export_fail", err=repr(e)))
+        return None
+    ok(tr("foxyproxy_export_done", path=path, n=len(proxies), format=fmt))
+    info(tr("foxyproxy_import_hint", format=fmt))
+    return path
+
+def maybe_foxyproxy_export(args, engine) -> None:
+    """v5.5: run the --foxyproxy-export / --foxyproxy-legacy-export CLI
+    actions ONCE, right after the local proxies started (both engines expose
+    the same proxy dict shape: port/country/countryCode/city/label). The
+    hotkeys f / x call export_foxyproxy() directly and are repeatable."""
+    if getattr(args, "_foxyproxy_done", False):
+        return
+    args._foxyproxy_done = True
+    if not (getattr(args, "foxyproxy_export", False)
+            or getattr(args, "foxyproxy_legacy_export", False)):
+        return
+    if not engine or not getattr(engine, "proxies", None):
+        info(tr("foxyproxy_no_proxies"))
+        return
+    if getattr(args, "foxyproxy_export", False):
+        export_foxyproxy(args, engine.proxies, engine.listen_host, legacy=False)
+    if getattr(args, "foxyproxy_legacy_export", False):
+        export_foxyproxy(args, engine.proxies, engine.listen_host, legacy=True)
 
 # ---------------------------------------------------------------------------
 # Local proxy engines (req. 6, 10, 11)
 # ---------------------------------------------------------------------------
 
-def port_for_location(country_code: str, city_code: str, used: set) -> int:
-    """Deterministic port 20000..39999 derived from the location (SHA-256)."""
-    key = f"{country_code}|{city_code or ''}"
+def port_for_location(key: str, used: set) -> int:
+    """Deterministic port 20000..39999 derived from the location key (SHA-256).
+    v5.0: the key is '<country>|<city>|<server index>' so EVERY server of a
+    city gets its own local port (one local proxy per upstream server)."""
+    key = str(key)
     h = int(hashlib.sha256(key.encode()).hexdigest(), 16)
     port = LOCAL_PORT_BASE + h % LOCAL_PORT_RANGE
     while port in used:
@@ -3173,30 +4262,30 @@ class BuiltinProxyEngine:
         self._threads = []
         self._stopping = threading.Event()
 
-    def build_proxies(self, locations, servers_by_key: dict):
-        """servers_by_key: {(countryCode, cityCode): server_dict} of verified
-        upstreams (protocol already resolved by the probe)."""
+    def build_proxies(self, locations, verified):
+        """v5.0: verified is the LIST of per-server entries from
+        collect_verified_servers (one entry per upstream server of every
+        city, with the location fields included) - one local proxy per
+        entry, ports derived from country|city|serverIndex."""
         used = set()
         proxies = []
         max_p = self.args.max_proxies or 0
-        for loc in locations:
-            for city in loc["cities"]:
-                srv = servers_by_key.get((loc["countryCode"], city.get("cityCode")))
-                if srv is None:
-                    continue
-                port = port_for_location(loc["countryCode"], city.get("cityCode") or "", used)
-                label = f"{loc['countryName']}/{city['cityName']}"
-                proxies.append({"port": port,
-                                "country": loc["countryName"],
-                                "countryCode": loc["countryCode"],
-                                "city": city["cityName"],
-                                "cityCode": city.get("cityCode"),
-                                "host": srv["protocolHost"],
-                                "upstreamPort": srv["protocolPort"],
-                                "protocol": srv["protocol"],
-                                "label": label})
-                if max_p and len(proxies) >= max_p:
-                    return proxies
+        for srv in verified:
+            key = (f"{srv['countryCode']}|{srv.get('cityCode') or ''}"
+                   f"|{srv.get('serverIndex') or 0}")
+            port = port_for_location(key, used)
+            label = f"{srv['countryName']}/{srv['cityName']}"
+            proxies.append({"port": port,
+                            "country": srv["countryName"],
+                            "countryCode": srv["countryCode"],
+                            "city": srv["cityName"],
+                            "cityCode": srv.get("cityCode"),
+                            "host": srv["protocolHost"],
+                            "upstreamPort": srv["protocolPort"],
+                            "protocol": srv["protocol"],
+                            "label": label})
+            if max_p and len(proxies) >= max_p:
+                return proxies
         return proxies
 
     def start_all(self):
@@ -3405,34 +4494,38 @@ class SingBoxEngine:
             raise MozVpnError(tr("singbox_missing"))
         self.exe = exe
 
-    def build_proxies(self, locations, servers_by_key: dict):
-        """Write sing-box configs for every verified upstream (ports by hash)."""
+    def build_proxies(self, locations, verified):
+        """Write sing-box configs for every verified upstream (ports by hash).
+        v5.0: one config per per-server entry of collect_verified_servers.
+        Note: sing-box resolves the upstream hostname itself - the DoH
+        resolver of this script applies to the builtin engine and to the
+        probe/geo checks."""
         os.makedirs(SINGBOX_DIR, exist_ok=True)
         used, proxies = set(), []
         token = self.token_holder.get()
         max_p = self.args.max_proxies or 0
-        for loc in locations:
-            for city in loc["cities"]:
-                srv = servers_by_key.get((loc["countryCode"], city.get("cityCode")))
-                if srv is None:
-                    continue
-                port = port_for_location(loc["countryCode"], city.get("cityCode") or "", used)
-                label = f"{loc['countryName']}/{city['cityName']}"
-                cfg = singbox_config(port, srv["protocolHost"], srv["protocolPort"], token,
-                               self.listen_host)
-                path = os.path.join(SINGBOX_DIR, f"moz-{loc['countryCode']}-"
-                                    f"{city.get('cityCode') or port}-{port}.json")
-                with open(path, "w") as f:
-                    json.dump(cfg, f, indent=2)
-                proxies.append({"port": port, "country": loc["countryName"],
-                                "countryCode": loc["countryCode"],
-                                "city": city["cityName"], "cityCode": city.get("cityCode"),
-                                "host": srv["protocolHost"],
-                                "upstreamPort": srv["protocolPort"],
-                                "protocol": srv["protocol"],
-                                "path": path, "label": label})
-                if max_p and len(proxies) >= max_p:
-                    return proxies
+        for srv in verified:
+            key = (f"{srv['countryCode']}|{srv.get('cityCode') or ''}"
+                   f"|{srv.get('serverIndex') or 0}")
+            port = port_for_location(key, used)
+            label = f"{srv['countryName']}/{srv['cityName']}"
+            cfg = singbox_config(port, srv["protocolHost"], srv["protocolPort"],
+                                 token, self.listen_host)
+            fname = (f"moz-{srv['countryCode']}-"
+                     f"{srv.get('cityCode') or port}-{port}"
+                     f"-{srv.get('serverIndex') or 0}.json")
+            path = os.path.join(SINGBOX_DIR, fname)
+            with open(path, "w") as f:
+                json.dump(cfg, f, indent=2)
+            proxies.append({"port": port, "country": srv["countryName"],
+                            "countryCode": srv["countryCode"],
+                            "city": srv["cityName"], "cityCode": srv.get("cityCode"),
+                            "host": srv["protocolHost"],
+                            "upstreamPort": srv["protocolPort"],
+                            "protocol": srv["protocol"],
+                            "path": path, "label": label})
+            if max_p and len(proxies) >= max_p:
+                return proxies
         self.proxies = proxies
         return proxies
 
@@ -3617,76 +4710,127 @@ def _on_sigterm(signum, frame):
 
 _confirm_exit_enabled = False
 
-def collect_verified_servers(args, locations, token: str) -> dict:
-    """Run the parallel probe (req. 7) and return
-    {(countryCode, cityCode): server_dict}. Every returned server dict gets a
-    "probe_ok" flag. Failed servers are dropped only with --probe-fail drop;
-    the default (keep) serves them anyway with a warning, because a probe
-    failure is often caused by local network filtering (SNI/DPI) while the
-    tunnel still works from curl/other clients."""
-    # Gather one candidate server per city (prefer MASQUE entries if any)
-    candidates = {}
+def collect_verified_servers(args, locations, token: str) -> list:
+    """v5.0: return ONE ENTRY PER SERVER of every city (the old version
+    collapsed each city to a single server and hid most countries behind
+    --probe-count 1). Every entry carries its location fields so the engines
+    raise one local proxy per upstream server. The recommended anycast (REC)
+    location is served too. Every entry gets a 'probe_ok' flag; failed
+    servers are dropped only with --probe-fail drop. --probe-geo adds an
+    exit-country check (ipinfo.io/json) that catches a wrong (usually US)
+    exit PoP caused by a geo-wrong DNS answer for the egress hostname."""
+    entries = []
     for loc in locations:
         for city in loc["cities"]:
-            for s in city["servers"]:
-                key = (loc["countryCode"], city.get("cityCode"))
-                cur = candidates.get(key)
-                if cur is None or (cur["protocol"] != PROTO_MASQUE
-                                   and s["protocol"] == PROTO_MASQUE):
-                    s = dict(s)
-                    # Optional manual override of the egress host/port
-                    # (Fastly anycast pool, hosts-file trick, custom port)
-                    if getattr(args, "upstream_host", None):
-                        s["protocolHost"] = args.upstream_host
-                        s["host"] = args.upstream_host
-                    if getattr(args, "upstream_port", None):
-                        s["protocolPort"] = args.upstream_port
-                    candidates[key] = s
-    servers = list(candidates.values())
-    if getattr(args, "upstream_host", None):
+            for idx, s in enumerate(city["servers"]):
+                s = dict(s)
+                # Optional manual override of the egress host/port
+                # (Fastly anycast pool, hosts-file trick, custom port)
+                if getattr(args, "upstream_host", None):
+                    s["protocolHost"] = args.upstream_host
+                    s["host"] = args.upstream_host
+                if getattr(args, "upstream_port", None):
+                    s["protocolPort"] = args.upstream_port
+                s.update({"countryCode": loc["countryCode"],
+                          "countryName": loc["countryName"],
+                          "cityName": city.get("cityName"),
+                          "cityCode": city.get("cityCode"),
+                          "serverIndex": idx})
+                entries.append(s)
+    if getattr(args, "upstream_host", None) and entries:
         info(tr("upstream_override", host=args.upstream_host,
                 port=(args.upstream_port
-                      or (servers[0]["protocolPort"] if servers else 2499))))
-    if args.proxy_check:
-        # req: minimal probing by default - only the first --probe-count
-        # upstreams are verified (0 = all). A failed or skipped probe does
-        # not remove a server from the served list (see --probe-fail).
-        n_probe = getattr(args, "probe_count", 1)
-        if n_probe and n_probe > 0:
-            probe_servers = servers[:n_probe]
+                      or entries[0]["protocolPort"])))
+    if not getattr(args, "proxy_check", True):
+        info(tr("proxy_check_disabled"))
+        for s in entries:
+            s["probe_ok"] = None          # not probed
+        return entries
+    # v5.0: probe ALL upstreams by default (--probe-count now defaults
+    # to 0 = all; a positive number still limits the probe).
+    n_probe = getattr(args, "probe_count", 0)
+    probe_servers = entries if not n_probe else entries[:n_probe]
+    # v5.1 (req. 7): the exit-country check runs IN THE SAME TIME as the
+    # data probe (a second thread pool) - the startup no longer waits for
+    # the probe to finish before the geo requests even begin.
+    probed_hp = {(s["protocolHost"], s["protocolPort"]) for s in probe_servers}
+    # v5.1 (req. 7): PRE-RESOLVE every unique egress hostname over DoH in
+    # parallel BEFORE the probe starts, so the probe threads do not repeat
+    # the same DoH round-trips. The answers are cached only when the DoH
+    # cache is enabled (it is OFF by default - req. 4), so the prefill
+    # runs only in that mode (without a cache the answers would be thrown
+    # away and the probes resolve in parallel anyway).
+    if doh_cache_enabled() and probe_servers:
+        pre_hosts = sorted({s["protocolHost"] for s in probe_servers})
+        if pre_hosts:
+            with ThreadPoolExecutor(max_workers=min(8, len(pre_hosts))) as ex:
+                list(ex.map(resolve_host, pre_hosts))
+    geo_mode = getattr(args, "probe_geo", "warn")
+    # v5.2 (req. 3): ONE request per probe. The default echo service
+    # (ipinfo.io/json) answers with the external IP AND the exit geo
+    # (country ISO code + city) in the SAME single response, so the
+    # separate exit-country request of v5.0/v5.1 is GONE: no second
+    # thread pool, no second tunnel - the probes finish roughly twice as
+    # fast. A plain-IP echo service (--ip-echo-service ipify etc.)
+    # returns no geo; in that case the geo check is skipped with ONE
+    # explanatory line (probe_geo() is kept for explicit custom use).
+    results = probe_upstreams_parallel(probe_servers, token,
+                                       args.ip_echo_url,
+                                       args.ip_echo_name)
+    # Several locations can share one egress (and with --upstream-host they
+    # all do), so match results by (host, port), not by identity.
+    ok_by_hp = {}
+    geo_by_hp = {}
+    for r in results:
+        rs = r.get("server") or {}
+        key = (rs.get("protocolHost"), rs.get("protocolPort"))
+        if r["ok"]:
+            ok_by_hp.setdefault(key, []).append(rs)
+            if r.get("geo"):
+                geo_by_hp[key] = (r["geo"], r.get("geoCity"))
+    # v5.4: the note is printed ONLY when probes DID pass but the echo
+    # service returned no geo (a plain-IP echo). On total probe failure
+    # (ok_by_hp empty) the failure lines above already explain it - the
+    # old condition fired the note there too and misled the live run.
+    if (geo_mode != "off" and probe_servers and ok_by_hp and not geo_by_hp
+            and not getattr(args, "_geo_skip_noted", False)):
+        args._geo_skip_noted = True
+        info(tr("geo_echo_no_geo", service=args.ip_echo_name))
+    verified = []
+    for s in entries:
+        hp = (s["protocolHost"], s["protocolPort"])
+        if hp not in probed_hp:
+            s["probe_ok"] = None          # not probed (probe-count limit)
+            verified.append(s)
+            continue
+        cand = ok_by_hp.get(hp)
+        if cand:
+            s.update(cand[0])            # may carry the CONNECT fallback
+            s["probe_ok"] = True
+            geo, geo_city = geo_by_hp.get(hp, (None, None))
+            if geo and s.get("countryCode") != "REC":
+                s["geoCountry"], s["geoCity"] = geo, geo_city
+                if geo == s.get("countryCode"):
+                    ok(tr("doh_geo_ok", hp=_hp(s["protocolHost"],
+                                               s["protocolPort"]),
+                          geo=geo, city=geo_city or "?",
+                          cc=s["countryCode"]))
+                else:
+                    warn(tr("doh_geo_mismatch",
+                            hp=_hp(s["protocolHost"], s["protocolPort"]),
+                            geo=geo, city=geo_city or "?",
+                            cc=s["countryCode"],
+                            cname=s.get("countryName") or s["countryCode"]))
+                    if geo_mode == "drop":
+                        continue
+            verified.append(s)
         else:
-            probe_servers = servers
-        probed_hp = {(s["protocolHost"], s["protocolPort"])
-                     for s in probe_servers}
-        results = probe_upstreams_parallel(probe_servers, token,
-                                            args.ip_echo_url, args.ip_echo_name)
-        # Several locations can share one egress (and with --upstream-host
-        # they all do), so match results by (host, port), not by identity.
-        ok_by_hp = {}
-        for r in results:
-            rs = r.get("server") or {}
-            if r["ok"]:
-                ok_by_hp[(rs.get("protocolHost"), rs.get("protocolPort"))] = rs
-        for key, s in candidates.items():
-            if (s["protocolHost"], s["protocolPort"]) not in probed_hp:
-                s["probe_ok"] = None          # not probed (probe-count limit)
-                continue
-            rs = ok_by_hp.get((s["protocolHost"], s["protocolPort"]))
-            if rs is not None:
-                s.update(rs)          # may carry the CONNECT-fallback protocol
-                s["probe_ok"] = True
-            else:
-                s["probe_ok"] = False
-        verified = {k: v for k, v in candidates.items()
-                    if v["probe_ok"] is not False
-                    or getattr(args, "probe_fail", "keep") != "drop"}
-        # No "all probes failed" hint here: the summary lines above already
-        # state the check result; the user asked for the hint to be removed.
-        return verified
-    info(tr("proxy_check_disabled"))
-    for s in candidates.values():
-        s["probe_ok"] = None          # not probed
-    return candidates
+            # A failed probe is NOT a script error - it stays in the served
+            # list by default (--probe-fail drop removes it).
+            s["probe_ok"] = False
+            if getattr(args, "probe_fail", "keep") != "drop":
+                verified.append(s)
+    return verified
 
 def run_manager(args, creds, totp_provider):
     """The loop: keep proxyPass fresh (reissue --refresh-margin seconds before
@@ -3709,7 +4853,9 @@ def run_manager(args, creds, totp_provider):
     json_out = args.json or None
     session_token, force_relogin = None, False
     relogin_backoff = 0
-    copy_mode = None        # None | "local" | "remote" (v / b sub-modes)
+    copy_mode = None        # None | "local" | "remote" | "doh" | "files" (v5.1)
+    select_buf = ""        # v5.1: the typed selection token (confirmed by Enter)
+    select_items = []      # v5.1: [{"token": ..., ...}] of the active list
     totp_secret = (args.totp_secret or "").strip() or creds.get("totp_secret")
 
     signal.signal(signal.SIGINT, _on_sigint)
@@ -3789,6 +4935,10 @@ def run_manager(args, creds, totp_provider):
                     engine.token_holder.set(token)
                     engine.proxies = engine.build_proxies(locations, verified_servers)
                     engine.start_all()
+                    # v5.5 (req. 3 + 4): --foxyproxy-export /
+                    # --foxyproxy-legacy-export (with the paired --*-out
+                    # paths) run ONCE right after the proxies started.
+                    maybe_foxyproxy_export(args, engine)
                     # Test commands: ready-to-paste curl lines for EVERY local
                     # proxy and for EVERY upstream (remote) proxy. The local
                     # command goes through the local listener (no Bearer
@@ -3846,8 +4996,12 @@ def run_manager(args, creds, totp_provider):
             files = config_open_files()
             if files:
                 info(tr("hotkey_files_hint"))
-                for i, p in enumerate(files, 1):
-                    hint(tr("hotkey_file_entry", n=i, path=p))
+                for i, p in enumerate(files):
+                    hint(tr("hotkey_file_entry", n=selection_token(i), path=p))
+                if len(files) > 9:
+                    # v5.1: more than 9 files -> tokens + Enter (see the
+                    # selection sub-mode in the key handler below)
+                    hint(tr("select_hint"))
             # What the 'c' hotkey / --clear-cache will remove (req: log it)
             print_clear_targets()
             _hotkey_mode(True)
@@ -3860,22 +5014,75 @@ def run_manager(args, creds, totp_provider):
                         _reset_confirm()
                 k = _key_pressed()
                 if copy_mode and k:
-                    # v/b sub-mode: a digit copies the chosen proxy address,
-                    # any other key cancels (v/b re-enter the mode below)
-                    if k.isdigit() and k != "0" and engine and engine.proxies:
-                        idx = int(k) - 1
-                        if 0 <= idx < len(engine.proxies):
-                            p = engine.proxies[idx]
-                            text = (f"{engine.listen_host}:{p['port']}"
-                                    if copy_mode == "local"
-                                    else f"{p['host']}:{p['upstreamPort']}")
-                            if copy_to_clipboard(text):
-                                ok(tr("hotkey_copied", text=text))
+                    # v5.1: generic SELECTION sub-mode (v/b proxy copy, 'h'
+                    # DoH menu, 1-9 config files when there are more than 9).
+                    # A token may be several characters long (1-9, a-z,
+                    # aa, ab, ...), so the choice is confirmed with ENTER;
+                    # Backspace deletes the last typed character, any other
+                    # key cancels the sub-mode.
+                    if k in ("\r", "\n"):
+                        # ENTER: confirm the buffered token
+                        item = None
+                        for it in select_items:
+                            if it["token"] == select_buf:
+                                item = it
+                                break
+                        if item is not None:
+                            if copy_mode in ("local", "remote") and engine:
+                                p = item["proxy"]
+                                text = (f"{engine.listen_host}:{p['port']}"
+                                        if copy_mode == "local"
+                                        else f"{p['host']}:{p['upstreamPort']}")
+                                if copy_to_clipboard(text):
+                                    ok(tr("hotkey_copied", text=text))
+                            elif copy_mode == "doh":
+                                name = item["provider"]
+                                set_doh_provider(name)
+                                if name:
+                                    info(tr("doh_selected", provider=name,
+                                            url=DOH_PROVIDERS.get(name, name)))
+                                    info(tr("hotkey_doh", provider=name))
+                                else:
+                                    info(tr("hotkey_doh",
+                                            provider=tr("doh_system_short")))
+                                    info(tr("doh_system"))
+                            elif copy_mode == "files":
+                                open_in_system_editor(item["path"])
+                        else:
+                            info(tr("select_bad", buf=select_buf or "?"))
+                        select_buf = ""
                         copy_mode = None
+                        select_items = []
                         k = ""
-                    elif k not in ("v", "b"):
+                    elif k in ("\x7f", "\x08"):
+                        # BACKSPACE: delete the last typed character
+                        if select_buf:
+                            select_buf = select_buf[:-1]
+                            info(tr("select_buffer", buf=select_buf))
+                        k = ""
+                    elif k.isalnum() and len(k) == 1:
+                        # A token character: append to the buffer. Show the
+                        # buffer only when a valid COMPLETION exists, so
+                        # single-digit tokens stay silent like before.
+                        candidate = select_buf + k
+                        if any(it["token"].startswith(candidate)
+                               for it in select_items):
+                            select_buf = candidate
+                            if not any(it["token"] == select_buf
+                                       for it in select_items):
+                                info(tr("select_buffer", buf=select_buf))
+                        else:
+                            info(tr("select_bad", buf=candidate))
+                            select_buf = ""
+                            copy_mode = None
+                            select_items = []
+                        k = ""
+                    else:
+                        # Any other key cancels the selection sub-mode
                         info(tr("hotkey_copy_cancel"))
+                        select_buf = ""
                         copy_mode = None
+                        select_items = []
                         k = ""
                 if k == "r":
                     # FULL wipe: saved session, credentials, cookies, sing-box
@@ -3981,20 +5188,32 @@ def run_manager(args, creds, totp_provider):
                                   else tr("totp_none_reason_nosecret"))
                         info(tr("hotkey_totp_none", reason=reason))
                 elif k == "v" and engine and engine.proxies:
-                    # Copy a LOCAL proxy address (listen host + port)
+                    # Copy a LOCAL proxy address (listen host + port).
+                    # v5.1: the list may exceed 9 items -> selection tokens
+                    # (1-9, a-z, aa, ab, ...) confirmed with Enter.
                     copy_mode = "local"
+                    select_buf = ""
+                    select_items = [{"token": selection_token(i), "proxy": p}
+                                    for i, p in enumerate(engine.proxies)]
                     info(tr("hotkey_copy_local_hint"))
-                    for i, p in enumerate(engine.proxies, 1):
-                        hint(tr("hotkey_copy_entry", n=i,
-                                addr=f"{engine.listen_host}:{p['port']}",
+                    hint(tr("select_hint"))
+                    for it in select_items:
+                        p = it["proxy"]
+                        hint(tr("hotkey_copy_entry", n=it["token"],
+                                addr=f"{engine.listen_host}:{p['port']}".ljust(36),
                                 label=p["label"]))
                 elif k == "b" and engine and engine.proxies:
-                    # Copy an UPSTREAM (remote) proxy address
+                    # Copy an UPSTREAM (remote) proxy address (see 'v').
                     copy_mode = "remote"
+                    select_buf = ""
+                    select_items = [{"token": selection_token(i), "proxy": p}
+                                    for i, p in enumerate(engine.proxies)]
                     info(tr("hotkey_copy_remote_hint"))
-                    for i, p in enumerate(engine.proxies, 1):
-                        hint(tr("hotkey_copy_entry", n=i,
-                                addr=f"{p['host']}:{p['upstreamPort']}",
+                    hint(tr("select_hint"))
+                    for it in select_items:
+                        p = it["proxy"]
+                        hint(tr("hotkey_copy_entry", n=it["token"],
+                                addr=f"{p['host']}:{p['upstreamPort']}".ljust(36),
                                 label=p["label"]))
                 elif k == "g":
                     # v4.3 (req. 5): load a QR image with the 2FA (TOTP)
@@ -4085,6 +5304,44 @@ def run_manager(args, creds, totp_provider):
                     set_theme(new_theme)
                     redraw_log()
                     info(tr("hotkey_theme", theme=new_theme))
+                elif k == "h":
+                    # v5.1 (req. 2): 'h' now OPENS A SELECTION MENU of the
+                    # DNS resolvers (like the v/b copy lists) instead of
+                    # cycling: every DoH preset + the system DNS entry.
+                    # Applies live to the builtin engine (every new upstream
+                    # connection resolves again) and to the next probe run.
+                    copy_mode = "doh"
+                    select_buf = ""
+                    select_items = []
+                    for i, name in enumerate(DOH_PRESETS):
+                        select_items.append({"token": selection_token(i),
+                                             "provider": name})
+                    select_items.append({"token": selection_token(len(
+                                                select_items)),
+                                         "provider": ""})   # system DNS
+                    info(tr("doh_menu_hint"))
+                    hint(tr("select_hint"))
+                    for it in select_items:
+                        if it["provider"]:
+                            name = it["provider"]
+                            hint(tr("doh_menu_entry", n=it["token"],
+                                    name=name.ljust(10),
+                                    url=f"({DOH_PROVIDERS.get(name, name)})"))
+                        else:
+                            hint(tr("doh_menu_entry", n=it["token"],
+                                    name=tr("doh_system_short").ljust(10),
+                                    url=""))
+                elif k == "k":
+                    # v5.1 (req. 4): toggle the DoH answer cache on/off
+                    # (mirrors --doh-cache); the cache is DISABLED by default.
+                    set_doh_cache(not doh_cache_enabled())
+                    state = tr("color_state_on" if doh_cache_enabled()
+                               else "color_state_off")
+                    info(tr("hotkey_doh_cache", state=state))
+                    if doh_cache_enabled():
+                        info(tr("doh_cache_state_on", ttl=DOH_TTL))
+                    else:
+                        info(tr("doh_cache_state_off"))
                 elif k == "n":
                     # v4.4 (req. 3): toggle the colored log output on/off
                     # (mirrors --no-color); v4.5: the WHOLE log is redrawn
@@ -4104,18 +5361,54 @@ def run_manager(args, creds, totp_provider):
                         info(tr("color_enabled"))
                     else:
                         info(tr("color_disabled"))
+                elif k == "f":
+                    # v5.5 (req. 3): export ALL running local proxies as a
+                    # FoxyProxy Standard settings file (CURRENT format) -
+                    # OS save dialog, or --foxyproxy-out path when set.
+                    if engine and engine.proxies:
+                        _hotkey_mode(False)
+                        export_foxyproxy(args, engine.proxies,
+                                         engine.listen_host, legacy=False)
+                        _hotkey_mode(True)
+                    else:
+                        info(tr("foxyproxy_no_proxies"))
+                elif k == "x":
+                    # v5.5 (req. 4): same export in the LEGACY FoxyProxy
+                    # XML format (FoxyProxy 4.x foxyproxy.xml).
+                    if engine and engine.proxies:
+                        _hotkey_mode(False)
+                        export_foxyproxy(args, engine.proxies,
+                                         engine.listen_host, legacy=True)
+                        _hotkey_mode(True)
+                    else:
+                        info(tr("foxyproxy_no_proxies"))
                 elif k and k.isdigit() and k != "0":
-                    # 1-9: open the config file in the system default editor
+                    # 1-9: open the config file in the system default editor.
+                    # v5.1: when there are MORE than 9 config files, the
+                    # digits enter the selection sub-mode instead (tokens
+                    # 1-9, a-z, aa, ab, ... + Enter) - see select_items.
                     files = config_open_files()
-                    idx = int(k) - 1
-                    if 0 <= idx < len(files):
-                        open_in_system_editor(files[idx])
+                    if len(files) > 9:
+                        copy_mode = "files"
+                        select_buf = k
+                        select_items = [{"token": selection_token(i),
+                                         "path": p}
+                                        for i, p in enumerate(files)]
+                        info(tr("select_buffer", buf=select_buf))
+                    else:
+                        idx = int(k) - 1
+                        if 0 <= idx < len(files):
+                            open_in_system_editor(files[idx])
                 elif k == "q":
                     info(tr("hotkey_stop"))
                     _STOP = True
                     break
-                time.sleep(1)
-                slept += 1
+                # v5.1 (req. 7): poll keys FAST while a selection sub-mode is
+                # active (so multi-character tokens + Enter feel instant),
+                # otherwise keep the calm 1 s cadence.
+                step = 0.05 if copy_mode else 1
+                time.sleep(step)
+                slept += step
             _hotkey_mode(False)
             if _STOP:
                 break
@@ -4182,7 +5475,7 @@ def _hotkey_mode(on: bool):
 #
 # 1) WINDOWS - fully layout-independent via the PHYSICAL key position:
 #    msvcrt.getwch() returns the character produced by the CURRENT
-#    layout (e.g. 'й' when Russian ЙЦУКЕН is active), so the raw char
+#    layout (e.g. 'Ð¹' when Russian ÐÐ¦Ð£ÐÐÐ is active), so the raw char
 #    alone is not enough. The chain  char -> VkKeyScanW -> virtual key
 #    -> MapVirtualKeyW(MAPVK_VK_TO_VSC) -> scan code  recovers the
 #    PHYSICAL key: VkKeyScanW maps a character to the virtual key that
@@ -4194,7 +5487,7 @@ def _hotkey_mode(on: bool):
 #    VkKeyScanW and MapVirtualKeyW).
 # 2) POSIX - terminals report only the layout-translated character in
 #    the input stream (there is no scan-code channel), so a translation
-#    table for the standard Cyrillic ЙЦУКЕН family (Russian, and the
+#    table for the standard Cyrillic ÐÐ¦Ð£ÐÐÐ family (Russian, and the
 #    position-compatible Belarusian/Ukrainian letters) maps the typed
 #    letter to the English key in the SAME physical position.
 _SCAN_TO_KEY = {
@@ -4210,23 +5503,23 @@ _SCAN_TO_KEY = {
 }
 
 _CYR_TO_LATIN = {
-    # standard Russian ЙЦУКЕН: typed letter -> English key in the same
+    # standard Russian ÐÐ¦Ð£ÐÐÐ: typed letter -> English key in the same
     # physical position (Belarusian/Ukrainian layouts share the letter
     # row positions; their unique letters sit where [];' etc. are and
     # are not used by any hotkey)
-    "й": "q", "ц": "w", "у": "e", "к": "r", "е": "t",
-    "н": "y", "г": "u", "ш": "i", "щ": "o", "з": "p",
-    "ф": "a", "ы": "s", "в": "d", "а": "f", "п": "g",
-    "р": "h", "о": "j", "л": "k", "д": "l",
-    "я": "z", "ч": "x", "с": "c", "м": "v", "и": "b",
-    "т": "n", "ь": "m", "ї": "s", "і": "s", "ў": "f",
+    "Ð¹": "q", "Ñ": "w", "Ñ": "e", "Ðº": "r", "Ðµ": "t",
+    "Ð½": "y", "Ð³": "u", "Ñ": "i", "Ñ": "o", "Ð·": "p",
+    "Ñ": "a", "Ñ": "s", "Ð²": "d", "Ð°": "f", "Ð¿": "g",
+    "Ñ": "h", "Ð¾": "j", "Ð»": "k", "Ð´": "l",
+    "Ñ": "z", "Ñ": "x", "Ñ": "c", "Ð¼": "v", "Ð¸": "b",
+    "Ñ": "n", "Ñ": "m", "Ñ": "s", "Ñ": "s", "Ñ": "f",
     # uppercase too (Caps Lock)
-    "Й": "q", "Ц": "w", "У": "e", "К": "r", "Е": "t",
-    "Н": "y", "Г": "u", "Ш": "i", "Щ": "o", "З": "p",
-    "Ф": "a", "Ы": "s", "В": "d", "А": "f", "П": "g",
-    "Р": "h", "О": "j", "Л": "k", "Д": "l",
-    "Я": "z", "Ч": "x", "С": "c", "М": "v", "И": "b",
-    "Т": "n", "Ь": "m", "Ї": "s", "І": "s", "Ў": "f",
+    "Ð": "q", "Ð¦": "w", "Ð£": "e", "Ð": "r", "Ð": "t",
+    "Ð": "y", "Ð": "u", "Ð¨": "i", "Ð©": "o", "Ð": "p",
+    "Ð¤": "a", "Ð«": "s", "Ð": "d", "Ð": "f", "Ð": "g",
+    "Ð ": "h", "Ð": "j", "Ð": "k", "Ð": "l",
+    "Ð¯": "z", "Ð§": "x", "Ð¡": "c", "Ð": "v", "Ð": "b",
+    "Ð¢": "n", "Ð¬": "m", "Ð": "s", "Ð": "s", "Ð": "f",
 }
 
 def _normalize_key(k: str) -> str:
@@ -4318,6 +5611,28 @@ PIP_DEPS = (
 SINGBOX_DECLINE_CACHE = os.path.join(CONF_DIR, "singbox-install.json")
 SINGBOX_INSTALL_PAGE  = "https://sing-box.sagernet.org/installation/"
 SINGBOX_RELEASES_PAGE = "https://github.com/SagerNet/sing-box/releases"
+
+def selection_token(index: int) -> str:
+    """v5.1: selection tokens for interactive lists (hotkeys v / b / h):
+    1-9 first, then the English letters a-z, then two-letter combinations
+    aa, ab, ... - so a list with more than 9 items stays usable (typing
+    '10' or 'ab' works because the choice is confirmed with Enter)."""
+    if index < 0:
+        return ""
+    if index < 9:
+        return str(index + 1)
+    index -= 9
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    if index < 26:
+        return letters[index]
+    index -= 26
+    if index < 26 * 26:
+        return letters[index // 26] + letters[index % 26]
+    return ""
+
+def selection_tokens(count: int) -> "list[str]":
+    """The token list for a list of `count` items."""
+    return [selection_token(i) for i in range(count)]
 
 def is_frozen() -> bool:
     """True when running as a compiled binary: PyInstaller sets sys.frozen,
@@ -4663,8 +5978,10 @@ def print_clear_targets():
 
 def config_open_files() -> list:
     """Ordered list of the config/cache files that can be opened with the
-    number hotkeys (1..9): session, credentials, Fastly cookie, then every
-    sing-box config json in the singbox directory."""
+    number hotkeys: session, credentials, Fastly cookie, then every
+    sing-box config json in the singbox directory. v5.1: the list is NO
+    LONGER capped at 9 - with more than 9 files the digits switch to the
+    token selection sub-mode (1-9, a-z, aa, ... + Enter)."""
     files = []
     for p in (CACHE, CRED_CACHE, FASTLY_CACHE):
         if os.path.isfile(p):
@@ -4673,7 +5990,7 @@ def config_open_files() -> list:
         for name in sorted(os.listdir(SINGBOX_DIR)):
             if name.endswith(".json"):
                 files.append(os.path.join(SINGBOX_DIR, name))
-    return files[:9]
+    return files
 
 def open_in_system_editor(path: str):
     """Ask the OS to open the file (or directory, in the file manager) with
@@ -4790,10 +6107,10 @@ def main():
                     help="What to do when the probe cannot verify an upstream: "
                          "keep (default) - serve it anyway with a warning; "
                          "drop - remove it from the served list")
-    ap.add_argument("--probe-count", type=int, default=1,
+    ap.add_argument("--probe-count", type=int, default=0,
                     help="How many upstreams to probe before starting the "
-                         "local proxies (default: 1 - minimal checking; "
-                         "0 = probe all of them)")
+                         "local proxies (v5.0 default: 0 = probe ALL of "
+                         "them; the old default of 1 hid most upstreams)")
     ap.add_argument("--upstream-host", metavar="HOST", default=None,
                     help="Force every upstream to this host (e.g. the Fastly "
                          "anycast pool p.m1.fastly-masque.net) instead of the "
@@ -4802,6 +6119,67 @@ def main():
                     help="Force the upstream port (default: keep the server-list port)")
     ap.add_argument("--max-proxies", type=int, default=0,
                     help="Maximum number of local proxies (0 = all locations)")
+    # v5.0: DNS-over-HTTPS for the egress hostnames (Firefox-like TRR).
+    ap.add_argument("--doh",
+                    choices=["cloudflare", "google", "nextdns", "quad9", "off"],
+                    default=(os.environ.get("MOZVPN_DOH", "cloudflare")
+                             .strip().lower() or "cloudflare"),
+                    help="DNS-over-HTTPS provider used to resolve the Fastly "
+                         "egress hostnames (v5.0, like Firefox TRR - protects "
+                         "against poisoned/geo-wrong system DNS that routes "
+                         "you to a US PoP). Presets: cloudflare (default), "
+                         "google, nextdns, quad9; 'off' = the system DNS. "
+                         "Env: MOZVPN_DOH")
+    ap.add_argument("--doh-url", metavar="URL", default=None,
+                    help="Custom DoH endpoint (RFC 8484 JSON API, "
+                         "?name=&type=A) - overrides the --doh preset")
+    # v5.1 (req. 4): the DoH answer cache is DISABLED by default and is
+    # strictly opt-in (--doh-cache / hotkey 'k' / env MOZVPN_DOH_CACHE=1).
+    ap.add_argument("--doh-cache", action=argparse.BooleanOptionalAction,
+                    default=_env_flag("MOZVPN_DOH_CACHE", False),
+                    help="Cache DoH answers for %d seconds (v5.1; DISABLED "
+                         "by default: without the flag every lookup queries "
+                         "the DoH chain directly). Env: MOZVPN_DOH_CACHE" %
+                         DOH_TTL)
+    ap.add_argument("--probe-geo", choices=["warn", "drop", "off"],
+                    default="warn",
+                    help="Exit-country check of every probed upstream "
+                         "(v5.2: the geo comes from the SAME single probe "
+                         "answer - the default ipinfo.io/json echo returns "
+                         "the IP and the country/city in one request): "
+                         "warn (default) - log a warning when the exit "
+                         "country does not match the location; drop - "
+                         "remove such upstreams; off - skip the check")
+    # v5.5 (req. 3 + 4): FoxyProxy Standard settings export for the RUNNING
+    # local proxies. Both exports also work live via the hotkeys f / x.
+    ap.add_argument("--foxyproxy-export", dest="foxyproxy_export",
+                    action="store_true",
+                    help="After the local proxies start, write a COMBINED "
+                         "FoxyProxy Standard settings file with ALL of them: "
+                         "the current v8+/v9.x pref (data: [...]) PLUS the "
+                         "same proxies as top-level FoxyProxy 6/7 'k<id>' "
+                         "entries, so it imports via ANY FoxyProxy import "
+                         "path (the 'Import' button at the top of the "
+                         "Options page next to Export, or the Import tab "
+                         "-> 'Import from older versions'); after the "
+                         "import click 'Save'")
+    ap.add_argument("--foxyproxy-out", metavar="FILE", default=None,
+                    help="Save path for --foxyproxy-export; when set, the "
+                         "save dialog is NOT shown (the file is written "
+                         "straight to this path)")
+    ap.add_argument("--foxyproxy-legacy-export", dest="foxyproxy_legacy_export",
+                    action="store_true",
+                    help="Same as --foxyproxy-export, but the LEGACY "
+                         "FoxyProxy settings JSON in the REAL FoxyProxy 6/7 "
+                         "export shape (every proxy as a top-level 'k<id>' "
+                         "key - the only shape the migrate.js convert7() "
+                         "importer of FoxyProxy 9.x reads); import on the "
+                         "Import tab via 'Import from older versions' (the "
+                         "FoxyProxy 4.x foxyproxy.xml is NOT importable by "
+                         "FoxyProxy 9.x); after the import click 'Save'")
+    ap.add_argument("--foxyproxy-legacy-out", metavar="FILE", default=None,
+                    help="Save path for --foxyproxy-legacy-export; when set, "
+                         "the save dialog is NOT shown")
     ap.add_argument("--no-input", action="store_true",
                     help="Never ask interactive questions (for an autonomous loop)")
     ap.add_argument("--refresh-margin", type=int, default=45,
@@ -4820,8 +6198,17 @@ def main():
                     help="Firefox version for the Remote Settings filter_expression (default 156.0)")
     ap.add_argument("--client-country", default="",
                     help="Country code for env.country in filter_expression (unset by default)")
-    ap.add_argument("--include-locked", action="store_true",
-                    help="Include entries/nodes marked as locked")
+    # v5.0: the live vpn-serverlist marks almost every country record
+    # 'locked' and Firefox serves them anyway, so locked records are now
+    # INCLUDED by default; --exclude-locked restores the old behavior.
+    ap.add_argument("--exclude-locked", dest="include_locked",
+                    action="store_false", default=True,
+                    help="Skip entries/nodes marked as locked (the old "
+                         "behavior; since v5.0 locked records are included "
+                         "by default)")
+    ap.add_argument("--include-locked", action="store_true", default=True,
+                    help="Kept for compatibility - locked records are "
+                         "included by default since v5.0")
     ap.add_argument("--json", metavar="FILE",
                     help="Path for the result JSON (default: next to the script)")
     # v4.7.3: argparse.BooleanOptionalAction REJECTS option names that
@@ -4877,6 +6264,28 @@ def main():
                          "brew; other systems: the official install page) and exit")
     a = ap.parse_args()
 
+    # v5.2 (req. 2): FORCE UTF-8 on stdout/stderr BEFORE any output, so the
+    # emoji in the log NEVER show as "garbage symbols". On Windows the
+    # console stream defaults to the legacy ANSI code page (cp1251/cp866),
+    # which cannot encode emoji; sys.stdout.reconfigure(encoding="utf-8")
+    # (Python 3.7+, verified on Python 3.14 - the current stable release,
+    # 3.14.x) switches the stream to UTF-8 with a safe replacement handler.
+    # NOTE: UTF-8 mode becomes the DEFAULT only in Python 3.15 (PEP 686),
+    # so on 3.14 (and older) this explicit reconfigure is REQUIRED.
+    # On modern Windows 10/11 terminals the UTF-8 bytes then render
+    # correctly (PEP 528 console IO is UTF-8 based); a legacy console may
+    # need `chcp 65001` or the PYTHONIOENCODING=utf-8 / PYTHONUTF8=1 env.
+    # Python 3.14 compatibility of everything else used here was checked
+    # against the 3.14 release notes / deprecations index: argparse (only
+    # new optional features - suggest_on_error, color help), ssl, socket,
+    # threading, concurrent.futures, urllib - no deprecations or removals
+    # affect this script.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     # Language and colors are configured before any other output (req. 14,
     # 16). v4.7.1: set_color() runs FIRST (it only switches the color mode, it
     # no longer touches the window background), then set_theme() forces
@@ -4887,6 +6296,34 @@ def main():
     set_theme(a.theme)
     if a.no_color:
         info(tr("color_disabled"))
+
+    # v5.0: DoH resolver setup - must run before any upstream probing.
+    if a.doh_url:
+        DOH_PROVIDERS["custom"] = a.doh_url
+        set_doh_provider("custom")
+    elif a.doh == "off":
+        set_doh_provider("")
+    else:
+        set_doh_provider(a.doh)
+    if doh_provider():
+        info(tr("doh_selected", provider=doh_provider(),
+                url=DOH_PROVIDERS.get(doh_provider(), doh_provider())))
+        # v5.2 (req. 5): the full fallback chain is stated ONCE at startup;
+        # after startup the individual DoH lookups are SILENT (no
+        # "queried DoH / dns" lines in the log).
+        chain = " -> ".join(
+            [DOH_PROVIDERS.get(n, n) for n in _doh_chain()]
+            + [tr("doh_system_short")])
+        info(tr("doh_chain", chain=chain))
+    else:
+        info(tr("doh_system"))
+    # v5.1 (req. 4): the DoH answer cache state at startup (opt-in)
+    set_doh_cache(bool(getattr(a, "doh_cache", False)))
+    if doh_cache_enabled():
+        info(tr("doh_cache_state_on", ttl=DOH_TTL))
+    else:
+        info(tr("doh_cache_state_off"))
+    info(tr("locked_note"))
 
     # req. 8: --clear-cache wipes everything and exits (a fresh dict is
     # passed: nothing has been loaded into memory yet at this point)
@@ -5077,12 +6514,12 @@ def main():
     if a.test:
         # Prefer a probe-verified server; MASQUE entries are tested over
         # their CONNECT fallback (probe_connect always speaks CONNECT).
-        ordered = sorted(verified.values(),
+        ordered = sorted(verified,
                         key=lambda s: 0 if s.get("probe_ok") else 1)
         for s in ordered:
             info(tr("test_running", host=s["protocolHost"], port=s["protocolPort"]))
             try:
-                _, detail = probe_connect(s, token, a.ip_echo_url)
+                _, detail, _, _ = probe_connect(s, token, a.ip_echo_url)
                 ok(tr("test_external_ip", ip=detail))
             except Exception as e:
                 err(str(e))
