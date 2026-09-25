@@ -187,14 +187,10 @@
 #      run. Всё ДО cp работало (pkg update, 69 пакетов через apt, pip) —
 #      значит сеть, привилегии и Termux-окружение в порядке, а точка
 #      монтирования /src ВНУТРИ контейнера оказалась ПУСТОЙ: bind-mount
-#      с хоста не дошёл до процесса (termux-docker entrypoint.sh exec'ает
-#      команду через /system/bin/su + `env -i` от пользователя system
-#      (UID 1000) — сам по себе он пути не меняет, но и не защищает от
-#      пустого маунта). Классический симптом: docker создал mountpoint
-#      /src, но источник на стороне демона не виден. Диагностировать
-#      причину по логу невозможно, поэтому фикс УСТРАНЯЕТ САМ КЛАСС
-#      проблемы — в джобе build-termux БОЛЬШЕ НЕТ bind-mount'ов:
-#        * ВВОД: `docker build` запекает mozvpn_beta.py + requirements.txt
+#      с хоста не дошёл до процесса. Диагностировать причину по логу
+#      невозможно, поэтому фикс УСТРАНЯЕТ САМ КЛАСС проблемы — в джобе
+#      build-termux БОЛЬШЕ НЕТ bind-mount'ов:
+#        * ВВОД: docker build запекает mozvpn_beta.py + requirements.txt
 #          в слой образа через COPY. Контекст сборки docker-КЛИЕНТ
 #          загружает демону tar-потоком (Docker docs: Build context),
 #          поэтому путь на хосте демону вообще не нужен. Если checkout
@@ -209,9 +205,13 @@
 #        * Exit-код сборки: docker run в foreground — non-zero exit
 #          контейнера роняет шаг GitHub Actions автоматически.
 #      Внутренний скрипт сборки не изменился: TARGET/MARCH по-прежнему
-#      «запечены» в текст подстановкой ${{ matrix.* }} (это уже
+#      «запечены» в текст подстановкой выражений matrix (это уже
 #      доказанно работало в живом прогоне), pkg-тулчейн и порядок
-#      установки зависимостей сохранены.
+#      установки зависимостей сохранены. ВАЖНО: парсер workflow
+#      вычисляет КАЖДЫЙ expression-токен в файле (в том числе внутри
+#      комментариев в run:), поэтому литеральные заглушки вида
+#      «двойные фигурные скобки с тремя точками» в тексте скрипта
+#      запрещены — только реальные подстановки matrix.target/march.
 #
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
@@ -762,9 +762,12 @@ jobs:
               set -euo pipefail
               # NOTE: termux-docker entrypoint passes COMMAND-LINE ARGUMENTS
               # into the Termux environment (through a privilege-dropping su,
-              # UID 1000) — Docker `-e` env vars do NOT survive into it, and
-              # `${{ ... }}` below is substituted by GitHub Actions BEFORE
-              # the shell runs, so the inner script sees plain literals.
+              # UID 1000) — Docker `-e` env vars do NOT survive into it.
+              # The two GitHub Actions expression substitutions below are
+              # replaced BEFORE the shell runs, so the inner script sees
+              # plain literals (never write a bare expression placeholder in
+              # a comment: the workflow parser evaluates every expression
+              # token in the whole file, comments inside run: included).
               TARGET="${{ matrix.target }}"
               MARCH="${{ matrix.march }}"
               export PIP_BREAK_SYSTEM_PACKAGES=1
