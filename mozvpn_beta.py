@@ -1,10 +1,413 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mozvpn.py â Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
+mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
-VERSION 2026-09-23 (v4.7.1) â startup duplicate-line fix + full re-audit:
+VERSION 2026-09-28 (v5.23) - the endless failing relogin loop FIXED (the
+  "restart always works, retry never does" live-run signature):
+
+  ROOT CAUSE 1) _OPENER (urllib.request.build_opener with
+  HTTPCookieProcessor(COOKIE_JAR)) is built ONCE at import and holds the
+  ORIGINAL cookie jar forever. wipe_all_saved_data() reassigned
+  COOKIE_JAR to a fresh jar, but every HTTP request still went through
+  the OPENER wired to the DEAD jar: the Fastly challenge flow stored
+  the solved _fs_ch_cp_* Set-Cookie into the OLD jar while
+  fastly_solve_challenge() scanned the NEW, empty one -> every single
+  attempt ended in "_fs_ch_cp_* cookie not received after a successful
+  solution" and the API requests never carried the fresh jar's cookies.
+  FIX: wipe_all_saved_data() now REBUILDS _OPENER on the fresh jar
+  right after reassigning COOKIE_JAR - the jar and the opener can never
+  diverge again after a wipe ('r', 'c', --clear-cache, --relogin).
+  ROOT CAUSE 2) the _fastly_state latch ({"solved", "failed"}) survived
+  every wipe: after ONE challenge failure failed=True disabled
+  ensure_fastly_cookie() for the REST of the process, so every 30 s
+  retry skipped the solver and went straight to HTTP 406 - forever.
+  That is exactly why the relogin loop NEVER recovered while a RESTART
+  always worked (a fresh process starts with a clean latch). FIX: the
+  wipe resets both flags - the challenge state is part of the Fastly
+  session and is cleared with it.
+  RESULT) after 'r' the fresh sign-in asks for the email/password (v5.22)
+  and the Fastly challenge is re-solved into the fresh, correctly wired
+  cookie jar on the FIRST retry - no restart needed anymore.
+
+VERSION 2026-09-28 (v5.22) - relogin REALLY wipes email/password now (the
+  live-run leak found and fixed) + the full 'c'/--clear-cache audit:
+
+  FIX 1) The live run showed the real leak: after 'r' (and 'c') the
+  script asked ONLY for the TOTP code and signed in successfully -
+  it never asked for the EMAIL and PASSWORD, although the wipe is
+  supposed to make the fresh sign-in ask for all of them. ROOT CAUSE:
+  ensure_session() reads args.email / args.password / args.session_token
+  FIRST (the CLI flags and the MOZVPN_EMAIL/MOZVPN_PASSWORD/
+  MOZVPN_SESSION_TOKEN environment copies live in the argparse Namespace
+  for the whole run) - the handlers wiped the config dir, credentials.json
+  and the in-memory creds DICT, but those args values survived and
+  re-logged-in silently. The live totp_provider closure (the --qr
+  generator of this run) and args.qr / args.totp_secret / args.totp are
+  leftovers of exactly the same kind: a relogin/clear must not reuse ANY
+  credential information from before the wipe.
+  FIX: the 'r' and 'c' handlers and the --relogin branch of main() now
+  ALSO clear args.email, args.password, args.session_token, args.qr,
+  args.totp_secret, args.totp and set totp_provider = None after
+  wipe_all_saved_data(). The fresh sign-in then asks for the email,
+  the password and the 2FA code (fxa_login falls back to the
+  interactive totp_prompt when the provider is None) - reusing nothing
+  that existed before the wipe. A NEW --qr / --totp-secret / --totp /
+  MOZVPN_* value can of course still be given for the new sign-in.
+  AUDIT 2) 'c - clear ALL saved data & restart' and --clear-cache
+  verified end-to-end: both call wipe_all_saved_data() ->
+  clear_all_caches(), which shutil.rmtree's the WHOLE config directory
+  (session.json, credentials.json incl. totp_secret,
+  fastly-cookie.json, countries.json, singbox-install.json, the
+  singbox/ and engine/ dirs of this and all previous versions) and
+  clear the in-memory creds dict + the Fastly cookie jar; with v5.22
+  the in-memory args credentials and the live TOTP provider go too.
+  The 'c' handler additionally stops the live engine (its config files
+  were just deleted) and forces the fresh sign-in on the next loop
+  iteration; --clear-cache exits right after the wipe. NOTE: when
+  --relogin and --qr are combined, the QR secret is decoded and saved
+  BEFORE the wipe removes it again - use --qr alone (it stores the
+  secret in credentials.json) or re-supply it after a relogin.
+
+VERSION 2026-09-28 (v5.21) - the v5.20 QR/TOTP "wipe" REVERTED (it broke
+  the auto-TOTP feature); the original relogin semantics restored:
+
+  REVERT) v5.20 made the 'r'/'c' hotkeys and --relogin also clear the
+  in-memory totp_provider and args.qr / args.totp_secret / args.totp.
+  That was WRONG: the in-memory TOTP generator (built from the --qr
+  image of THIS run) is a DELIBERATE FEATURE of the script - the whole
+  point of --qr is that the script generates the 2FA codes itself
+  (auto-TOTP, per the v2 credential-flow header) instead of asking
+  the user to type them. The QR image is never saved to disk and the
+  secret is persisted only in credentials.json, which the wipe DOES
+  remove - keeping the live generator working is not "leftover saved
+  data", exactly like the login session that is rebuilt right after.
+  The v5.20 change therefore only achieved one thing: the fresh
+  sign-in after 'r' prompted for a TOTP code by hand - the feature
+  regressed. This version restores the ORIGINAL behavior:
+  'r' / 'c' / --relogin wipe the DISK and the saved credentials
+  (email/password/totp_secret in credentials.json, session.json,
+  fastly-cookie.json, countries.json, singbox-install.json, the
+  singbox/ and engine/ dirs, the in-memory creds dict and the Fastly
+  cookie jar) and the fresh sign-in asks for the LOGIN and PASSWORD
+  again (they cannot survive the wipe), while the TOTP code for that
+  fresh sign-in is still GENERATED automatically by the live
+  totp_provider - the cached generator of the running process, as it
+  was before v5.20.
+  AUDIT) 'c' / --clear-cache verified again: both go through
+  wipe_all_saved_data() -> clear_all_caches() (shutil.rmtree of the
+  whole config dir) + the in-memory clear; the 'c' handler stops the
+  live engine (its config files were just deleted) and forces the
+  fresh sign-in on the next loop iteration. Unchanged and correct.
+
+VERSION 2026-09-28 (v5.19) - the flag art REDRAWN as a real 6x2 pixel
+  grid + full line alignment (per the live-run screenshot):
+
+  ART) The old quarter/diagonal-glyph table produced noisy, poorly
+  readable flags and mixed 2- and 3-cell entries (Japan sat one
+  column left of every other line). The art is now a REAL PIXEL GRID:
+  every flag is exactly 6 cells = 12 pixels, painted with the
+  upper-half block U+2580 - the truecolor foreground is the TOP pixel
+  of the column, the background the BOTTOM pixel (verified online:
+  the standard half-block technique gives two vertical pixels per
+  cell; Windows Terminal still has no Kitty graphics protocol/Sixel,
+  so half-block truecolor remains the only portable console PICTURE).
+  The data lives in ONE constant table at the top of the code
+  (_FLAG_PIXELS: two 6-char strings per country + a palette dict of
+  the official shades) - easy to edit. No SVG/base64 images: consoles
+  cannot scale or display them portably; the pixel grid is the best
+  representation a terminal offers.
+  REC) The recommended anycast keeps its real flag - solid WHITE in
+  the dark theme, solid BLACK in the light theme - but in art mode it
+  is now DRAWN AS ART (the same 6 cells), so the REC line aligns
+  exactly like every country line; in emoji mode it stays the
+  single-glyph white/black flag emoji, padded to the same width.
+  ALIGN 1) Every flag representation is exactly FLAG_COLS (6) columns
+  + 1 trailing space; the emoji fallbacks are padded to the same
+  total, so the listen-address column never moves.
+  ALIGN 2) The proxy-line LABELS are padded to the widest label of
+  all proxies (min 30) before the template runs: the long
+  'Recomended Location/Recomended City' line no longer pushes its
+  '->' arrow further right than every other line (_proxy_label_width).
+
+VERSION 2026-09-28 (v5.18) - real flag PICTURES on Windows 11 + the
+  white/black flag for the recommended location:
+
+  FIX 1) The local proxy lines on Windows showed LETTERS instead of
+  flags: the default v5.17 representation is the flag emoji pair,
+  and Windows 10/11 (re-verified online today - still true for the
+  current 24H2 Emoji 16.0 fonts: Emojiall, chsm.dev, the
+  flag-emojis-for-windows font-patch project) ships NO font that
+  maps the regional-indicator pairs to flag glyphs. The default is
+  therefore now --flag-style AUTO: the truecolor PIXEL ART on
+  Windows (a console flag PICTURE exists there ONLY via the art)
+  and the ready-made emoji pair on Linux/macOS/Android. --flag-style
+  emoji / art still forces a style explicitly. Three countries of
+  the live network list had NO art data and fell back to the
+  letters - Ghana, Peru and the Philippines now have art entries
+  with the official shades (Ghana #CE1126/#FCD116/#006B3F, Peru
+  #D91023/#FFFFFF, Philippines #0038A8/#CE1126/#FCD116/#FFFFFF).
+
+  FIX 2) The recommended anycast line no longer shows the electric
+  plug: it now gets a REAL single-glyph flag - the waving WHITE flag
+  (U+1F3F3 U+FE0F) in the dark theme and the BLACK flag (U+1F3F4)
+  in the light theme. Both are SINGLE emoji (not regional-indicator
+  pairs), so Windows renders them as pictures too.
+
+  ALIGN) Every flag representation is now 4 console columns wide
+  (3 art cells + space; the 2-column pair or flag + 2 spaces), so
+  all proxy lines stay aligned and the emoji pair is no longer
+  glued to the listen address ("AR127.0.0.1" -> "AR  127.0.0.1").
+
+VERSION 2026-09-28 (v5.17) - hotkey 'n' crash + flag style + mojibake:
+
+  FIX 1) Hotkey 'n' (colors on/off) crashed with "Unexpected error:
+  UnboundLocalError("cannot access local variable '_BG_CURRENT'
+  where it is not associated with a value")". ROOT CAUSE: the 'n'
+  handler of the watch loop releases the forced window background by
+  assigning _BG_CURRENT = None, but the enclosing function had NO
+  'global _BG_CURRENT' declaration - Python therefore compiles the
+  name as a LOCAL of that function, and the earlier read 'elif
+  _BG_CURRENT is not None:' raises UnboundLocalError. The toggle
+  itself (set_color) ran BEFORE the crash, so the color mode DID
+  flip once the 30 s retry loop resumed. FIX: the handler now declares
+  'global _BG_CURRENT'.
+
+  FIX 2) The country flags next to the local proxy lines: the DEFAULT
+  is again the READY-MADE Unicode flag emoji pair (the regional
+  indicators, as in v5.13); the v5.14-v5.16 truecolor pixel art is
+  opt-in via the new --flag-style {emoji,art}. Verified online
+  (Emojiall, the chsm.dev and execross.dev write-ups): Windows 10/11
+  ships NO font that maps regional-indicator pairs to flag glyphs,
+  so on Windows the pair renders as the clean two-letter ISO code
+  ("US", "DE", ...), not a picture; on Linux/macOS/Android (Termux)
+  it is the real colored flag. No ready-made terminal renderer for
+  flag PICTURES exists, so the pixel art stays available behind
+  --flag-style art for those who want it.
+
+  FIX 3) The corrupt symbols in the log ("Hotkey 'm' <broken glyph>:"
+  and the "a" that replaced em dashes): the v5.14 edit pipeline had
+  DOUBLE-ENCODED every non-ASCII literal of the string templates -
+  e.g. the palette emoji was stored as the four code points U+00F0
+  U+009F U+008E U+00A8 instead of U+1F3A8, which prints as garbage.
+  v5.17 decodes every damaged literal back to the intended character
+  and then stores it as an ASCII-only escape sequence (the
+  backslash-u / backslash-U form) - the whole file is now
+  PURE ASCII, so no editor, clipboard or code page can ever corrupt
+  it again; the runtime strings are byte-for-byte identical.
+  (v5.17.1: the first v5.17 build had written THIS VERY text with
+  literal backslash-u characters - Python parsed the docstring
+  escape and refused to start with SyntaxError: (unicode error)
+  'unicodeescape' codec ... truncated \\uXXXX escape at line 3;
+  the changelog now uses plain ASCII words only.)
+
+VERSION 2026-09-28 (v5.16) - the 'Unexpected error: ValueError(...)' on
+  startup FIXED - the flag-art crash:
+
+  The first v5.15 run (the first run of the pixel-art flags AT ALL -
+  v5.14 never started because of its SyntaxError) crashed while
+  printing the local proxy list: "Unexpected error:
+  ValueError('not enough values to unpack (expected 3, got 2)')".
+  ROOT CAUSE: the flag-art table paints every country flag as three
+  cells, and a cell is EITHER the full form (glyph, fg, bg) or the
+  SHORT form (glyph, color) - a SOLID cell whose fg and bg are the
+  same color (the full-block stripes of the vertical tricolors and
+  the like: France, Belgium, Italy, Ireland, Sweden, Norway, Denmark,
+  Finland, Portugal, Greece, Romania, Switzerland, Brazil, Mexico,
+  Kazakhstan, Nigeria, Morocco, Bangladesh, Saudi Arabia, China,
+  Israel, Turkey, Vietnam, ... - 29 of the 181 cells). The v5.14
+  painter unpacked strictly 3 values per cell, so EVERY short-form
+  cell raised ValueError - the watch loop printed a few proxy lines,
+  hit the first solid-stripe country and died. v5.16: _flag_paint()
+  renders BOTH forms (the short form paints fg = bg = the given
+  color); the data table itself is untouched.
+
+VERSION 2026-09-28 (v5.15) - the ROOT CAUSE of the 'broken' themes/hotkeys
+  + hotkeys hardened against PTY byte-splitting + MASQUE probes that
+  really TUNNEL DATA:
+
+  FIX 1) THE ROOT CAUSE: v5.14 shipped with a SyntaxError - a stray
+     closing parenthesis on the _ANSI_RE line ('unmatched \')\'' at
+     import time) - so THE SCRIPT DID NOT EVEN START; every hotkey
+     ('m' the theme, 'n' the color mode) was 'broken' because there
+     was never a running process to press keys in. v5.15 fixes the
+     line; the v4.5+ theme machinery (dark/light switch + the FULL
+     log redraw via redraw_log(), the color toggle with the embedded-
+     ANSI strip) works again exactly as in the older versions.
+  FIX 2) hotkeys in ANY layout: _key_pressed() could FREEZE the whole
+     hotkey loop on POSIX - the v5.13 code re-read the UTF-8
+     continuation bytes of a non-English letter with a BLOCKING
+     os.read(), and a PTY that delivers the lead byte in a separate
+     write made that read wait for the NEXT keypress forever. v5.15:
+     BUFFERED reads - one poll reads every currently available byte,
+     leftovers wait in _KEY_BUF, escape sequences (arrows) are
+     consumed whole, and a partial UTF-8 sequence is completed with
+     bounded 20 ms waits, never a blocking read.
+  FIX 3) the MASQUE probe now REALLY transfers data (req. 3): a 2xx
+     answer alone is no longer a success. The probe sends a minimal
+     DNS query (A mozilla.com, a random transaction ID) through the
+     CONNECT-UDP tunnel to 1.1.1.1:53 - a DATAGRAM capsule (RFC 9297:
+     capsule type 0x00, varint framing; Context ID 0 = the raw UDP
+     payload to the CONNECT target, RFC 9298) - and succeeds ONLY
+     when the DNS answer comes back through the tunnel (matched by
+     the transaction ID + the QR bit, in a DataReceived capsule or a
+     DatagramReceived frame). '200 but no data' is now an honest
+     FAILURE. The CONNECT request also gained the RFC-required
+     'capsule-protocol: ?1' header, the correct :authority (the
+     PROXY host:port, not the tunnel target) and end_stream=False -
+     the v5.14 probe CLOSED its send side, so no data could ever be
+     tunneled at all. A dropped UDP query is re-sent (max twice, once
+     also via the QUIC DATAGRAM frame variant).
+
+VERSION 2026-09-28 (v5.14) - VISIBLE pixel-art flags + the REAL probe
+  speedup (the found root causes):
+
+  FLAG) The v5.13 emoji flags (regional-indicator pairs) render as
+     LETTERS on Android/Termux - the stock monospace font maps the
+     regional indicators to Latin letters (a known Termux font issue;
+     termux-app #4757: 'known issue with the monospace fonts shipped by
+     default on a lot of phones'), so the user saw "US"/"DE" instead of
+     a flag. No script can force a glyph the font does not have, so
+     v5.14 draws a REAL mini-flag with ANSI 24-bit truecolor + block
+     glyphs (U+2580/258C/2590/quarters): three cell-sized stripes of
+     the official flag colors, supported by Termux, Windows Terminal
+     and every modern terminal (the termstandard-colors truecolor
+     list). With --no-color (or an unknown country) the v5.13 emoji
+     pair / the plug emoji remain the representation. The colorless
+     log render now strips embedded ANSI codes so a theme/color
+     hotkey redraw stays clean.
+  SPEED 1) THE remaining probe bottleneck: the v5.13 masque event hook
+     DISCARDED the H3 events returned by H3Connection.handle_event()
+     (the aioquic docs: handle_event RETURNS a list of H3 events) -
+     the response to the extended CONNECT arrives as an
+     HeadersReceived with the :status pseudo-header, so an ANSWERING
+     masque server produced no verdict and EVERY accepted probe still
+     sat out the full 5 s window. v5.14: the hook consumes the
+     returned events - a 2xx HEADERS answer is the IMMEDIATE success,
+     any other status an IMMEDIATE rejection; StreamReset /
+     StreamDataReceived / the silent cap are unchanged.
+  SPEED 2) _tls_connect: a TCP-LAYER connect failure (timeout/refused/
+     unreachable - no ClientHello was sent) now ABORTS the 4-profile
+     ClientHello matrix immediately - no profile can change a connect
+     failure, and the v5.8 note already said 'a fully-failing run is
+     bounded by the profile matrix x the per-attempt timeout'
+     (4 x 5 s per upstream wasted). TLS handshake failures keep
+     walking the full matrix as before.
+  SPEED 3) _connect_resolved_ips: after the preferred (first) address
+     fails, the REMAINING A records are raced CONCURRENTLY (the RFC
+     8305 'Happy Eyeballs' idea) and the first winner is used - the
+     old serial loop paid the FULL connect timeout PER address.
+  SPEED 4) check_upstream: the concurrent CONNECT fallback moved from
+     a per-upstream ThreadPoolExecutor (its worker threads are NOT
+     daemon and the interpreter JOINS them at exit - bpo-36780) to a
+     plain daemon thread + Event: same concurrency, no exit delay.
+  SPEED 5) resolve_host: an IN-FLIGHT dedup - concurrent callers for
+     the SAME hostname (the probe pool + the prefill racing on a
+     shared egress host) share ONE DoH query instead of stampeding;
+     the DoH prefill is no longer a SERIAL phase before the probes -
+     it starts in daemon threads and OVERLAPS the probe phase.
+
+VERSION 2026-09-28 (v5.13) - binary-on-Android DNS bypass + REAL probe
+  parallelism + per-proxy flags + hotkeys in ANY layout:
+
+  FIX 1) gaierror(7) 'No address associated with hostname' in the
+     PACKAGED binary (Termux/armv9) while the plain script works:
+     packaged-Python-on-Android runtimes are KNOWN to break
+     socket.getaddrinfo while nslookup/the browser work fine
+     (python-for-android #1447, kivy #7087, PyInstaller #3721), so the
+     system resolver is NOT trustworthy inside a binary. req() now has
+     a LAST-RESORT DIRECT-IP path: when the v5.12 single retry fails
+     too, _emergency_doh_resolve() asks the well-known DoH resolver
+     IPs DIRECTLY (1.1.1.1 / 8.8.8.8 on 443 / 9.9.9.9 on 5053 - NO
+     name resolution anywhere, the SNI stays the resolver hostname)
+     and _raw_https() sends the API request straight to the resolved
+     IP with the correct Host header + SNI (redirect following and the
+     shared cookie jar included). This covers EVERY API call (OAuth,
+     Guardian, Remote Settings) regardless of the --doh setting.
+  FIX 2) per-proxy FLAG emoji in the proxy list: every local proxy
+     line now starts with the NATIONAL FLAG of its country (the two
+     regional-indicator letters of the ISO code; 'UK' -> the GB flag;
+     REC/unknown keep the electric-plug emoji). tr() accepts an _e=
+     override, country_flag() builds the pair.
+  FIX 3) the probes were STILL slow because of the LAST serial part:
+     per upstream the MASQUE attempt and its CONNECT fallback ran ONE
+     AFTER ANOTHER (a UDP-blocked network paid up to 2 s QUIC connect
+     + 5 s data wait and THEN the whole CONNECT probe on top), the
+     masque probe ALWAYS sat out the fixed 5 s data window, and
+     aioquic resolved the egress hostname with the SYSTEM resolver.
+     v5.13: (a) the CONNECT fallback runs CONCURRENTLY with the
+     MASQUE probe (a 1-thread pool; the masque verdict keeps
+     priority); (b) the masque verdict returns as soon as the server
+     actually ANSWERS (an event hook shadows
+     QuicConnectionProtocol.quic_event_received; a stream reset is
+     now detected as a REJECTION instead of a silent 5 s wait; the
+     deadline remains only as the cap for silent peers); (c) the QUIC
+     connect goes to the DoH-resolved IP (SNI stays the hostname).
+  FIX 4) the 'w' multi-selection echo now SHOWS the typed spaces (the
+     v5.12.1 .strip() hid the very separator the user is asked to
+     type); only accidental double spaces are collapsed.
+  FIX 5) hotkeys in ANY keyboard layout on POSIX: _key_pressed() read
+     ONE BYTE, so the 2-4 byte UTF-8 letter of a non-English layout
+     was split into a lone invalid lead byte that no transliteration
+     table could map - hotkeys silently worked only in the English
+     layout. It now reads the COMPLETE UTF-8 character and only then
+     applies the position-based layout mapping (JCUKEN ru/by/ua on
+     POSIX, the scan-code route on Windows), so the letter printed on
+     the keycap works in every layout.
+
+VERSION 2026-09-28 (v5.12.1) - 'w' menu: ONE in-place selection line:
+
+  The v5.12 multi-selection echoed a NEW 'Selected: ...' log line on
+  EVERY keystroke, so typing '1 2 x' left three duplicate lines in
+  the log. v5.12.1 prints ONE line that REWRITES itself in place (\r
+  rewrite, the exact technique of the existing retry countdown) -
+  _multi_line_show() / _multi_line_clear(); the line is erased when
+  the selection is applied or cancelled, and the apply/cancel
+  summary starts on a clean row. Everything else is unchanged.
+
+VERSION 2026-09-28 (v5.12) - friendly transient net errors + REAL
+  parallel DoH + --countries filter with hotkey 'w':
+
+  FIX 1) The Termux/arm live log showed 'Unexpected error:
+     URLError(gaierror(7, 'No address associated with hostname'))'.
+     A gaierror(7) is a TRANSIENT DNS blip (the resolver briefly had
+     no answer) that is gone seconds later - the raw exception repr
+     was printed by the watch loop's generic handler. Fixes:
+       a) new _is_transient_net_error() / _net_err_public(): transient
+          network errors (URLError with a gaierror/timeout/connection
+          reason, socket.gaierror, timeouts, connection errors) are
+          detected and mapped to SHORT localized reasons
+          (net_error_retry + net_err_dns/timeout/conn, EN + RU);
+       b) req() retries ONCE (a 1.5 s pause) on a transient URLError -
+          this covers EVERY API call site (OAuth, Guardian, Remote
+          Settings), not just the watch loop;
+       c) the watch loop's generic except prints the friendly
+          net_error_retry line instead of the raw repr.
+  FIX 2) The probes were STILL slow because the DoH chain was walked
+     SEQUENTIALLY per hostname: when the first provider was slow or
+     blocked (typical on filtering networks) EVERY lookup paid its
+     full 4 s timeout before the chain moved on - so 'parallel probes'
+     still waited on DNS. Fixes:
+       a) _doh_query_parallel(): ALL DoH providers of the chain get
+          the query AT ONCE and the FIRST non-empty answer wins (the
+          losing slower queries finish in the background); failed
+          providers keep the 60 s penalty;
+       b) the probe pre-resolve now runs ALWAYS (not only with the
+          opt-in long cache - the always-on 60 s memo keeps the
+          answers), its workers 8 -> 16;
+       c) probe workers 32 -> 64.
+  NEW 3) --countries LIST: run local proxies ONLY for the listed
+     countries (comma/space-separated ISO codes, full country names,
+     'rec' = the recommended anycast egress; example:
+     --countries "us,de,jp"). Default: not used. The choice is
+     cached in countries.json and survives restarts. Hotkey 'w'
+     opens the interactive equivalent: every upstream gets a token
+     (1-9, a-z, aa, ...), the tokens are typed SEPARATED BY SPACES
+     and confirmed with Enter; token '0' = ALL local proxies (this
+     clears the saved filter).
+
+VERSION 2026-09-23 (v4.7.1) -- startup duplicate-line fix + full re-audit:
 VERSION 2026-09-25 (v5.8) - probe log: ONE compact message + the probe
   errors VERIFIED as not caused by the earlier edits:
 
@@ -67,7 +470,7 @@ VERSION 2026-09-25 (v5.7) - FoxyProxy import FIXED for real (verified
   NOTE 3) After ANY import FoxyProxy shows the settings in the UI, but
      they are persisted only after clicking 'Save' - the import hint
      and the hotkey help now say the exact buttons to press.
-VERSION 2026-09-25 (v5.6) — probe speedup (DoH) + FoxyProxy import fixes:
+VERSION 2026-09-25 (v5.6) -- probe speedup (DoH) + FoxyProxy import fixes:
 
   SPEED 1) The 'probes take 10+ seconds' ROOT CAUSE was in the DoH
      layer, not in the echo parsing: with the DoH cache OFF (the
@@ -116,7 +519,7 @@ VERSION 2026-09-25 (v5.6) — probe speedup (DoH) + FoxyProxy import fixes:
           no 'Options -> Import Settings' submenu in 9.x; the import
           hints now state the exact click path for both formats.
 
-VERSION 2026-09-25 (v5.5) — FoxyProxy Standard export + faster probes:
+VERSION 2026-09-25 (v5.5) -- FoxyProxy Standard export + faster probes:
 
   REQ 1) Confirmed (no change needed): a FAILED probe never removes an
      upstream - the fail line says "the upstream is served anyway",
@@ -146,7 +549,7 @@ VERSION 2026-09-25 (v5.5) — FoxyProxy Standard export + faster probes:
      proxy. Import via Options -> Import Settings -> Import from older
      versions.
 
-VERSION 2026-09-25 (v5.4) — probe algorithm fix per the live-run log:
+VERSION 2026-09-25 (v5.4) -- probe algorithm fix per the live-run log:
 
   DIAG) Live log 2026-09-25: ALL 33 upstreams failed the data check
      ("Probe: ... - data check not passed") while the tunnels themselves
@@ -182,13 +585,13 @@ VERSION 2026-09-25 (v5.4) — probe algorithm fix per the live-run log:
      pass but the echo carries no geo (a plain-IP echo service); on
      total probe failure the failure lines speak for themselves.
 
-VERSION 2026-09-25 (v5.3) — verified against the ORIGINAL file + Python 3.14:
+VERSION 2026-09-25 (v5.3) -- verified against the ORIGINAL file + Python 3.14:
 
   FIX 1) The hotkey hint emoji now match the ORIGINAL mozvpn_beta.py
-     EXACTLY (♻️ r, 🧹 c, 🔄 e, 🔀 l, 📂 o, 📋 v/b, 🔢 t, 🎫 j, 🖼️ g,
-     👤 u, 🔑 p, 📦 d, ⤴️ s, 🎨 m, 🌈 n, 📄 1-9, ⏹️ q - v5.2 had restored
-     them with slightly different glyphs) + the new v5.1 keys keep their
-     own: 🌐 h, 💾 k. Both languages.
+     EXACTLY (recycle r, broom c, arrows-e e, shuffle l, folder o,
+     clipboard v/b, digits t, ticket j, frame g, person u, key p,
+     package d, up-arrow s, palette m, rainbow n, page 1-9, stop q -
+     v5.2 restored them) + the new v5.1 keys: globe h, floppy k (both).
   VERIFIED 2) A FULL audit against the user-provided ORIGINAL file
      (mozvpn_beta.py): message-template keys, _EMOJI map keys, argparse
      options, watch-loop hotkey handlers and the function list were
@@ -202,7 +605,7 @@ VERSION 2026-09-25 (v5.3) — verified against the ORIGINAL file + Python 3.14:
      on 3.14 - UTF-8 mode becomes the interpreter default only in
      Python 3.15 (PEP 686).
 
-VERSION 2026-09-25 (v5.2) — aligned log, emoji restored + UTF-8, 1-request probe:
+VERSION 2026-09-25 (v5.2) -- aligned log, emoji restored + UTF-8, 1-request probe:
 
   FIX 1) The log is now COLUMN-ALIGNED: every per-upstream line (probe,
      geo check, protocol choice) prints host:port padded to a fixed
@@ -236,7 +639,7 @@ VERSION 2026-09-25 (v5.2) — aligned log, emoji restored + UTF-8, 1-request pro
      against the original mozvpn_beta.py - only additions exist
      (DoH module, selection tokens, _hp alignment helper).
 
-VERSION 2026-09-25 (v5.1) — hotkey UX fixes, opt-in DoH cache, faster startup:
+VERSION 2026-09-25 (v5.1) -- hotkey UX fixes, opt-in DoH cache, faster startup:
 
   FIX 1) The hotkey hint lines no longer show "garbage symbols" - all
      emoji decorations are removed from the hotkeys_hint block (both
@@ -271,7 +674,7 @@ VERSION 2026-09-25 (v5.1) — hotkey UX fixes, opt-in DoH cache, faster startup:
      every 0.05 s (instead of 1 s) so multi-character tokens + Enter
      feel instant.
 
-VERSION 2026-09-25 (v5.0) â all upstream proxies + DoH resolving + geo check:
+VERSION 2026-09-25 (v5.0) -- all upstream proxies + DoH resolving + geo check:
 
   ROOT CAUSE of the "few proxies / always US exit" problem (verified against
   the LIVE vpn-serverlist Remote Settings collection on 2026-09-25, 35
@@ -306,7 +709,7 @@ VERSION 2026-09-25 (v5.0) â all upstream proxies + DoH resolving + geo chec
        check via ipinfo.io/json (--probe-geo warn|drop|off) that warns
        about / drops wrong-country egresses.
 
-VERSION 2026-09-23 (v4.7.3) â fix: --no-save crashed at startup:
+VERSION 2026-09-23 (v4.7.3) -- fix: --no-save crashed at startup:
 
   FIX 1) ValueError: invalid option name '--no-save' for BooleanOptionalAction.
      Python's argparse REJECTS BooleanOptionalAction for options whose name
@@ -320,7 +723,7 @@ VERSION 2026-09-23 (v4.7.3) â fix: --no-save crashed at startup:
      Behavior is unchanged: by default nothing is saved and local proxies
      are served; '--save' re-enables the JSON file.
 
-VERSION 2026-09-23 (v4.7.2) â DEFAULT-ON --local-proxy and --no-save:
+VERSION 2026-09-23 (v4.7.2) -- DEFAULT-ON --local-proxy and --no-save:
 
   NEW 1) Both flags are now ON BY DEFAULT: starting the script without any
      arguments serves local proxies AND does not write the result JSON.
@@ -342,7 +745,7 @@ VERSION 2026-09-23 (v4.7.2) â DEFAULT-ON --local-proxy and --no-save:
      back on and releases it (OSC 111) when colors go off; the exit note
      is printed only when a background was actually forced.
 
-VERSION 2026-09-23 (v4.7) â forced console background, layout-independent
+VERSION 2026-09-23 (v4.7) -- forced console background, layout-independent
 hotkeys, pip conflict-proof install:
 
   NEW 1) Themes now FORCE the console WINDOW background itself, not just
@@ -357,10 +760,10 @@ hotkeys, pip conflict-proof install:
   FIX 2) Hotkeys now work in ANY keyboard layout. On Windows the chain
      char -> VkKeyScanW -> virtual key -> MapVirtualKeyW(MAPVK_VK_TO_VSC)
      -> scan code recovers the PHYSICAL key cap, so e.g. the key labeled
-     'Ð¹' on a Russian ÐÐ¦Ð£ÐÐÐ layout still triggers hotkey 'q' (scan
+     '\u0439' on a Russian JCUKEN layout still triggers hotkey 'q' (scan
      codes are layout-independent; verified against the Win32 docs).
      On POSIX terminals (no scan-code channel in the input stream) a
-     Cyrillic->English translation table for the ÐÐ¦Ð£ÐÐÐ family is used.
+     Cyrillic->English translation table for the JCUKEN family is used.
   FIX 3) Dependency reinstall no longer dies on pip ResolutionImpossible
      conflicts: a STAGED install is used - all packages in one command
      first (pip resolves them together), then each package separately
@@ -369,7 +772,7 @@ hotkeys, pip conflict-proof install:
      then pip install <pkg> --no-deps as a last resort, with a clear
      per-package OK/FAILED report at the end.
 
-VERSION 2026-09-23 (v4.6) â correct dark/light themes + sing-box dependency info:
+VERSION 2026-09-23 (v4.6) -- correct dark/light themes + sing-box dependency info:
 
   FIX 1) The themes were misunderstood before. Now: the DARK theme is for a
      BLACK console background (bg 16 = true black) and the LIGHT theme is
@@ -384,7 +787,7 @@ VERSION 2026-09-23 (v4.6) â correct dark/light themes + sing-box dependency
      (only the 'singbox' engine needs it; the builtin engine works fully
      without it).
 
-VERSION 2026-09-23 (v4.5) â full log redraw, JWT hotkey, hint styling:
+VERSION 2026-09-23 (v4.5) -- full log redraw, JWT hotkey, hint styling:
 
   NEW 1) Hotkeys 'm' (theme) and 'n' (color) now FULLY REDRAW the whole
      log: every line printed so far is kept in an in-memory history and
@@ -404,7 +807,7 @@ VERSION 2026-09-23 (v4.5) â full log redraw, JWT hotkey, hint styling:
      with --flags and IPs inside the description still highlighted
      separately.
 
-VERSION 2026-09-23 (v4.4) â retry countdown, theme & color hotkeys:
+VERSION 2026-09-23 (v4.4) -- retry countdown, theme & color hotkeys:
 
   NEW 1) After a failed sign-in (e.g. the Fastly WAF challenge not yielding
      a cookie - usually succeeds on the SECOND attempt) the script now says
@@ -417,7 +820,7 @@ VERSION 2026-09-23 (v4.4) â retry countdown, theme & color hotkeys:
   NEW 3) Hotkey 'n': toggle the colored log output on/off (mirrors
      --no-color).
 
-VERSION 2026-09-23 (v4.3) â dependencies management, new hotkeys:
+VERSION 2026-09-23 (v4.3) -- dependencies management, new hotkeys:
 
   NEW 0) At startup the script prints ALL its Python dependencies (pyotp,
      zxing-cpp, Pillow, aioquic) with pip name, module, version and
@@ -453,7 +856,7 @@ VERSION 2026-09-23 (v4.3) â dependencies management, new hotkeys:
      clipboard.
   NEW 10) The hotkey hint is printed with EVERY hotkey on its own line.
 
-VERSION 2026-09-23 (v4.2) â curl test-command output now opt-in:
+VERSION 2026-09-23 (v4.2) -- curl test-command output now opt-in:
 
   NEW 0) The ready-to-paste curl test commands (for the LOCAL proxies and
      for the UPSTREAM proxies, plus the per-server curl hints in one-shot
@@ -462,7 +865,7 @@ VERSION 2026-09-23 (v4.2) â curl test-command output now opt-in:
      MOZVPN_SHOW_TEST_COMMANDS=1) enables them; default: off. When the
      commands are hidden, one short hint line explains how to enable them.
 
-VERSION 2026-09-23 (v4.1) â hotkey 'r'/'c' crash fix per live-run feedback:
+VERSION 2026-09-23 (v4.1) -- hotkey 'r'/'c' crash fix per live-run feedback:
 
   FIX 0) CRASH on hotkey 'r' (relogin) with the singbox engine running:
      FileNotFoundError(2, 'No such file or directory'). Cause: the wipe
@@ -479,7 +882,7 @@ VERSION 2026-09-23 (v4.1) â hotkey 'r'/'c' crash fix per live-run feedback:
           directory (os.makedirs, exist_ok=True) before rewriting the
           configs - defense in depth against any wipe while it runs.
 
-VERSION 2026-09-23 (v4.0) â hotkey fixes per live-run feedback:
+VERSION 2026-09-23 (v4.0) -- hotkey fixes per live-run feedback:
 
   FIX 0) Hotkey 'o' no longer dead-ends with "File does not exist": if the
      sing-box config directory is not there yet (it is created only by the
@@ -497,7 +900,7 @@ VERSION 2026-09-23 (v4.0) â hotkey fixes per live-run feedback:
      so hotkeys clearly stand out in the hint line, file lists and status
      messages.
 
-VERSION 2026-09-23 (v3.9) â full-wipe relogin, TOTP hotkey, decoded JWT:
+VERSION 2026-09-23 (v3.9) -- full-wipe relogin, TOTP hotkey, decoded JWT:
 
   FIX 1) 'c' / 'r' / --clear-cache / --relogin now wipe EVERYTHING the
      script has ever saved: the whole config directory (session cache,
@@ -514,7 +917,7 @@ VERSION 2026-09-23 (v3.9) â full-wipe relogin, TOTP hotkey, decoded JWT:
   NEW 4) Hotkeys are highlighted in the log (their own color class) and
      carry per-key emoji placed inside the hint line next to each key.
 
-VERSION 2026-09-23 (v3.8) â protocol choice logging, copy/open hotkeys:
+VERSION 2026-09-23 (v3.8) -- protocol choice logging, copy/open hotkeys:
 
   NEW 1) Hotkey 'o': open the singbox config directory in the system file
      manager (os.startfile / open / xdg-open handle directories natively).
@@ -545,7 +948,7 @@ VERSION 2026-09-23 (v3.8) â protocol choice logging, copy/open hotkeys:
      rocket for the winning masque protocol, return arrow for the fallback,
      broom/wastebasket for cleanup).
 
-VERSION 2026-09-23 (v3.7) â audit, hotkeys l / 1-9, probe hint removed:
+VERSION 2026-09-23 (v3.7) -- audit, hotkeys l / 1-9, probe hint removed:
 
   AUDIT 0) Full template audit: every tr() call supplies every placeholder
      used by BOTH the en and ru templates (the KeyError('reason') class of
@@ -567,7 +970,7 @@ VERSION 2026-09-23 (v3.7) â audit, hotkeys l / 1-9, probe hint removed:
      xdg-open (freedesktop.org standard, user's preferred application).
      The watch loop prints which number opens which file.
 
-VERSION 2026-09-23 (v3.6) â KeyError crash fix, --listen, config paths:
+VERSION 2026-09-23 (v3.6) -- KeyError crash fix, --listen, config paths:
 
   FIX 1) CRASH during probe: KeyError('reason') - the EN template still
      had a {reason} placeholder while the caller no longer passes it.
@@ -590,7 +993,7 @@ VERSION 2026-09-23 (v3.6) â KeyError crash fix, --listen, config paths:
   NOTE 5) Ctrl+C: the FIRST press stops immediately by default; the
      two-press confirmation exists ONLY behind --confirm-exit.
 
-VERSION 2026-09-23 (v3.5) â quota fix, hotkeys, emoji & theme polish:
+VERSION 2026-09-23 (v3.5) -- quota fix, hotkeys, emoji & theme polish:
 
   FIX 1) Quota now always shows GiB + MiB: the remainder was divided by
      the next LARGER unit (so "47 GiB 463 MiB" collapsed to "47 GiB");
@@ -615,7 +1018,7 @@ VERSION 2026-09-23 (v3.5) â quota fix, hotkeys, emoji & theme polish:
      restart the local proxies with it, q = stop. Windows uses msvcrt,
      POSIX uses cbreak (restored before any interactive prompt).
 
-VERSION 2026-09-23 (v3.4) â hotfix for a v3.3 regression + restoration:
+VERSION 2026-09-23 (v3.4) -- hotfix for a v3.3 regression + restoration:
 
   FIX 1) CRASH on startup: the word-highlight regex had unterminated
      subpatterns (nested named groups written incorrectly) -> re.PatternError
@@ -636,7 +1039,7 @@ VERSION 2026-09-23 (v3.4) â hotfix for a v3.3 regression + restoration:
      top-level entry point catches KeyboardInterrupt so no traceback
      is printed in one-shot mode either.
 
-VERSION 2026-09-23 (v3.3) â probe wording, themes, richer word colors:
+VERSION 2026-09-23 (v3.3) -- probe wording, themes, richer word colors:
 
   FIX 1) The probe output no longer looks like errors: per-upstream lines,
      the summary and the "nothing confirmed" case are informational results
@@ -661,7 +1064,7 @@ VERSION 2026-09-23 (v3.3) â probe wording, themes, richer word colors:
      (session.json, credentials.json, fastly-cookie.json, the sing-box
      config directory) with size and modification time, or "not created yet".
 
-VERSION 2026-09-23 (v3.2) â logging polish based on a live run report:
+VERSION 2026-09-23 (v3.2) -- logging polish based on a live run report:
 
   FIX 1) "Local proxy engine: builtin" was printed twice (once by main(),
      once by run_manager); now it is emitted exactly once at startup.
@@ -677,7 +1080,7 @@ VERSION 2026-09-23 (v3.2) â logging polish based on a live run report:
   FIX 5) The quota line is humanized: "Quota: 47 GiB 463 MiB of 50 GiB left"
      instead of raw byte counters.
 
-VERSION 2026-09-23 (v3.1) â TLS profile fallback matrix, probe-fail policy,
+VERSION 2026-09-23 (v3.1) -- TLS profile fallback matrix, probe-fail policy,
 upstream override, cross-engine log consistency, watch-loop error codes:
 
   FIX 1) SSLError(UNEXPECTED_MESSAGE) on the outer TLS to the egress:
@@ -713,7 +1116,7 @@ upstream override, cross-engine log consistency, watch-loop error codes:
   FIX 8) The interactive QR answer check compared against corrupted string
      literals; it now uses the localized answer_no_words list.
 
-VERSION 2026-09-23 (v3.0) â MASQUE support, builtin proxy engine, i18n, colors:
+VERSION 2026-09-23 (v3.0) -- MASQUE support, builtin proxy engine, i18n, colors:
 
   1) MASQUE PROTOCOL SUPPORT (verified against live data, 2026-09-23):
      - Fastly's official blog ("We Built the Proxy Behind Firefox's New
@@ -722,13 +1125,13 @@ VERSION 2026-09-23 (v3.0) â MASQUE support, builtin proxy engine, i18n, col
        Fastly's infrastructure later.
      - The live Remote Settings collection "vpn-serverlist" today only
        advertises protocols: [{name: "connect", ...}] on hosts like
-       *.m1.fastly-masque.net:2499 â i.e. the egress hostnames are
+       *.m1.fastly-masque.net:2499 -- i.e. the egress hostnames are
        MASQUE-branded, but the actually served protocol is still HTTP CONNECT
        over TLS.
      - Therefore this script fully PARSES "masque" protocol entries in the
        server list, PROBES them for real MASQUE (HTTP/3 CONNECT-UDP over
-       QUIC via the optional `aioquic` package) and â when MASQUE is not
-       actually usable â FALLS BACK to HTTP CONNECT automatically (req. 1, 2).
+       QUIC via the optional `aioquic` package) and -- when MASQUE is not
+       actually usable -- FALLS BACK to HTTP CONNECT automatically (req. 1, 2).
      - The probe does not trust a bare "200" response: it tunnels real data
        through the proxy to a public IP-echo service and verifies the
        response body looks like an IP address.
@@ -751,7 +1154,7 @@ VERSION 2026-09-23 (v3.0) â MASQUE support, builtin proxy engine, i18n, col
        HTTP CONNECT proxy implemented inside this script (modeled after the
        connection-handling approach of the popular proxy.py package and the
        sing-box http outbound). No third-party runtime, no subprocesses,
-       no external engine binary â fully Nuitka/exe-friendly (req. 11).
+       no external engine binary -- fully Nuitka/exe-friendly (req. 11).
        Token rotation is applied live: the tunnel reads the current proxyPass
        from an in-memory token holder for every new client connection.
      - --local-proxy-engine singbox: generates sing-box configs exactly like
@@ -821,9 +1224,9 @@ Environment variables:
   MOZVPN_SHOW_TEST_COMMANDS (1/true/yes/on), MOZVPN_RETRY_DELAY (seconds)
 
 Caches (all mode 600, under ~/.config/mozvpn):
-  session.json        â sessionToken
-  credentials.json    â email/password/totp_secret (+digits/period/algorithm)
-  fastly-cookie.json  â Fastly WAF cookie
+  session.json        -- sessionToken
+  credentials.json    -- email/password/totp_secret (+digits/period/algorithm)
+  fastly-cookie.json  -- Fastly WAF cookie
 """
 
 import argparse, base64, binascii, getpass, hashlib, hmac, http.cookiejar, json, os, re
@@ -832,7 +1235,7 @@ import urllib.request, urllib.error
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from datetime import timezone
 from email.utils import parsedate_to_datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---- optional dependencies (popular pip packages with prebuilt wheels;
 # ---- no system utilities are ever required) ----
@@ -947,6 +1350,11 @@ _doh_lock = threading.Lock()
 # query per attempt - the main 'probes take 10+ seconds' cause when the
 # DoH chain itself is slow or partially blocked).
 _doh_memo = {}                   # host -> (expires_at, [ip, ...])
+# v5.14: IN-FLIGHT dedup - host -> threading.Event of the query that is
+# CURRENTLY running. Concurrent callers for the same host (the 64 probe
+# workers and the prefill threads racing on a shared egress hostname)
+# JOIN the running query instead of launching duplicate DoH chains.
+_doh_inflight = {}               # host -> threading.Event (owner running)
 # v5.6: a DoH provider that failed (timeout/connection error) is skipped
 # for DOH_PROVIDER_PENALTY seconds, so ONE dead endpoint does not add its
 # full timeout to every subsequent lookup in the same run.
@@ -1007,6 +1415,45 @@ def _doh_chain() -> list:
         return [cur] + rest
     return [cur] + list(DOH_PRESETS)    # custom endpoint first
 
+def _doh_query_parallel(host: str) -> "list[str] | None":
+    """v5.12: query ALL DoH providers of the fallback chain IN PARALLEL and
+    take the FIRST non-empty answer. The old SEQUENTIAL walk was the real
+    'probes take forever' root cause on filtering networks: the selected
+    provider (usually cloudflare) was always queried first and ALONE, so
+    every hostname lookup paid its full DOH_TIMEOUT (4 s) before the
+    chain moved on to the next provider. Here every provider gets the
+    query at the same moment, so the answer arrives as fast as the
+    FASTEST reachable provider. Providers that fail keep the same
+    DOH_PROVIDER_PENALTY (60 s) skip as before."""
+    now = time.time()
+    with _doh_lock:
+        chain = [n for n in _doh_chain()
+                 if _doh_provider_down.get(n, 0) <= now]
+    if not chain:
+        return None
+    ips = None
+    ex = ThreadPoolExecutor(max_workers=len(chain))
+    try:
+        futs = {ex.submit(_doh_query, DOH_PROVIDERS.get(n) or n, host): n
+                for n in chain}
+        for fut in as_completed(futs):
+            try:
+                ans = fut.result() or None
+            except Exception:
+                ans = None
+            if ans:
+                ips = ans
+                break               # first non-empty answer wins
+            # a failed provider is penalized like before
+            with _doh_lock:
+                _doh_provider_down[futs[fut]] = (time.time()
+                                                 + DOH_PROVIDER_PENALTY)
+    finally:
+        # do NOT wait for the slower losing queries - they finish in the
+        # background (each is bounded by DOH_TIMEOUT anyway)
+        ex.shutdown(wait=False)
+    return ips
+
 def resolve_host(host: str) -> "list[str] | None":
     """Resolve a hostname over DoH ONLY (req. 5): the selected provider,
     then the remaining DoH presets in the fallback chain; the SYSTEM
@@ -1035,42 +1482,60 @@ def resolve_host(host: str) -> "list[str] | None":
         hit = _doh_memo.get(host)
         if hit and hit[0] > now:
             return hit[1]
-    # 3) walk the DoH chain, skipping providers that failed recently
-    ips = None
-    for name in _doh_chain():
-        with _doh_lock:
-            down = _doh_provider_down.get(name, 0)
-        if down > now:
-            continue                     # v5.6: recently failed - skip
-        url = DOH_PROVIDERS.get(name) or name
-        try:
-            ips = _doh_query(url, host) or None
-        except Exception:
-            ips = None
+    # 3) v5.12: query ALL chain providers in PARALLEL (the first non-empty
+    #    answer wins); providers that failed recently are skipped (penalty).
+    #    v5.14: IN-FLIGHT dedup - when several threads race on the SAME
+    #    hostname (the probe pool + the prefill on a shared egress host),
+    #    exactly ONE query chain runs; every other caller WAITS for it and
+    #    reads the memo afterwards instead of stampeding the DoH endpoints
+    #    with duplicate chains that all pay the same round trips.
+    with _doh_lock:
+        inflight = _doh_inflight.get(host)
+        if inflight is None:
+            inflight = threading.Event()
+            _doh_inflight[host] = inflight
+            is_owner = True
+        else:
+            is_owner = False
+    if not is_owner:
+        # someone else is already resolving this exact host: wait for the
+        # shared answer (bounded: the chain timeout x2 + slack), then take
+        # it from the memo / the opt-in cache
+        inflight.wait(timeout=DOH_TIMEOUT * 2 + 2)
+        for store in (_doh_memo, _doh_cache):
             with _doh_lock:
-                _doh_provider_down[name] = (time.time()
-                                            + DOH_PROVIDER_PENALTY)
+                hit = store.get(host)
+            if hit and hit[0] > time.time():
+                return hit[1]
+        return None            # the shared query failed: the caller falls
+                               # back to the system resolver, as after any
+                               # full DoH-chain failure
+    try:
+        ips = _doh_query_parallel(host)
+        if not ips:
+            # Every DoH endpoint failed -> the SYSTEM resolver (last resort).
+            # v5.2 (req. 5): SILENT - the DoH setup is reported once at
+            # startup (doh_selected + doh_chain); individual lookups must
+            # NOT write "queried DoH / dns" lines into the log afterwards.
+            try:
+                ips = sorted({ai[4][0] for ai in
+                              socket.getaddrinfo(host, None,
+                                                 proto=socket.IPPROTO_TCP)}) or None
+            except Exception:
+                ips = None
         if ips:
-            break
-    if not ips:
-        # Every DoH endpoint failed -> the SYSTEM resolver (last resort).
-        # v5.2 (req. 5): SILENT - the DoH setup is reported once at
-        # startup (doh_selected + doh_chain); individual lookups must
-        # NOT write "queried DoH / dns" lines into the log afterwards.
-        try:
-            ips = sorted({ai[4][0] for ai in
-                          socket.getaddrinfo(host, None,
-                                             proto=socket.IPPROTO_TCP)}) or None
-        except Exception:
-            ips = None
-    if ips:
-        if _doh_cache_enabled:
+            if _doh_cache_enabled:
+                with _doh_lock:
+                    _doh_cache[host] = (time.time() + DOH_TTL, ips)
+            # v5.6: remember in the always-on short memo too
             with _doh_lock:
-                _doh_cache[host] = (time.time() + DOH_TTL, ips)
-        # v5.6: remember in the always-on short memo too
+                _doh_memo[host] = (time.time() + DOH_MEMO_TTL, ips)
+        return ips
+    finally:
+        # wake EVERY waiter and free the in-flight slot (even on failure)
         with _doh_lock:
-            _doh_memo[host] = (time.time() + DOH_MEMO_TTL, ips)
-    return ips
+            _doh_inflight.pop(host, None)
+        inflight.set()
 
 def _connect_resolved(host: str, port: int, timeout: int) -> "socket.socket":
     """TCP connection to the egress. With DoH ON the DoH-resolved IPs are
@@ -1094,16 +1559,71 @@ def _connect_resolved_ips(ips: "list[str] | None", host: str, port: int,
     passes an ALREADY resolved IP list, so the 4-profile TLS matrix (and
     the in-probe echo fallback) does not trigger a fresh DoH query on
     every attempt. With ips=None the normal system resolution is used
-    (the DoH-off case; also the last-resort path after a DoH failure)."""
+    (the DoH-off case; also the last-resort path after a DoH failure).
+    v5.14: after the PREFERRED (first) address fails, the remaining
+    addresses are raced CONCURRENTLY - the RFC 8305 'Happy Eyeballs'
+    idea - and the first socket that wins is used: the old serial loop
+    paid the FULL connect timeout PER address, so a blackholed first A
+    record plus three more records burned four timeouts inside ONE
+    probe. The ordered preference is preserved: the first address is
+    still tried alone, the race only replaces the serial tail."""
     if not ips:
         return socket.create_connection((host, port), timeout=timeout)
-    last = None
-    for ip in ips:
+    # 1) the preferred (first) address, alone - the ordered preference
+    try:
+        return socket.create_connection((ips[0], port), timeout=timeout)
+    except OSError as first_err:
+        if len(ips) == 1:
+            raise first_err          # same error shape as the old loop
+    rest = ips[1:]
+    # 2) v5.14: race the remaining addresses concurrently, first wins
+    results = [None] * len(rest)
+    def _try_one(i):
         try:
-            return socket.create_connection((ip, port), timeout=timeout)
+            results[i] = socket.create_connection((rest[i], port),
+                                                  timeout=timeout)
         except OSError as e:
-            last = e
-    raise last if last else OSError(f"no route to {host}:{port}")
+            results[i] = e          # remember the error, not the socket
+        except Exception as e:
+            results[i] = e          # never kill the thread with a traceback
+    ths = [threading.Thread(target=_try_one, args=(i,), daemon=True)
+           for i in range(len(rest))]
+    for t in ths:
+        t.start()
+    deadline = time.time() + timeout + 2.0   # hard cap: timeout + slack
+    while time.time() < deadline:
+        for r in results:
+            if isinstance(r, socket.socket):
+                # a winner: close the other sockets that also made it
+                for other in results:
+                    if isinstance(other, socket.socket) and other is not r:
+                        try:
+                            other.close()
+                        except Exception:
+                            pass
+                return r
+        if all(not t.is_alive() for t in ths):
+            break
+        time.sleep(0.02)
+    # 3) the cap elapsed / all threads done: take any late success,
+    #    else raise the FIRST real error of the tail (the error shape
+    #    of the old serial loop - e.g. a timeout stays a timeout)
+    for r in results:
+        if isinstance(r, socket.socket):
+            for other in results:
+                if isinstance(other, socket.socket) and other is not r:
+                    try:
+                        other.close()
+                    except Exception:
+                        pass
+            return r
+    for r in results:
+        if isinstance(r, OSError):
+            raise r
+    for r in results:
+        if isinstance(r, BaseException):
+            raise r
+    raise OSError(f"no route to {host}:{port}")
 
 # Supported upstream protocols: CONNECT (always) and MASQUE (probed, with fallback).
 PROTO_CONNECT = "connect"
@@ -1195,7 +1715,7 @@ STR = {
 "en": {
   "engine_selected": "Local proxy engine {_e}: {engine}",
   "config_files_header": "Configuration and cache files used on this system {_e}:",
-  "config_file_entry": "  {_e} {path} â {status}",
+  "config_file_entry": "  {_e} {path} \u2014 {status}",
   "config_file_exists": "{size} bytes, modified {mtime} UTC",
   "config_file_dir": "directory, {n} entries",
   "config_file_missing": "not created yet",
@@ -1290,16 +1810,17 @@ STR = {
   "probe_reason_reset": "connection reset",
   "probe_reason_unreachable": "network unreachable",
   "probe_reason_echo": "the echo service answer was unusable",
+  "probe_reason_nodata": "tunnel accepted but no UDP data came back",
   "probe_reason_other": "other transport error",
   "proxy_check_masque_ok": "Probe: {hp} - MASQUE (HTTP/3 CONNECT-UDP) tunnel carried data",
   "proxy_check_masque_fallback": "Probe: MASQUE on {hp} not confirmed - this upstream will use HTTP CONNECT",
   "proxy_check_connect_ok": "Probe: {hp} - CONNECT tunnel carried data (external IP {ip})",
   "proxy_check_connect_fail": "Probe: {hp} - data check not passed ({reason}); the upstream is served anyway",
   "proxy_check_disabled": "Proxy pre-check disabled (--no-proxy-check): using all server-list upstreams as-is.",
-  "doh_selected": "DNS resolver {_e}: {provider} ({url}) — the Fastly egress hostnames are resolved over DoH ONLY (like Firefox TRR); if this provider fails, the chain falls back to the other DoH providers, the system resolver is the LAST resort.",
-  "doh_system": "DoH disabled {_e} — the egress hostnames are resolved by the SYSTEM DNS (a poisoned/geo-wrong answer can route you to a wrong Fastly PoP, usually a US one). Use --doh <provider> or hotkey 'h'.",
+  "doh_selected": "DNS resolver {_e}: {provider} ({url}) \u2014 the Fastly egress hostnames are resolved over DoH ONLY (like Firefox TRR); if this provider fails, the chain falls back to the other DoH providers, the system resolver is the LAST resort.",
+  "doh_system": "DoH disabled {_e} \u2014 the egress hostnames are resolved by the SYSTEM DNS (a poisoned/geo-wrong answer can route you to a wrong Fastly PoP, usually a US one). Use --doh <provider> or hotkey 'h'.",
   "doh_system_short": "system DNS (DoH off)",
-  "doh_chain": "DoH fallback chain (checked left to right): {chain} — the system resolver is the LAST resort. This is logged once at startup; individual DNS lookups during the run are silent.",
+  "doh_chain": "DoH fallback chain (checked left to right): {chain} \u2014 the system resolver is the LAST resort. This is logged once at startup; individual DNS lookups during the run are silent.",
   "geo_echo_no_geo": "Geo check skipped: the echo service '{service}' returns only the IP. Use the default --ip-echo-service ipinfo (ipinfo.io/json) - its single answer carries the IP AND the exit country/city.",
   "foxyproxy_no_proxies": "FoxyProxy export skipped: no local proxies are currently running.",
   "foxyproxy_export_cancel": "FoxyProxy export cancelled - no save path chosen.",
@@ -1309,18 +1830,32 @@ STR = {
   "foxyproxy_path_prompt": "Enter the path to save the FoxyProxy settings file (default: {name}): ",
   "foxyproxy_format_current": "combined settings JSON (current v8+/v9.x 'data' + FoxyProxy 6/7 entries - imports via ANY FoxyProxy import path)",
   "foxyproxy_format_legacy": "legacy settings JSON (the REAL FoxyProxy 6/7 export shape - for 'Import from older versions')",
-  "doh_cache_state_on": "DoH cache {_e}: ENABLED — answers are cached for {ttl}s (hotkey 'k' or --no-doh-cache disables).",
-  "doh_cache_state_off": "DoH cache {_e}: DISABLED (default) — every lookup queries the DoH chain directly (hotkey 'k' or --doh-cache enables).",
+  "doh_cache_state_on": "DoH cache {_e}: ENABLED \u2014 answers are cached for {ttl}s (hotkey 'k' or --no-doh-cache disables).",
+  "doh_cache_state_off": "DoH cache {_e}: DISABLED (default) \u2014 every lookup queries the DoH chain directly (hotkey 'k' or --doh-cache enables).",
   "doh_geo_mismatch": "Geo check: {hp} exits in {geo} ({city}), but the location is {cc} ({cname}). The egress PoP is reached via a wrong route (usually a geo-wrong DNS answer); the IPv6 route may still show the right country.",
-  "doh_geo_ok": "Geo check: {hp} exits in {geo} ({city}) — matches the location {cc}.",
-  "doh_menu_hint": "Choose the DNS resolver {_e} — type its number/letter and press Enter (Backspace deletes, any other key cancels):",
+  "doh_geo_ok": "Geo check: {hp} exits in {geo} ({city}) \u2014 matches the location {cc}.",
+  "doh_menu_hint": "Choose the DNS resolver {_e} \u2014 type its number/letter and press Enter (Backspace deletes, any other key cancels):",
   "doh_menu_entry": "  {n} - {name}{url}",
-  "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} — new upstream connections use it immediately (the sing-box engine resolves on its own).",
+  "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} \u2014 new upstream connections use it immediately (the sing-box engine resolves on its own).",
   "hotkey_doh_cache": "Hotkey 'k': DoH cache {state} (mirrors --doh-cache).",
   "select_hint": "Type the number/letter of an item, then press Enter. Backspace deletes the last character, any other key cancels.",
   "select_buffer": "Your choice: {buf}",
   "select_bad": "There is no item '{buf}' - cancelled.",
-  "locked_note": "Note {_e}: the live vpn-serverlist marks almost every country record 'locked', and Firefox serves them anyway — locked records are INCLUDED by default since v5.0 (--exclude-locked restores the old filtering).",
+  "select_hint_multi": "Multi-selection: type several tokens SEPARATED BY SPACES (example: 1 3 a), then press Enter. '0' = all proxies. Backspace deletes, any other key cancels.",
+  "multi_buffer": "Selected: {buf}",
+  "multi_bad": "There is no item '{tok}' - it is skipped.",
+  "countries_menu_hint": "Choose which local proxies to run {_e} \u2014 type the tokens of the proxies separated by SPACES and press Enter (0 = all proxies, Backspace deletes, any other key cancels):",
+  "countries_menu_entry": "  {n} - {desc}",
+  "filter_all_desc": "ALL local proxies (clears the filter)",
+  "countries_filter_applied": "Proxy filter {_e}: {n} of {m} upstreams will be served ({list}). The choice is saved and survives restarts (hotkey 'w' or --countries).",
+  "filter_all_applied": "Proxy filter {_e}: ALL local proxies will run (the filter is cleared).",
+  "filter_empty_fallback": "The saved proxy filter matched no upstream - serving ALL of them (clear the filter: hotkey 'w' -> 0).",
+  "hotkey_countries": "Hotkey 'w': the local proxies will restart with the new selection.",
+  "net_error_retry": "Network error {_e}: {err} - retrying in 30s (a transient failure - a DNS or connection blip; the next attempt usually succeeds).",
+  "net_err_dns": "temporary DNS failure (no address associated with hostname)",
+  "net_err_timeout": "timed out",
+  "net_err_conn": "connection failed (refused/reset/unreachable)",
+  "locked_note": "Note {_e}: the live vpn-serverlist marks almost every country record 'locked', and Firefox serves them anyway \u2014 locked records are INCLUDED by default since v5.0 (--exclude-locked restores the old filtering).",
   "upstream_override": "Upstream override: all locations use {host}:{port} instead of the per-city hosts.",
   "engine_started": "{engine} engine started: {n} local proxies on {listen}",
   "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]",
@@ -1328,8 +1863,8 @@ STR = {
   "no_free_ports": "No free ports for local proxies (all candidate ports are busy).",
   "no_servers_to_serve": "No upstream servers to serve: the probe dropped everything (use --probe-fail keep) or the server list is empty.",
   "tls_plain_http": "upstream answered in plaintext (not TLS): {text}",
-  "answer_no_words": "n, no, Ð½, Ð½ÐµÑ",
-  "answer_yes_words": "y, yes, Ð´, Ð´Ð°",
+  "answer_no_words": "n, no, \u043d, \u043d\u0435\u0442",
+  "answer_yes_words": "y, yes, \u0434, \u0434\u0430",
   "deps_manual_hint": "Install manually {_e}: {cmd}",
   "singbox_missing": "sing-box not found in PATH. Install it (https://sing-box.sagernet.org/installation/) or use --local-proxy-engine builtin.",
   "token_updated_builtin": "builtin engine: new proxyPass applied live (new connections use it, no restart needed).",
@@ -1343,18 +1878,18 @@ STR = {
   "unexpected_error": "Unexpected error: {err!r} - retrying in 30s.",
   "next_refresh": "Next refresh {_e} in {sec}s ({at} UTC).",
   "confirm_exit_hint": "Press Ctrl+C to stop.",
-  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  ♻️ r - re-login now, wiping ALL saved data (--relogin)\n  🧹 c - clear ALL saved data & restart (--clear-cache)\n  🔄 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  🔀 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  🌐 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  💾 k - toggle the DoH cache on/off (--doh-cache)\n  📂 o - open the sing-box config directory (or the main config directory)\n  📋 v - copy a LOCAL proxy address:port\n  📋 b - copy an UPSTREAM proxy address:port\n  🔢 t - show & copy the current TOTP code\n  🎫 j - show & copy the current proxyPass JWT\n  🖼️ g - load a QR image with the 2FA secret on the fly (--qr)\n  👤 u - show & copy the login (email)\n  🔑 p - show & copy the password\n  📦 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  ⤴️ s - reinstall sing-box from scratch (--reinstall-singbox)\n  🎨 m - switch the color theme dark <-> light (--theme)\n  🌈 n - toggle the colored log output on/off (--no-color)\n  📄 1-9 - open a config file in the system default editor\n  🦊 f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  🧾 x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  ⏹️ q - stop.",
-  "hotkey_relogin": "Hotkey 'r' â»ï¸: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
-  "hotkey_clear": "Hotkey 'c' ð§¹: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
+  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \u267b\ufe0f r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache)\n  \U0001f4c2 o - open the sing-box config directory (or the main config directory)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f5bc\ufe0f g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \u2934\ufe0f s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme)\n  \U0001f308 n - toggle the colored log output on/off (--no-color)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4c4 1-9 - open a config file in the system default editor\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \u23f9\ufe0f q - stop.",
+  "hotkey_relogin": "Hotkey 'r' \u267b\ufe0f: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
+  "hotkey_clear": "Hotkey 'c' \U0001f9f9: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
   "hotkey_engine": "Hotkey 'e': switching the engine to {engine} - local proxies will restart with it.",
   "hotkey_listen": "Hotkey 'l': listeners will now bind on {host} - local proxies will restart with it.",
-  "hotkey_totp": "Hotkey 't' ð¢: current TOTP code - also copied to the clipboard.",
+  "hotkey_totp": "Hotkey 't' \U0001f522: current TOTP code - also copied to the clipboard.",
   "hotkey_jwt": "Current proxyPass JWT {_e} - also copied to the clipboard:",
-  "hotkey_jwt_none": "Hotkey 'j' ð«: no proxyPass token yet - it appears right after the successful sign-in.",
-  "hotkey_totp_none": "Hotkey 't' ð¢: no TOTP secret is available. Reason: {reason}. The TOTP secret is stored in credentials.json and gets there only after a sign-in with --qr <QR image> or --totp-secret <base32> (or the MOZVPN_TOTP_SECRET environment variable).",
+  "hotkey_jwt_none": "Hotkey 'j' \U0001f3ab: no proxyPass token yet - it appears right after the successful sign-in.",
+  "hotkey_totp_none": "Hotkey 't' \U0001f522: no TOTP secret is available. Reason: {reason}. The TOTP secret is stored in credentials.json and gets there only after a sign-in with --qr <QR image> or --totp-secret <base32> (or the MOZVPN_TOTP_SECRET environment variable).",
   "totp_none_reason_nocreds": "credentials.json has not been created yet - no sign-in with saved credentials has happened on this machine",
   "totp_none_reason_nosecret": "credentials.json exists but contains no totp_secret field - the saved sign-in was made without --qr / --totp-secret, or the account has no TOTP 2FA enabled",
-  "hotkey_open_dir_fallback": "Hotkey 'o' ð: the sing-box config directory does not exist yet (it is created when the singbox engine runs) - opened the main config directory instead {_e}: {path}",
+  "hotkey_open_dir_fallback": "Hotkey 'o' \U0001f4c2: the sing-box config directory does not exist yet (it is created when the singbox engine runs) - opened the main config directory instead {_e}: {path}",
   "hotkey_files_hint": "Config files: press the number to open the file in the system default editor.",
   "hotkey_file_entry": "  {n} - {path}",
   "hotkey_open": "Opened in the system default editor {_e}: {path}",
@@ -1378,9 +1913,9 @@ STR = {
   "deps_pkg_ok": "  {_e} {pkg} - OK",
   "deps_pkg_fail": "  {_e} {pkg} - FAILED",
   "deps_conflict_fail": "Packages that could not be installed: {pkgs}. See the pip errors above.",
-  "hotkey_theme": "Hotkey 'm' ð¨: switched the theme to {theme} (--theme).",
+  "hotkey_theme": "Hotkey 'm' \U0001f3a8: switched the theme to {theme} (--theme).",
   "color_enabled": "Colored log output enabled {_e} (hotkey 'n' / --no-color toggles).",
-  "hotkey_color": "Hotkey 'n' ð: colored log output {state} (mirrors --no-color).",
+  "hotkey_color": "Hotkey 'n' \U0001f308: colored log output {state} (mirrors --no-color).",
   "color_state_on": "enabled",
   "color_state_off": "disabled",
   "deps_header": "Python dependencies used by this script {_e}:",
@@ -1454,265 +1989,280 @@ STR = {
   "builtin_no_token": "proxyPass token not available yet",
 },
 "ru": {
-  "engine_selected": "ÐÐ²Ð¸Ð¶Ð¾Ðº Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ {_e}: {engine}",
-  "config_files_header": "Ð¤Ð°Ð¹Ð»Ñ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸ Ð¸ ÐºÑÑÐµÐ¹, ÐºÐ¾ÑÐ¾ÑÑÐµ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐµÑ ÑÐºÑÐ¸Ð¿Ñ {_e}:",
-  "config_file_entry": "  {_e} {path} â {status}",
-  "config_file_exists": "{size} Ð±Ð°Ð¹Ñ, Ð¸Ð·Ð¼ÐµÐ½ÑÐ½ {mtime} UTC",
-  "config_file_dir": "ÐºÐ°ÑÐ°Ð»Ð¾Ð³, {n} ÑÐ»ÐµÐ¼ÐµÐ½ÑÐ¾Ð²",
-  "config_file_missing": "ÐµÑÑ Ð½Ðµ ÑÐ¾Ð·Ð´Ð°Ð½",
-  "engine_builtin": "builtin (Ð²ÑÑÑÐ¾ÐµÐ½Ð½ÑÐ¹ Ð´Ð²Ð¸Ð¶Ð¾Ðº: ÐºÐ°Ð¶Ð´ÑÐ¹ Ð°Ð¿ÑÑÑÐ¸Ð¼ Ð¾Ð±ÑÐ»ÑÐ¶Ð¸Ð²Ð°ÐµÑÑÑ ÐºÐ°Ðº MASQUE Ð¸Ð»Ð¸ HTTP CONNECT, Ñ Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¸Ð¼ ÑÐ¾Ð»Ð±ÑÐºÐ¾Ð¼)",
-  "engine_singbox": "sing-box (Ð²Ð½ÐµÑÐ½Ð¸Ð¹ Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº, Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ MASQUE/HTTP CONNECT)",
-  "lang_selected": "Ð¯Ð·ÑÐº Ð²ÑÐ²Ð¾Ð´Ð°: {lang}",
-  "color_disabled": "Ð¦Ð²ÐµÑÐ½Ð¾Ð¹ Ð²ÑÐ²Ð¾Ð´ Ð¾ÑÐºÐ»ÑÑÑÐ½.",
-  "cache_cleared": "ÐÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÑÑÐ° ÑÐ´Ð°Ð»ÑÐ½: {path}",
-  "cache_clear_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÐ´Ð°Ð»Ð¸ÑÑ ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÑÑÐ° {path}: {err}",
-  "cache_nothing": "ÐÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÑÑÐ° Ð½Ðµ ÑÑÑÐµÑÑÐ²ÑÐµÑ, ÑÐ¸ÑÑÐ¸ÑÑ Ð½ÐµÑÐµÐ³Ð¾.",
-  "cached_session": "ÐÑÑÐ¸ÑÐ¾Ð²Ð°Ð½Ð½Ð°Ñ ÑÐµÑÑÐ¸Ñ ({email}) {_e}. --relogin Ð´Ð»Ñ Ð½Ð¾Ð²Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°.",
-  "enter_email": "Email Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Mozilla: ",
-  "enter_password": "ÐÐ°ÑÐ¾Ð»Ñ: ",
-  "email_missing": "Email Ð½Ðµ Ð·Ð°Ð´Ð°Ð½ (Ð½ÐµÑ Ð½Ð¸ Ð°ÑÐ³ÑÐ¼ÐµÐ½ÑÐ°, Ð½Ð¸ ÐºÑÑÐ°).",
-  "password_missing": "ÐÐ°ÑÐ¾Ð»Ñ Ð½Ðµ Ð·Ð°Ð´Ð°Ð½ (Ð½ÐµÑ Ð½Ð¸ Ð°ÑÐ³ÑÐ¼ÐµÐ½ÑÐ°, Ð½Ð¸ ÐºÑÑÐ° ÑÐµÐºÐ²Ð¸Ð·Ð¸ÑÐ¾Ð²).",
-  "signing_in": "ÐÑÐ¾Ð´ Ð² Mozilla Accounts...",
-  "session_cached": "sessionToken Ð·Ð°ÐºÑÑÐ¸ÑÐ¾Ð²Ð°Ð½ {_e}: {path}",
-  "stretch_version": "ÐÐµÑÑÐ¸Ñ key-stretching Ð°ÐºÐºÐ°ÑÐ½ÑÐ°: {version}",
-  "stretch_v2_note": " (650k Ð¸ÑÐµÑÐ°ÑÐ¸Ð¹ PBKDF2)",
-  "clock_skew": "Ð§Ð°ÑÑ ÐÐ ÑÐ°ÑÑÐ¾Ð´ÑÑÑÑ Ñ ÑÐµÑÐ²ÐµÑÐ°Ð¼Ð¸ Mozilla Ð½Ð° {offset} Ñ; TOTP Ð±ÑÐ´ÐµÑ ÑÑÐ¸ÑÐ°ÑÑÑÑ Ð¿Ð¾ ÑÐµÑÐ²ÐµÑÐ½Ð¾Ð¼Ñ Ð²ÑÐµÐ¼ÐµÐ½Ð¸.",
-  "account_not_found": "ÐÐºÐºÐ°ÑÐ½Ñ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½.",
-  "wrong_password": "ÐÐµÐ²ÐµÑÐ½ÑÐ¹ Ð¿Ð°ÑÐ¾Ð»Ñ (errno 103). ÐÑÐ»Ð¸ Ð²ÑÐ¾Ð´Ð¸Ð»Ð¸ ÑÐµÑÐµÐ· Google/Apple â ÑÐ½Ð°ÑÐ°Ð»Ð° Ð·Ð°Ð´Ð°Ð¹ÑÐµ Ð¿Ð°ÑÐ¾Ð»Ñ: accounts.firefox.com â ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸.",
-  "login_blocked": "ÐÐ¥ÐÐ ÐÐ ÐÐÐÐÐÐ ÐÐÐÐÐÐÐÐ ÐÐÐÐ ({source}): ÑÐ»Ð¸ÑÐºÐ¾Ð¼ Ð¼Ð½Ð¾Ð³Ð¾ Ð½ÐµÑÐ´Ð°ÑÐ½ÑÑ Ð¿Ð¾Ð¿ÑÑÐ¾Ðº Ð¿Ð¾Ð´ÑÑÐ´ (Ð½ÐµÐ²ÐµÑÐ½ÑÐ¹ Ð¿Ð°ÑÐ¾Ð»Ñ Ð¸/Ð¸Ð»Ð¸ ÐºÐ¾Ð´Ñ 2FA).{wait}\nÐ­ÑÐ¾ ÐÐ ÑÐ´Ð°Ð»ÐµÐ½Ð¸Ðµ Ð¸ ÐÐ Ð²ÐµÑÐ½Ð°Ñ Ð±Ð»Ð¾ÐºÐ¸ÑÐ¾Ð²ÐºÐ°. ÐÑÐ¾Ð´ Ð²Ð¾ÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÐµÑÑÑ ÐÐÐÐ¢ÐÐÐ ÐÐÐÐÐÐÐ ÐÐ EMAIL:\n  1) ÐÑÐ¾Ð²ÐµÑÑÑÐµ Ð¿Ð¾ÑÑÑ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° (Ð¸ Ð¿Ð°Ð¿ÐºÑ Â«Ð¡Ð¿Ð°Ð¼Â»): Mozilla Ð¾ÑÐ¿ÑÐ°Ð²Ð¸Ð»Ð° Ð¿Ð¸ÑÑÐ¼Ð¾\n     (Â«New sign-in to FirefoxÂ» / Â«Confirm your sign-inÂ» / ÐºÐ¾Ð´ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ).\n  2) ÐÑÐºÑÐ¾Ð¹ÑÐµ Ð¿Ð¸ÑÑÐ¼Ð¾ Ð¸ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÐµ Ð²ÑÐ¾Ð´ (ÐºÐ½Ð¾Ð¿ÐºÐ° Ð¸Ð»Ð¸ ÐºÐ¾Ð´ Ð½Ð° accounts.firefox.com).\n  3) ÐÐ¾ÑÐ»Ðµ ÑÑÐ¾Ð³Ð¾ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ Ð·Ð°Ð¿ÑÑÐº (Ð² ÑÐµÐ¶Ð¸Ð¼Ðµ --watch ÑÐºÑÐ¸Ð¿Ñ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸Ñ ÑÐ°Ð¼).",
-  "retry_after": " Ð¡ÐµÑÐ²ÐµÑ Ð¿ÑÐ¾ÑÐ¸Ñ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÑ Ð½Ðµ ÑÐ°Ð½ÑÑÐµ ÑÐµÐ¼ ÑÐµÑÐµÐ· ~{sec} Ñ.",
-  "blocked_extra_method": " Ð¡ÐµÑÐ²ÐµÑ ÑÑÐµÐ±ÑÐµÑ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð¼ÐµÑÐ¾Ð´Ð¾Ð¼ '{method}'.",
-  "login_error": "ÐÑÐ¸Ð±ÐºÐ° Ð²ÑÐ¾Ð´Ð° ({status}): {msg}",
-  "server_wants_method": "Ð¡ÐµÑÐ²ÐµÑ Ð·Ð°Ð¿ÑÐ¾ÑÐ¸Ð» Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð²ÑÐ¾Ð´Ð° Ð¼ÐµÑÐ¾Ð´Ð¾Ð¼ '{method}' (Ð¿ÑÐ¸ÑÐ¸Ð½Ð°: {reason}). ÐÐ»Ñ TOTP-Ð°ÐºÐºÐ°ÑÐ½ÑÐ¾Ð² ÑÐµÑÐ²ÐµÑ Ð¿ÑÐ¸Ð½Ð¸Ð¼Ð°ÐµÑ /session/verify/totp Ð½ÐµÐ·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ Ð¾Ñ Ð·Ð°ÑÐ²Ð»ÐµÐ½Ð½Ð¾Ð³Ð¾ Ð¼ÐµÑÐ¾Ð´Ð° â Ð¿ÑÐ¾Ð±ÑÑ TOTP.",
-  "totp_prompt": "ÐÐ¾Ð´ Ð´Ð²ÑÑÑÐ°ÐºÑÐ¾ÑÐ½Ð¾Ð¹ Ð°ÑÑÐµÐ½ÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¸Ð¸ (TOTP): ",
-  "totp_digits_only": "ÐÐ¾Ð´ Ð´Ð¾Ð»Ð¶ÐµÐ½ ÑÐ¾ÑÑÐ¾ÑÑÑ ÑÐ¾Ð»ÑÐºÐ¾ Ð¸Ð· ÑÐ¸ÑÑ.",
-  "totp_not_enabled": "Ð£ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ð° ÑÐµÑÐ²ÐµÑÐµ TOTP Ð½Ðµ Ð²ÐºÐ»ÑÑÑÐ½ (TOTP_TOKEN_NOT_FOUND) â TOTP-Ð²ÐµÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¸Ñ Ð½ÐµÐ²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð°.",
-  "totp_rejected_window": "Ð¡ÐµÑÐ²ÐµÑ Ð¾ÑÐºÐ»Ð¾Ð½Ð¸Ð» ÐºÐ¾Ð´. ÐÑÐ¾Ð²ÐµÑÑÑÐµ, ÑÑÐ¾ ÑÐµÐºÑÐµÑ ÑÐ¾Ð²Ð¿Ð°Ð´Ð°ÐµÑ Ñ Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸ÐµÐ¼-Ð°ÑÑÐµÐ½ÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¾ÑÐ¾Ð¼ (Ð² Ñ.Ñ. Ð½Ðµ Ð¿ÐµÑÐµÑÐ¾Ð·Ð´Ð°Ð²Ð°Ð»ÑÑ Ð»Ð¸ 2FA Ð¿Ð¾ÑÐ»Ðµ ÑÐ¾ÑÑÐ°Ð½ÐµÐ½Ð¸Ñ QR).{clock} ÐÐ´Ñ ÑÐ»ÐµÐ´ÑÑÑÐµÐµ Ð¾ÐºÐ½Ð¾ ...",
-  "totp_rejected_final": "ÐÐ¾Ð´ 2FA Ð½Ðµ Ð¿Ð¾Ð´Ð¾ÑÑÐ» ÑÑÐ¸ ÑÐ°Ð·Ð° Ð¿Ð¾Ð´ÑÑÐ´ (Ð² ÑÐ°Ð·Ð½ÑÑ Ð²ÑÐµÐ¼ÐµÐ½Ð½ÑÑ Ð¾ÐºÐ½Ð°Ñ). Ð¡Ð²ÐµÑÑÑÐµ TOTP-ÑÐµÐºÑÐµÑ Ñ Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸ÐµÐ¼: Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÐ¸ÑÐµ Ñ --qr <ÑÐ²ÐµÐ¶Ð¸Ð¹ QR> â Ð²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð¾, 2FA Ð¿ÐµÑÐµÑÐ¾Ð·Ð´Ð°Ð²Ð°Ð»ÑÑ Ð¸ qr.png ÑÑÑÐ°ÑÐµÐ».",
-  "totp_unknown_error": "ÐÑÐ¸Ð±ÐºÐ° Ð¿ÑÐ¾Ð²ÐµÑÐºÐ¸ 2FA ({status}): {data} (Ð¿ÑÐ¾Ð²ÐµÑÑÑÐµ sessionToken / Ð°ÐºÐºÐ°ÑÐ½Ñ)",
-  "totp_code_current": "Ð¢ÐµÐºÑÑÐ¸Ð¹ TOTP-ÐºÐ¾Ð´: {code} (Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ ÐµÑÑ {sec} Ñ{offset})",
-  "totp_code_generated": "Ð¡Ð³ÐµÐ½ÐµÑÐ¸ÑÐ¾Ð²Ð°Ð½ TOTP-ÐºÐ¾Ð´: {code} (Ð¾ÐºÐ½Ð¾ {period} Ñ, Ð¾ÑÑÐ°Ð»Ð¾ÑÑ {left} Ñ)",
-  "clock_offset_note": ", ÑÐ¼ÐµÑÐµÐ½Ð¸Ðµ ÑÐ°ÑÐ¾Ð² {offset} Ñ",
-  "email_unverified": "Email Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ (ÑÐµÐ³Ð¸ÑÑÑÐ°ÑÐ¸Ñ). ÐÐ¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÐµ email Ð¿Ð¾ ÑÑÑÐ»ÐºÐµ Ð¸Ð· Ð¿Ð¸ÑÑÐ¼Ð° Mozilla, Ð·Ð°ÑÐµÐ¼ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ Ð²ÑÐ¾Ð´.",
-  "email_confirm_required": "Ð¢ÑÐµÐ±ÑÐµÑÑÑ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ðµ Ð²ÑÐ¾Ð´Ð° Ð¿Ð¾ email, Ð° Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ðµ Ð²ÐºÐ»ÑÑÑÐ½ TOTP (Ð¸Ð½Ð°ÑÐµ ÑÐºÑÐ¸Ð¿Ñ Ð²ÐµÑÐ¸ÑÐ¸ÑÐ¸ÑÐ¾Ð²Ð°Ð» Ð±Ñ ÑÐµÑÑÐ¸Ñ ÑÐ°Ð¼). Ð§ÑÐ¾ Ð´ÐµÐ»Ð°ÑÑ:\n  1) ÐÑÐºÑÐ¾Ð¹ÑÐµ Ð¿Ð¾ÑÑÑ, Ð½Ð°Ð¹Ð´Ð¸ÑÐµ Ð¿Ð¸ÑÑÐ¼Ð¾ Mozilla Â«New sign-in to FirefoxÂ» Ð¸ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ´Ð¸ÑÐµ Ð²ÑÐ¾Ð´\n     (Ð»Ð¸Ð±Ð¾ Ð²Ð²ÐµÐ´Ð¸ÑÐµ ÐºÐ¾Ð´ Ð¸Ð· Ð¿Ð¸ÑÑÐ¼Ð° Ð½Ð° accounts.firefox.com);\n  2) Ð¿Ð¾ÑÐ»Ðµ ÑÑÐ¾Ð³Ð¾ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ Ð·Ð°Ð¿ÑÑÐº â ÑÐµÑÑÐ¸Ñ ÑÑÐ°Ð½ÐµÑ Ð´Ð¾Ð²ÐµÑÐµÐ½Ð½Ð¾Ð¹;\n  3) Ð»Ð¸Ð±Ð¾ Ð²ÐºÐ»ÑÑÐ¸ÑÐµ TOTP Ð² Ð½Ð°ÑÑÑÐ¾Ð¹ÐºÐ°Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° (Two-step authentication);\n  4) Ð»Ð¸Ð±Ð¾ Ð²Ð¾Ð¹Ð´Ð¸ÑÐµ Ð² Ð±ÑÐ°ÑÐ·ÐµÑÐµ Firefox Ð¸ Ð·Ð°Ð¿ÑÑÑÐ¸ÑÐµ Ñ --session-token <hex>.",
-  "session_unverified": "Ð¡ÐµÑÑÐ¸Ñ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð° (Ð¼ÐµÑÐ¾Ð´: {method}, Ð¿ÑÐ¸ÑÐ¸Ð½Ð°: {reason}).",
-  "totp_missing": "ÐÐºÐºÐ°ÑÐ½Ñ ÑÑÐµÐ±ÑÐµÑ 2FA, Ð° TOTP-ÑÐµÐºÑÐµÑ Ð½ÐµÐ¸Ð·Ð²ÐµÑÑÐµÐ½. ÐÐ°Ð¿ÑÑÑÐ¸ÑÐµ Ñ --qr <ÐºÐ°ÑÑÐ¸Ð½ÐºÐ°> Ð¸Ð»Ð¸ --totp-secret.",
-  "oauth_fetching": "ÐÐ¾Ð»ÑÑÐµÐ½Ð¸Ðµ OAuth-ÑÐ¾ÐºÐµÐ½Ð° (grant fxa-credentials, scope 'profile https://identity.mozilla.com/apps/vpn')...",
-  "oauth_scope_fallback": "ÐÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ scope Ð¾ÑÐºÐ»Ð¾Ð½ÑÐ½ ÑÐµÑÐ²ÐµÑÐ¾Ð¼, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°Ð½ '{scope}'.",
-  "oauth_scope_denied": "Scope '{scope}' Ð½Ðµ ÑÐ°Ð·ÑÐµÑÑÐ½ (errno 114), Ð¿ÑÐ¾Ð±ÑÑ ÑÐ»ÐµÐ´ÑÑÑÐ¸Ð¹ ...",
-  "oauth_all_scopes_denied": "OAuth: Ð²ÑÐµ scope Ð¾ÑÐºÐ»Ð¾Ð½ÐµÐ½Ñ ÑÐµÑÐ²ÐµÑÐ¾Ð¼ (errno 114). ÐÐ¾ÑÐ»ÐµÐ´Ð½ÑÑ Ð¾ÑÐ¸Ð±ÐºÐ°: {err}",
-  "oauth_session_invalid": "sessionToken Ð½ÐµÐ´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÐµÐ½/Ð¸ÑÑÑÐº (errno {errno}) â ÑÑÐµÐ±ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ»Ð¾Ð³Ð¸Ð½.",
-  "oauth_error": "OAuth-ÑÐ¾ÐºÐµÐ½ Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ ({status}): {data}",
-  "guardian_activating": "ÐÐºÑÐ¸Ð²Ð°ÑÐ¸Ñ Guardian Ð¸ Ð¿Ð¾Ð»ÑÑÐµÐ½Ð¸Ðµ proxyPass...",
-  "guardian_enrolled": "Guardian: enroll Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½ (HTTP {status}).",
-  "guardian_enroll_failed": "/fpn/activate â HTTP {status} {detail} (Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð°Ñ: ÑÐ¾ÐºÐµÐ½ Guardian Ð²ÑÐ´Ð°ÑÑ Ð¸ Ð±ÐµÐ· enroll'Ð°)",
-  "guardian_403": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 403, no_entitlement).\nÐ­ÑÐ¾ ÐÐ Ð¾ÑÐ¸Ð±ÐºÐ° Ð²ÑÐ¾Ð´Ð°: OAuth-ÑÐ¾ÐºÐµÐ½ Ð¿ÑÐ¸Ð½ÑÑ, Ð½Ð¾ Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½ÐµÑ ÑÐ½ÑÐ°Ð¹ÑÐ»Ð¼ÐµÐ½ÑÐ° Firefox IP Protection (Built-in VPN).\nÐÐ¾Ð·Ð¼Ð¾Ð¶Ð½ÑÐµ Ð¿ÑÐ¸ÑÐ¸Ð½Ñ Ð¸ ÑÑÐ¾ Ð´ÐµÐ»Ð°ÑÑ:\n  1) Ð¤ÑÐ½ÐºÑÐ¸Ñ ÐµÑÑ Ð½Ðµ Ð²ÐºÐ»ÑÑÐµÐ½Ð° Ð² Ð²Ð°ÑÐµÐ¼ Ð±ÑÐ°ÑÐ·ÐµÑÐµ: Ð¾ÑÐºÑÐ¾Ð¹ÑÐµ Firefox 149+ â Ð·Ð½Ð°ÑÐ¾Ðº VPN\n     Ð½Ð° ÑÑÐ»Ð±Ð°ÑÐµ â Ð²ÐºÐ»ÑÑÐ¸ÑÐµ Ð¾Ð´Ð¸Ð½ ÑÐ°Ð· Ð´Ð¾ Â«Ð·ÐµÐ»ÑÐ½Ð¾Ð³Ð¾ Ð¸Ð½Ð´Ð¸ÐºÐ°ÑÐ¾ÑÐ°Â» (Ð¿ÐµÑÐ²Ð¾Ðµ Ð²ÐºÐ»ÑÑÐµÐ½Ð¸Ðµ\n     Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ°ÐµÑ ÑÐ½ÑÐ°Ð¹ÑÐ»Ð¼ÐµÐ½Ñ Ðº Ð°ÐºÐºÐ°ÑÐ½ÑÑ).\n  2) Built-in VPN beta Ð²ÑÐºÐ°ÑÑÐ²Ð°ÐµÑÑÑ Ð¿Ð¾ ÑÐµÐ³Ð¸Ð¾Ð½Ð°Ð¼ (Ð½Ð° 2026-09: US/UK/DE/FR). ÐÐ½Ðµ ÑÐ¿Ð¸ÑÐºÐ° â\n     403 Ð¾ÑÑÐ°Ð½ÐµÑÑÑ Ð½ÐµÐ·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ Ð¾Ñ ÑÐºÑÐ¸Ð¿ÑÐ°.\n  3) ÐÑÐ»Ð¸ Ð²ÑÐ¾Ð´ Ð² Mozilla-Ð°ÐºÐºÐ°ÑÐ½Ñ Ð±ÑÐ» ÑÐµÑÐµÐ· Google/Apple Ð¸Ð»Ð¸ Ð°ÐºÐºÐ°ÑÐ½Ñ Ð½Ð¾Ð²ÑÐ¹ â\n     Ð´Ð¾Ð¶Ð´Ð¸ÑÐµÑÑ Ð¿Ð¾Ð»Ð½Ð¾Ð¹ Ð°ÐºÑÐ¸Ð²Ð°ÑÐ¸Ð¸ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð¸ Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ.",
-  "guardian_401": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 401, reauth_required): ÑÐµÑÑÐ¸Ñ/FxA-ÑÐ¾ÐºÐµÐ½ Ð¾ÑÐºÐ»Ð¾Ð½ÐµÐ½Ñ Guardian'Ð¾Ð¼ â ÑÑÐµÐ±ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ»Ð¾Ð³Ð¸Ð½.",
-  "guardian_429": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 429): ÐºÐ²Ð¾ÑÐ° Ð¸ÑÑÐµÑÐ¿Ð°Ð½Ð°, Ð¿Ð¾Ð²ÑÐ¾ÑÐ¸ÑÐµ ÑÐµÑÐµÐ· {retry} Ñ.",
-  "guardian_451": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP 451): ÑÐµÐ³Ð¸Ð¾Ð½ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½.",
-  "guardian_error": "proxyPass Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½ (HTTP {status}): {detail}",
-  "guardian_no_token": "Ð Ð¾ÑÐ²ÐµÑÐµ Guardian Ð½ÐµÑ Ð¿Ð¾Ð»Ñ 'token': {data}",
-  "quota_unlimited": "ÐÐ²Ð¾ÑÐ°: Ð±ÐµÐ·Ð»Ð¸Ð¼Ð¸ÑÐ½Ð°Ñ (x-quota-unlimited: true).",
-  "quota_left": "ÐÐ²Ð¾ÑÐ°: Ð¾ÑÑÐ°Ð»Ð¾ÑÑ {left} Ð¸Ð· {limit}{reset}.",
-  "serverlist_fetching": "ÐÐ°Ð³ÑÑÐ·ÐºÐ° ÑÐ¿Ð¸ÑÐºÐ° ÑÐµÑÐ²ÐµÑÐ¾Ð² (Remote Settings: vpn-serverlist)...",
-  "serverlist_failed": "Ð¡Ð¿Ð¸ÑÐ¾Ðº ÑÐµÑÐ²ÐµÑÐ¾Ð² Ð½Ðµ Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½ Ð½Ð¸ Ð¸Ð· Remote Settings (vpn-serverlist), Ð½Ð¸ Ð¾Ñ Guardian (/api/v2/servers).",
-  "serverlist_done": "Ð¡ÑÑÐ°Ð½: {countries}, Ð¿ÑÐ¸Ð³Ð¾Ð´Ð½ÑÑ ÑÐµÑÐ²ÐµÑÐ¾Ð²: {servers}",
-  "proxypass_received": "proxyPass Ð¿Ð¾Ð»ÑÑÐµÐ½ {_e}, Ð´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÐµÐ½ Ð´Ð¾: {until} (exp {exp} UTC)",
-  "proxypass_jwt": "Ð¡Ð²ÐµÐ¶Ð¸Ð¹ proxyPass JWT:",
-  "session_token_print": "sessionToken (Ð´Ð»Ñ Ð¿Ð¾Ð²ÑÐ¾ÑÐ½ÑÑ Ð·Ð°Ð¿ÑÑÐºÐ¾Ð²):",
-  "json_saved": "JSON ÑÐ¾ÑÑÐ°Ð½ÑÐ½ {_e}: {path}",
-  "qr_need_zxing": "ÐÐ»Ñ ÑÑÐµÐ½Ð¸Ñ QR Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ zxing-cpp:\n    pip install zxing-cpp pyotp Pillow",
-  "qr_need_pillow": "ÐÐ»Ñ Ð¾ÑÐºÑÑÑÐ¸Ñ QR-ÑÐ°Ð¹Ð»Ð° Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ Pillow:\n    pip install Pillow",
-  "qr_not_found": "QR-ÑÐ°Ð¹Ð» Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½: {path}",
-  "qr_open_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¾ÑÐºÑÑÑÑ ÐºÐ°ÑÑÐ¸Ð½ÐºÑ {path}: {err}",
-  "qr_none_found": "QR-ÐºÐ¾Ð´ Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½ Ð² ÑÐ°Ð¹Ð»Ðµ: {path}",
-  "qr_no_otpauth": "Ð ÑÐ°Ð¹Ð»Ðµ {path} Ð½ÐµÑ otpauth:// QR-ÐºÐ¾Ð´Ð°: {sample}",
-  "qr_not_totp": "QR Ð½Ðµ ÑÐ²Ð»ÑÐµÑÑÑ TOTP (otpauth://totp): {sample}",
-  "qr_no_secret": "Ð QR Ð¾ÑÑÑÑÑÑÐ²ÑÐµÑ Ð¿Ð°ÑÐ°Ð¼ÐµÑÑ secret: {sample}",
-  "qr_secret_empty": "ÐÑÑÑÐ¾Ð¹ TOTP-ÑÐµÐºÑÐµÑ.",
-  "qr_secret_bad32": "TOTP-ÑÐµÐºÑÐµÑ Ð½Ðµ ÑÐ²Ð»ÑÐµÑÑÑ ÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐ¼ base32: {err}",
-  "totp_need_pyotp": "ÐÐ»Ñ Ð³ÐµÐ½ÐµÑÐ°ÑÐ¸Ð¸ TOTP Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ pyotp:\n    pip install pyotp",
-  "totp_bad_algo": "ÐÐµÐ¸Ð·Ð²ÐµÑÑÐ½ÑÐ¹ TOTP-Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼: {algo} (Ð¾Ð¶Ð¸Ð´Ð°Ð»ÑÑ SHA1/SHA256/SHA512)",
-  "totp_bad_params": "ÐÐµÐºÐ¾ÑÑÐµÐºÑÐ½ÑÐµ Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÑ TOTP: digits={digits}, period={period}",
-  "totp_init_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¸Ð½Ð¸ÑÐ¸Ð°Ð»Ð¸Ð·Ð¸ÑÐ¾Ð²Ð°ÑÑ TOTP Ð¸Ð· ÑÐµÐºÑÐµÑÐ°: {err}",
-  "qr_saved": "TOTP-ÑÐµÐºÑÐµÑ ÑÐ¾ÑÑÐ°Ð½ÑÐ½ Ð² {path} (mode 600); Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÑ: {digits} ÑÐ¸ÑÑ, Ð¾ÐºÐ½Ð¾ {period} Ñ, {algo}.",
-  "qr_saved_note": "ÐÐ¾Ð´Ñ 2FA ÑÐµÐ¿ÐµÑÑ Ð³ÐµÐ½ÐµÑÐ¸ÑÑÑÑÑÑ Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¸ (pyotp) Ð¿Ð¾ Ð²ÑÐµÐ¼ÐµÐ½Ð¸ ÑÐµÑÐ²ÐµÑÐ¾Ð² Mozilla.",
-  "qr_verify_q": "Ð¡Ð¾Ð²Ð¿Ð°Ð´Ð°ÐµÑ Ð»Ð¸ Ð¾Ð½ Ñ ÐºÐ¾Ð´Ð¾Ð¼ Ð² Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸Ð¸-Ð°ÑÑÐµÐ½ÑÐ¸ÑÐ¸ÐºÐ°ÑÐ¾ÑÐµ? [Y/n]: ",
-  "qr_verify_mismatch": "ÐÑÑÐ°Ð²ÑÑÐµ TOTP-ÑÐµÐºÑÐµÑ (base32) Ð¸Ð· Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸Ñ Ð¸Ð»Ð¸ Ð¿ÑÑÑ Ðº Ð´ÑÑÐ³Ð¾Ð¹ QR-ÐºÐ°ÑÑÐ¸Ð½ÐºÐµ (Enter â Ð¾ÑÐ¼ÐµÐ½Ð°): ",
-  "qr_verify_cancelled": "ÐÑÐ¼ÐµÐ½ÐµÐ½Ð¾: ÑÐµÐºÑÐµÑ Ð¸Ð· QR Ð½Ðµ ÑÐ¾Ð²Ð¿Ð°Ð» Ñ Ð¿ÑÐ¸Ð»Ð¾Ð¶ÐµÐ½Ð¸ÐµÐ¼.\nÐÑÐ»Ð¸ 2FA Ð¿ÐµÑÐµÑÐ¾Ð·Ð´Ð°Ð²Ð°Ð»ÑÑ â ÑÐºÐ°ÑÐ°Ð¹ÑÐµ ÑÐ²ÐµÐ¶Ð¸Ð¹ QR: accounts.firefox.com â ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸ â Two-step authentication.",
-  "qr_code_for_review": "ÐÐ¾Ð´ Ð¸Ð· ÑÐ°ÑÐ¿Ð¾Ð·Ð½Ð°Ð½Ð½Ð¾Ð³Ð¾ QR (Ð´Ð»Ñ ÑÐ²ÐµÑÐºÐ¸, Ð²Ð¾Ð¿ÑÐ¾Ñ Ð½Ðµ Ð·Ð°Ð´Ð°ÑÑÑÑ, --qr-verify ÑÑÐ¾Ð±Ñ Ð²ÐºÐ»ÑÑÐ¸ÑÑ): {code}, Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ ÐµÑÑ {sec} Ñ",
-  "proxy_check_started": "ÐÐ°ÑÐ°Ð»Ð»ÐµÐ»ÑÐ½Ð°Ñ Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° {n} Ð°Ð¿ÑÑÑÐ¸Ð¼-Ð¿ÑÐ¾ÐºÑÐ¸ ÑÐµÑÐµÐ· '{service}' ({url}) ...",
-  "proxy_check_summary_ok": "Проверка: {n}/{total} апстримов пропустили данные",
-  "proxy_check_summary_fail": "Проверка: {n}/{total} апстримов пропустили данные; {n_fail} не пропустили — они всё равно используются ({breakdown})",
-  "probe_reason_tls": "TLS к апстриму не удался (сеть или сторона эгресса)",
-  "probe_reason_timeout": "таймаут",
-  "probe_reason_declined": "эгресс отклонил туннель CONNECT",
-  "probe_reason_refused": "в соединении отказано",
-  "probe_reason_reset": "соединение сброшено",
-  "probe_reason_unreachable": "сеть недоступна",
-  "probe_reason_echo": "ответ echo-сервиса не разобран",
-  "probe_reason_other": "другая транспортная ошибка",
-  "proxy_check_masque_ok": "ÐÑÐ¾Ð²ÐµÑÐºÐ°: {hp} â ÑÑÐ½Ð½ÐµÐ»Ñ MASQUE (HTTP/3 CONNECT-UDP) Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ",
-  "proxy_check_masque_fallback": "ÐÑÐ¾Ð²ÐµÑÐºÐ°: MASQUE Ð½Ð° {hp} Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ â ÑÑÐ¾Ñ Ð°Ð¿ÑÑÑÐ¸Ð¼ Ð±ÑÐ´ÐµÑ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÑ HTTP CONNECT",
-  "proxy_check_connect_ok": "ÐÑÐ¾Ð²ÐµÑÐºÐ°: {hp} â ÑÑÐ½Ð½ÐµÐ»Ñ CONNECT Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ (Ð²Ð½ÐµÑÐ½Ð¸Ð¹ IP {ip})",
-  "proxy_check_connect_fail": "Проверка: {hp} — данные через туннель не прошли ({reason}); апстрим всё равно используется",
-  "proxy_check_disabled": "ÐÑÐµÐ´Ð²Ð°ÑÐ¸ÑÐµÐ»ÑÐ½Ð°Ñ Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° Ð¿ÑÐ¾ÐºÑÐ¸ Ð¾ÑÐºÐ»ÑÑÐµÐ½Ð° (--no-proxy-check): Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÑ Ð²ÑÐµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ Ð¸Ð· ÑÐ¿Ð¸ÑÐºÐ° ÐºÐ°Ðº ÐµÑÑÑ.",
-  "doh_selected": "DNS-резолвер {_e}: {provider} ({url}) — хосты апстримов Fastly резолвятся ТОЛЬКО через DoH (как TRR в Firefox); если этот провайдер недоступен, цепочка откатывается к остальным DoH-провайдерам, системный резолвер — ПОСЛЕДНЕЕ средство.",
-  "doh_system": "DoH отключён {_e} — хосты апстримов резолвит СИСТЕМНЫЙ DNS (отравленный/гео-неверный ответ может увести на чужой PoP Fastly, обычно американский). Используйте --doh <провайдер> или клавишу 'h'.",
-  "doh_system_short": "системный DNS (DoH выключен)",
-  "doh_chain": "Цепочка DoH (проверяется слева направо): {chain} — системный резолвер ПОСЛЕДНЕЕ средство. Строка выводится один раз при старте; отдельные DNS-запросы во время работы в лог не пишутся.",
-  "geo_echo_no_geo": "Проверка гео пропущена: echo-сервис «{service}» возвращает только IP. Используйте --ip-echo-service ipinfo по умолчанию (ipinfo.io/json) — его единственный ответ содержит и IP, и страну/город выхода.",
-  "foxyproxy_no_proxies": "Экспорт FoxyProxy пропущен: локальные прокси сейчас не запущены.",
-  "foxyproxy_export_cancel": "Экспорт FoxyProxy отменён — путь сохранения не выбран.",
-  "foxyproxy_export_done": "Файл настроек FoxyProxy записан: {path} ({n} прокси, формат: {format})",
-  "foxyproxy_export_fail": "Ошибка экспорта настроек FoxyProxy: {err}",
-  "foxyproxy_import_hint": "Импорт в FoxyProxy Standard: файл ({format}) импортируется ЛЮБЫМ путём - кнопка 'Import' вверху страницы Options (рядом с Export) ИЛИ вкладка Import -> 'Import from older versions'. После импорта нажмите 'Save', чтобы прокси сохранились.",
-  "foxyproxy_path_prompt": "Введите путь для сохранения файла настроек FoxyProxy (по умолчанию: {name}): ",
-  "foxyproxy_format_current": "комбинированный settings JSON (актуальный v8+/v9.x 'data' + записи FoxyProxy 6/7 - импортируется ЛЮБЫМ путём FoxyProxy)",
-  "foxyproxy_format_legacy": "устаревший settings JSON (НАСТОЯЩИЙ формат экспорта FoxyProxy 6/7 - для 'Import from older versions')",
-  "doh_cache_state_on": "Кэш DoH {_e}: ВКЛЮЧЁН — ответы кэшируются {ttl} с (клавиша 'k' или --no-doh-cache отключает).",
-  "doh_cache_state_off": "Кэш DoH {_e}: ВЫКЛЮЧЕН (по умолчанию) — каждый запрос идёт в DoH-цепочку напрямую (клавиша 'k' или --doh-cache включает).",
-  "doh_geo_mismatch": "Проверка гео: {hp} выходит в {geo} ({city}), а локация — {cc} ({cname}). Апстрим достигается по неверному маршруту (обычно из-за гео-неверного DNS-ответа); маршрут по IPv6 может при этом показывать правильную страну.",
-  "doh_geo_ok": "Проверка гео: {hp} выходит в {geo} ({city}) — совпадает с локацией {cc}.",
-  "doh_menu_hint": "Выберите DNS-резолвер {_e} — введите его номер/букву и нажмите Enter (Backspace удаляет символ, любая другая клавиша отменяет):",
+  "engine_selected": "\u0414\u0432\u0438\u0436\u043e\u043a \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 {_e}: {engine}",
+  "config_files_header": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 \u0438 \u043a\u044d\u0448\u0435\u0439, \u043a\u043e\u0442\u043e\u0440\u044b\u0435 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u0442 \u0441\u043a\u0440\u0438\u043f\u0442 {_e}:",
+  "config_file_entry": "  {_e} {path} \u2014 {status}",
+  "config_file_exists": "{size} \u0431\u0430\u0439\u0442, \u0438\u0437\u043c\u0435\u043d\u0451\u043d {mtime} UTC",
+  "config_file_dir": "\u043a\u0430\u0442\u0430\u043b\u043e\u0433, {n} \u044d\u043b\u0435\u043c\u0435\u043d\u0442\u043e\u0432",
+  "config_file_missing": "\u0435\u0449\u0451 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d",
+  "engine_builtin": "builtin (\u0432\u0441\u0442\u0440\u043e\u0435\u043d\u043d\u044b\u0439 \u0434\u0432\u0438\u0436\u043e\u043a: \u043a\u0430\u0436\u0434\u044b\u0439 \u0430\u043f\u0441\u0442\u0440\u0438\u043c \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f \u043a\u0430\u043a MASQUE \u0438\u043b\u0438 HTTP CONNECT, \u0441 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438\u043c \u0444\u043e\u043b\u0431\u044d\u043a\u043e\u043c)",
+  "engine_singbox": "sing-box (\u0432\u043d\u0435\u0448\u043d\u0438\u0439 \u0431\u0438\u043d\u0430\u0440\u043d\u0438\u043a, \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b MASQUE/HTTP CONNECT)",
+  "lang_selected": "\u042f\u0437\u044b\u043a \u0432\u044b\u0432\u043e\u0434\u0430: {lang}",
+  "color_disabled": "\u0426\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u043e\u0442\u043a\u043b\u044e\u0447\u0451\u043d.",
+  "cache_cleared": "\u041a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u044d\u0448\u0430 \u0443\u0434\u0430\u043b\u0451\u043d: {path}",
+  "cache_clear_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u044d\u0448\u0430 {path}: {err}",
+  "cache_nothing": "\u041a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u044d\u0448\u0430 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442, \u0447\u0438\u0441\u0442\u0438\u0442\u044c \u043d\u0435\u0447\u0435\u0433\u043e.",
+  "cached_session": "\u041a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u0430\u044f \u0441\u0435\u0441\u0441\u0438\u044f ({email}) {_e}. --relogin \u0434\u043b\u044f \u043d\u043e\u0432\u043e\u0433\u043e \u0432\u0445\u043e\u0434\u0430.",
+  "enter_email": "Email \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 Mozilla: ",
+  "enter_password": "\u041f\u0430\u0440\u043e\u043b\u044c: ",
+  "email_missing": "Email \u043d\u0435 \u0437\u0430\u0434\u0430\u043d (\u043d\u0435\u0442 \u043d\u0438 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u0430, \u043d\u0438 \u043a\u044d\u0448\u0430).",
+  "password_missing": "\u041f\u0430\u0440\u043e\u043b\u044c \u043d\u0435 \u0437\u0430\u0434\u0430\u043d (\u043d\u0435\u0442 \u043d\u0438 \u0430\u0440\u0433\u0443\u043c\u0435\u043d\u0442\u0430, \u043d\u0438 \u043a\u044d\u0448\u0430 \u0440\u0435\u043a\u0432\u0438\u0437\u0438\u0442\u043e\u0432).",
+  "signing_in": "\u0412\u0445\u043e\u0434 \u0432 Mozilla Accounts...",
+  "session_cached": "sessionToken \u0437\u0430\u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d {_e}: {path}",
+  "stretch_version": "\u0412\u0435\u0440\u0441\u0438\u044f key-stretching \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430: {version}",
+  "stretch_v2_note": " (650k \u0438\u0442\u0435\u0440\u0430\u0446\u0438\u0439 PBKDF2)",
+  "clock_skew": "\u0427\u0430\u0441\u044b \u041f\u041a \u0440\u0430\u0441\u0445\u043e\u0434\u044f\u0442\u0441\u044f \u0441 \u0441\u0435\u0440\u0432\u0435\u0440\u0430\u043c\u0438 Mozilla \u043d\u0430 {offset} \u0441; TOTP \u0431\u0443\u0434\u0435\u0442 \u0441\u0447\u0438\u0442\u0430\u0442\u044c\u0441\u044f \u043f\u043e \u0441\u0435\u0440\u0432\u0435\u0440\u043d\u043e\u043c\u0443 \u0432\u0440\u0435\u043c\u0435\u043d\u0438.",
+  "account_not_found": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.",
+  "wrong_password": "\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043f\u0430\u0440\u043e\u043b\u044c (errno 103). \u0415\u0441\u043b\u0438 \u0432\u0445\u043e\u0434\u0438\u043b\u0438 \u0447\u0435\u0440\u0435\u0437 Google/Apple \u2014 \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u0437\u0430\u0434\u0430\u0439\u0442\u0435 \u043f\u0430\u0440\u043e\u043b\u044c: accounts.firefox.com \u2192 \u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438.",
+  "login_blocked": "\u0412\u0425\u041e\u0414 \u0412\u0420\u0415\u041c\u0415\u041d\u041d\u041e \u0417\u0410\u0411\u041b\u041e\u041a\u0418\u0420\u041e\u0412\u0410\u041d ({source}): \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u043c\u043d\u043e\u0433\u043e \u043d\u0435\u0443\u0434\u0430\u0447\u043d\u044b\u0445 \u043f\u043e\u043f\u044b\u0442\u043e\u043a \u043f\u043e\u0434\u0440\u044f\u0434 (\u043d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043f\u0430\u0440\u043e\u043b\u044c \u0438/\u0438\u043b\u0438 \u043a\u043e\u0434\u044b 2FA).{wait}\n\u042d\u0442\u043e \u041d\u0415 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435 \u0438 \u041d\u0415 \u0432\u0435\u0447\u043d\u0430\u044f \u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u043a\u0430. \u0412\u0445\u043e\u0434 \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442\u0441\u044f \u041f\u041e\u0414\u0422\u0412\u0415\u0420\u0416\u0414\u0415\u041d\u0418\u0415\u041c \u041f\u041e EMAIL:\n  1) \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u043e\u0447\u0442\u0443 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 (\u0438 \u043f\u0430\u043f\u043a\u0443 \u00ab\u0421\u043f\u0430\u043c\u00bb): Mozilla \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u043b\u0430 \u043f\u0438\u0441\u044c\u043c\u043e\n     (\u00abNew sign-in to Firefox\u00bb / \u00abConfirm your sign-in\u00bb / \u043a\u043e\u0434 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f).\n  2) \u041e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u043f\u0438\u0441\u044c\u043c\u043e \u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 \u0432\u0445\u043e\u0434 (\u043a\u043d\u043e\u043f\u043a\u0430 \u0438\u043b\u0438 \u043a\u043e\u0434 \u043d\u0430 accounts.firefox.com).\n  3) \u041f\u043e\u0441\u043b\u0435 \u044d\u0442\u043e\u0433\u043e \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0443\u0441\u043a (\u0432 \u0440\u0435\u0436\u0438\u043c\u0435 --watch \u0441\u043a\u0440\u0438\u043f\u0442 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442 \u0441\u0430\u043c).",
+  "retry_after": " \u0421\u0435\u0440\u0432\u0435\u0440 \u043f\u0440\u043e\u0441\u0438\u0442 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u044c \u043d\u0435 \u0440\u0430\u043d\u044c\u0448\u0435 \u0447\u0435\u043c \u0447\u0435\u0440\u0435\u0437 ~{sec} \u0441.",
+  "blocked_extra_method": " \u0421\u0435\u0440\u0432\u0435\u0440 \u0442\u0440\u0435\u0431\u0443\u0435\u0442 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u043c\u0435\u0442\u043e\u0434\u043e\u043c '{method}'.",
+  "login_error": "\u041e\u0448\u0438\u0431\u043a\u0430 \u0432\u0445\u043e\u0434\u0430 ({status}): {msg}",
+  "server_wants_method": "\u0421\u0435\u0440\u0432\u0435\u0440 \u0437\u0430\u043f\u0440\u043e\u0441\u0438\u043b \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u0432\u0445\u043e\u0434\u0430 \u043c\u0435\u0442\u043e\u0434\u043e\u043c '{method}' (\u043f\u0440\u0438\u0447\u0438\u043d\u0430: {reason}). \u0414\u043b\u044f TOTP-\u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432 \u0441\u0435\u0440\u0432\u0435\u0440 \u043f\u0440\u0438\u043d\u0438\u043c\u0430\u0435\u0442 /session/verify/totp \u043d\u0435\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e \u043e\u0442 \u0437\u0430\u044f\u0432\u043b\u0435\u043d\u043d\u043e\u0433\u043e \u043c\u0435\u0442\u043e\u0434\u0430 \u2014 \u043f\u0440\u043e\u0431\u0443\u044e TOTP.",
+  "totp_prompt": "\u041a\u043e\u0434 \u0434\u0432\u0443\u0445\u0444\u0430\u043a\u0442\u043e\u0440\u043d\u043e\u0439 \u0430\u0443\u0442\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u0438 (TOTP): ",
+  "totp_digits_only": "\u041a\u043e\u0434 \u0434\u043e\u043b\u0436\u0435\u043d \u0441\u043e\u0441\u0442\u043e\u044f\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u0438\u0437 \u0446\u0438\u0444\u0440.",
+  "totp_not_enabled": "\u0423 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0435 TOTP \u043d\u0435 \u0432\u043a\u043b\u044e\u0447\u0451\u043d (TOTP_TOKEN_NOT_FOUND) \u2014 TOTP-\u0432\u0435\u0440\u0438\u0444\u0438\u043a\u0430\u0446\u0438\u044f \u043d\u0435\u0432\u043e\u0437\u043c\u043e\u0436\u043d\u0430.",
+  "totp_rejected_window": "\u0421\u0435\u0440\u0432\u0435\u0440 \u043e\u0442\u043a\u043b\u043e\u043d\u0438\u043b \u043a\u043e\u0434. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435, \u0447\u0442\u043e \u0441\u0435\u043a\u0440\u0435\u0442 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u0441 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435\u043c-\u0430\u0443\u0442\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0442\u043e\u0440\u043e\u043c (\u0432 \u0442.\u0447. \u043d\u0435 \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0441\u044f \u043b\u0438 2FA \u043f\u043e\u0441\u043b\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u044f QR).{clock} \u0416\u0434\u0443 \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u043a\u043d\u043e ...",
+  "totp_rejected_final": "\u041a\u043e\u0434 2FA \u043d\u0435 \u043f\u043e\u0434\u043e\u0448\u0451\u043b \u0442\u0440\u0438 \u0440\u0430\u0437\u0430 \u043f\u043e\u0434\u0440\u044f\u0434 (\u0432 \u0440\u0430\u0437\u043d\u044b\u0445 \u0432\u0440\u0435\u043c\u0435\u043d\u043d\u044b\u0445 \u043e\u043a\u043d\u0430\u0445). \u0421\u0432\u0435\u0440\u044c\u0442\u0435 TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 \u0441 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435\u043c: \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441 --qr <\u0441\u0432\u0435\u0436\u0438\u0439 QR> \u2014 \u0432\u043e\u0437\u043c\u043e\u0436\u043d\u043e, 2FA \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0441\u044f \u0438 qr.png \u0443\u0441\u0442\u0430\u0440\u0435\u043b.",
+  "totp_unknown_error": "\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0438 2FA ({status}): {data} (\u043f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 sessionToken / \u0430\u043a\u043a\u0430\u0443\u043d\u0442)",
+  "totp_code_current": "\u0422\u0435\u043a\u0443\u0449\u0438\u0439 TOTP-\u043a\u043e\u0434: {code} (\u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0435\u0449\u0451 {sec} \u0441{offset})",
+  "totp_code_generated": "\u0421\u0433\u0435\u043d\u0435\u0440\u0438\u0440\u043e\u0432\u0430\u043d TOTP-\u043a\u043e\u0434: {code} (\u043e\u043a\u043d\u043e {period} \u0441, \u043e\u0441\u0442\u0430\u043b\u043e\u0441\u044c {left} \u0441)",
+  "clock_offset_note": ", \u0441\u043c\u0435\u0449\u0435\u043d\u0438\u0435 \u0447\u0430\u0441\u043e\u0432 {offset} \u0441",
+  "email_unverified": "Email \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d (\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u044f). \u041f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 email \u043f\u043e \u0441\u0441\u044b\u043b\u043a\u0435 \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 Mozilla, \u0437\u0430\u0442\u0435\u043c \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0432\u0445\u043e\u0434.",
+  "email_confirm_required": "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u0432\u0445\u043e\u0434\u0430 \u043f\u043e email, \u0430 \u0443 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435 \u0432\u043a\u043b\u044e\u0447\u0451\u043d TOTP (\u0438\u043d\u0430\u0447\u0435 \u0441\u043a\u0440\u0438\u043f\u0442 \u0432\u0435\u0440\u0438\u0444\u0438\u0446\u0438\u0440\u043e\u0432\u0430\u043b \u0431\u044b \u0441\u0435\u0441\u0441\u0438\u044e \u0441\u0430\u043c). \u0427\u0442\u043e \u0434\u0435\u043b\u0430\u0442\u044c:\n  1) \u041e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u043f\u043e\u0447\u0442\u0443, \u043d\u0430\u0439\u0434\u0438\u0442\u0435 \u043f\u0438\u0441\u044c\u043c\u043e Mozilla \u00abNew sign-in to Firefox\u00bb \u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 \u0432\u0445\u043e\u0434\n     (\u043b\u0438\u0431\u043e \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u043a\u043e\u0434 \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 \u043d\u0430 accounts.firefox.com);\n  2) \u043f\u043e\u0441\u043b\u0435 \u044d\u0442\u043e\u0433\u043e \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0443\u0441\u043a \u2014 \u0441\u0435\u0441\u0441\u0438\u044f \u0441\u0442\u0430\u043d\u0435\u0442 \u0434\u043e\u0432\u0435\u0440\u0435\u043d\u043d\u043e\u0439;\n  3) \u043b\u0438\u0431\u043e \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u0435 TOTP \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430\u0445 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 (Two-step authentication);\n  4) \u043b\u0438\u0431\u043e \u0432\u043e\u0439\u0434\u0438\u0442\u0435 \u0432 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0435 Firefox \u0438 \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441 --session-token <hex>.",
+  "session_unverified": "\u0421\u0435\u0441\u0441\u0438\u044f \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0430 (\u043c\u0435\u0442\u043e\u0434: {method}, \u043f\u0440\u0438\u0447\u0438\u043d\u0430: {reason}).",
+  "totp_missing": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u0442\u0440\u0435\u0431\u0443\u0435\u0442 2FA, \u0430 TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u0435\u043d. \u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441 --qr <\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0430> \u0438\u043b\u0438 --totp-secret.",
+  "oauth_fetching": "\u041f\u043e\u043b\u0443\u0447\u0435\u043d\u0438\u0435 OAuth-\u0442\u043e\u043a\u0435\u043d\u0430 (grant fxa-credentials, scope 'profile https://identity.mozilla.com/apps/vpn')...",
+  "oauth_scope_fallback": "\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 scope \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u043c, \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d '{scope}'.",
+  "oauth_scope_denied": "Scope '{scope}' \u043d\u0435 \u0440\u0430\u0437\u0440\u0435\u0448\u0451\u043d (errno 114), \u043f\u0440\u043e\u0431\u0443\u044e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ...",
+  "oauth_all_scopes_denied": "OAuth: \u0432\u0441\u0435 scope \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u044b \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u043c (errno 114). \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u044f\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {err}",
+  "oauth_session_invalid": "sessionToken \u043d\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043b\u0435\u043d/\u0438\u0441\u0442\u0451\u043a (errno {errno}) \u2014 \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d.",
+  "oauth_error": "OAuth-\u0442\u043e\u043a\u0435\u043d \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d ({status}): {data}",
+  "guardian_activating": "\u0410\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f Guardian \u0438 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0438\u0435 proxyPass...",
+  "guardian_enrolled": "Guardian: enroll \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d (HTTP {status}).",
+  "guardian_enroll_failed": "/fpn/activate \u2192 HTTP {status} {detail} (\u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0430\u044e: \u0442\u043e\u043a\u0435\u043d Guardian \u0432\u044b\u0434\u0430\u0451\u0442 \u0438 \u0431\u0435\u0437 enroll'\u0430)",
+  "guardian_403": "proxyPass \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d (HTTP 403, no_entitlement).\n\u042d\u0442\u043e \u041d\u0415 \u043e\u0448\u0438\u0431\u043a\u0430 \u0432\u0445\u043e\u0434\u0430: OAuth-\u0442\u043e\u043a\u0435\u043d \u043f\u0440\u0438\u043d\u044f\u0442, \u043d\u043e \u0443 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435\u0442 \u044d\u043d\u0442\u0430\u0439\u0442\u043b\u043c\u0435\u043d\u0442\u0430 Firefox IP Protection (Built-in VPN).\n\u0412\u043e\u0437\u043c\u043e\u0436\u043d\u044b\u0435 \u043f\u0440\u0438\u0447\u0438\u043d\u044b \u0438 \u0447\u0442\u043e \u0434\u0435\u043b\u0430\u0442\u044c:\n  1) \u0424\u0443\u043d\u043a\u0446\u0438\u044f \u0435\u0449\u0451 \u043d\u0435 \u0432\u043a\u043b\u044e\u0447\u0435\u043d\u0430 \u0432 \u0432\u0430\u0448\u0435\u043c \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0435: \u043e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 Firefox 149+ \u2192 \u0437\u043d\u0430\u0447\u043e\u043a VPN\n     \u043d\u0430 \u0442\u0443\u043b\u0431\u0430\u0440\u0435 \u2192 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u0435 \u043e\u0434\u0438\u043d \u0440\u0430\u0437 \u0434\u043e \u00ab\u0437\u0435\u043b\u0451\u043d\u043e\u0433\u043e \u0438\u043d\u0434\u0438\u043a\u0430\u0442\u043e\u0440\u0430\u00bb (\u043f\u0435\u0440\u0432\u043e\u0435 \u0432\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435\n     \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442 \u044d\u043d\u0442\u0430\u0439\u0442\u043b\u043c\u0435\u043d\u0442 \u043a \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0443).\n  2) Built-in VPN beta \u0432\u044b\u043a\u0430\u0442\u044b\u0432\u0430\u0435\u0442\u0441\u044f \u043f\u043e \u0440\u0435\u0433\u0438\u043e\u043d\u0430\u043c (\u043d\u0430 2026-09: US/UK/DE/FR). \u0412\u043d\u0435 \u0441\u043f\u0438\u0441\u043a\u0430 \u2014\n     403 \u043e\u0441\u0442\u0430\u043d\u0435\u0442\u0441\u044f \u043d\u0435\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e \u043e\u0442 \u0441\u043a\u0440\u0438\u043f\u0442\u0430.\n  3) \u0415\u0441\u043b\u0438 \u0432\u0445\u043e\u0434 \u0432 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u0431\u044b\u043b \u0447\u0435\u0440\u0435\u0437 Google/Apple \u0438\u043b\u0438 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u043d\u043e\u0432\u044b\u0439 \u2014\n     \u0434\u043e\u0436\u0434\u0438\u0442\u0435\u0441\u044c \u043f\u043e\u043b\u043d\u043e\u0439 \u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u0438 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u0438 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435.",
+  "guardian_401": "proxyPass \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d (HTTP 401, reauth_required): \u0441\u0435\u0441\u0441\u0438\u044f/FxA-\u0442\u043e\u043a\u0435\u043d \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u044b Guardian'\u043e\u043c \u2014 \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d.",
+  "guardian_429": "proxyPass \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d (HTTP 429): \u043a\u0432\u043e\u0442\u0430 \u0438\u0441\u0447\u0435\u0440\u043f\u0430\u043d\u0430, \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0447\u0435\u0440\u0435\u0437 {retry} \u0441.",
+  "guardian_451": "proxyPass \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d (HTTP 451): \u0440\u0435\u0433\u0438\u043e\u043d \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d.",
+  "guardian_error": "proxyPass \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d (HTTP {status}): {detail}",
+  "guardian_no_token": "\u0412 \u043e\u0442\u0432\u0435\u0442\u0435 Guardian \u043d\u0435\u0442 \u043f\u043e\u043b\u044f 'token': {data}",
+  "quota_unlimited": "\u041a\u0432\u043e\u0442\u0430: \u0431\u0435\u0437\u043b\u0438\u043c\u0438\u0442\u043d\u0430\u044f (x-quota-unlimited: true).",
+  "quota_left": "\u041a\u0432\u043e\u0442\u0430: \u043e\u0441\u0442\u0430\u043b\u043e\u0441\u044c {left} \u0438\u0437 {limit}{reset}.",
+  "serverlist_fetching": "\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u0441\u043f\u0438\u0441\u043a\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 (Remote Settings: vpn-serverlist)...",
+  "serverlist_failed": "\u0421\u043f\u0438\u0441\u043e\u043a \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 \u043d\u0435 \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043d \u043d\u0438 \u0438\u0437 Remote Settings (vpn-serverlist), \u043d\u0438 \u043e\u0442 Guardian (/api/v2/servers).",
+  "serverlist_done": "\u0421\u0442\u0440\u0430\u043d: {countries}, \u043f\u0440\u0438\u0433\u043e\u0434\u043d\u044b\u0445 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432: {servers}",
+  "proxypass_received": "proxyPass \u043f\u043e\u043b\u0443\u0447\u0435\u043d {_e}, \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043b\u0435\u043d \u0434\u043e: {until} (exp {exp} UTC)",
+  "proxypass_jwt": "\u0421\u0432\u0435\u0436\u0438\u0439 proxyPass JWT:",
+  "session_token_print": "sessionToken (\u0434\u043b\u044f \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u044b\u0445 \u0437\u0430\u043f\u0443\u0441\u043a\u043e\u0432):",
+  "json_saved": "JSON \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d {_e}: {path}",
+  "qr_need_zxing": "\u0414\u043b\u044f \u0447\u0442\u0435\u043d\u0438\u044f QR \u043d\u0443\u0436\u0435\u043d \u043f\u0430\u043a\u0435\u0442 zxing-cpp:\n    pip install zxing-cpp pyotp Pillow",
+  "qr_need_pillow": "\u0414\u043b\u044f \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f QR-\u0444\u0430\u0439\u043b\u0430 \u043d\u0443\u0436\u0435\u043d \u043f\u0430\u043a\u0435\u0442 Pillow:\n    pip install Pillow",
+  "qr_not_found": "QR-\u0444\u0430\u0439\u043b \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d: {path}",
+  "qr_open_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 {path}: {err}",
+  "qr_none_found": "QR-\u043a\u043e\u0434 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0432 \u0444\u0430\u0439\u043b\u0435: {path}",
+  "qr_no_otpauth": "\u0412 \u0444\u0430\u0439\u043b\u0435 {path} \u043d\u0435\u0442 otpauth:// QR-\u043a\u043e\u0434\u0430: {sample}",
+  "qr_not_totp": "QR \u043d\u0435 \u044f\u0432\u043b\u044f\u0435\u0442\u0441\u044f TOTP (otpauth://totp): {sample}",
+  "qr_no_secret": "\u0412 QR \u043e\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440 secret: {sample}",
+  "qr_secret_empty": "\u041f\u0443\u0441\u0442\u043e\u0439 TOTP-\u0441\u0435\u043a\u0440\u0435\u0442.",
+  "qr_secret_bad32": "TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 \u043d\u0435 \u044f\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u043c base32: {err}",
+  "totp_need_pyotp": "\u0414\u043b\u044f \u0433\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u0438 TOTP \u043d\u0443\u0436\u0435\u043d \u043f\u0430\u043a\u0435\u0442 pyotp:\n    pip install pyotp",
+  "totp_bad_algo": "\u041d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u044b\u0439 TOTP-\u0430\u043b\u0433\u043e\u0440\u0438\u0442\u043c: {algo} (\u043e\u0436\u0438\u0434\u0430\u043b\u0441\u044f SHA1/SHA256/SHA512)",
+  "totp_bad_params": "\u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0435 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u044b TOTP: digits={digits}, period={period}",
+  "totp_init_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0438\u043d\u0438\u0446\u0438\u0430\u043b\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c TOTP \u0438\u0437 \u0441\u0435\u043a\u0440\u0435\u0442\u0430: {err}",
+  "qr_saved": "TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 {path} (mode 600); \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u044b: {digits} \u0446\u0438\u0444\u0440, \u043e\u043a\u043d\u043e {period} \u0441, {algo}.",
+  "qr_saved_note": "\u041a\u043e\u0434\u044b 2FA \u0442\u0435\u043f\u0435\u0440\u044c \u0433\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u044e\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 (pyotp) \u043f\u043e \u0432\u0440\u0435\u043c\u0435\u043d\u0438 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 Mozilla.",
+  "qr_verify_q": "\u0421\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u043b\u0438 \u043e\u043d \u0441 \u043a\u043e\u0434\u043e\u043c \u0432 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0438-\u0430\u0443\u0442\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0442\u043e\u0440\u0435? [Y/n]: ",
+  "qr_verify_mismatch": "\u0412\u0441\u0442\u0430\u0432\u044c\u0442\u0435 TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 (base32) \u0438\u0437 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u044f \u0438\u043b\u0438 \u043f\u0443\u0442\u044c \u043a \u0434\u0440\u0443\u0433\u043e\u0439 QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0435 (Enter \u2014 \u043e\u0442\u043c\u0435\u043d\u0430): ",
+  "qr_verify_cancelled": "\u041e\u0442\u043c\u0435\u043d\u0435\u043d\u043e: \u0441\u0435\u043a\u0440\u0435\u0442 \u0438\u0437 QR \u043d\u0435 \u0441\u043e\u0432\u043f\u0430\u043b \u0441 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435\u043c.\n\u0415\u0441\u043b\u0438 2FA \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0441\u044f \u2014 \u0441\u043a\u0430\u0447\u0430\u0439\u0442\u0435 \u0441\u0432\u0435\u0436\u0438\u0439 QR: accounts.firefox.com \u2192 \u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u2192 Two-step authentication.",
+  "qr_code_for_review": "\u041a\u043e\u0434 \u0438\u0437 \u0440\u0430\u0441\u043f\u043e\u0437\u043d\u0430\u043d\u043d\u043e\u0433\u043e QR (\u0434\u043b\u044f \u0441\u0432\u0435\u0440\u043a\u0438, \u0432\u043e\u043f\u0440\u043e\u0441 \u043d\u0435 \u0437\u0430\u0434\u0430\u0451\u0442\u0441\u044f, --qr-verify \u0447\u0442\u043e\u0431\u044b \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c): {code}, \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0435\u0449\u0451 {sec} \u0441",
+  "proxy_check_started": "\u041f\u0430\u0440\u0430\u043b\u043b\u0435\u043b\u044c\u043d\u0430\u044f \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 {n} \u0430\u043f\u0441\u0442\u0440\u0438\u043c-\u043f\u0440\u043e\u043a\u0441\u0438 \u0447\u0435\u0440\u0435\u0437 '{service}' ({url}) ...",
+  "proxy_check_summary_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {n}/{total} \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b\u0438 \u0434\u0430\u043d\u043d\u044b\u0435",
+  "proxy_check_summary_fail": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {n}/{total} \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b\u0438 \u0434\u0430\u043d\u043d\u044b\u0435; {n_fail} \u043d\u0435 \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b\u0438 \u2014 \u043e\u043d\u0438 \u0432\u0441\u0451 \u0440\u0430\u0432\u043d\u043e \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442\u0441\u044f ({breakdown})",
+  "probe_reason_tls": "TLS \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0443 \u043d\u0435 \u0443\u0434\u0430\u043b\u0441\u044f (\u0441\u0435\u0442\u044c \u0438\u043b\u0438 \u0441\u0442\u043e\u0440\u043e\u043d\u0430 \u044d\u0433\u0440\u0435\u0441\u0441\u0430)",
+  "probe_reason_timeout": "\u0442\u0430\u0439\u043c\u0430\u0443\u0442",
+  "probe_reason_declined": "\u044d\u0433\u0440\u0435\u0441\u0441 \u043e\u0442\u043a\u043b\u043e\u043d\u0438\u043b \u0442\u0443\u043d\u043d\u0435\u043b\u044c CONNECT",
+  "probe_reason_refused": "\u0432 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u0438 \u043e\u0442\u043a\u0430\u0437\u0430\u043d\u043e",
+  "probe_reason_reset": "\u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u0435 \u0441\u0431\u0440\u043e\u0448\u0435\u043d\u043e",
+  "probe_reason_unreachable": "\u0441\u0435\u0442\u044c \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430",
+  "probe_reason_echo": "\u043e\u0442\u0432\u0435\u0442 echo-\u0441\u0435\u0440\u0432\u0438\u0441\u0430 \u043d\u0435 \u0440\u0430\u0437\u043e\u0431\u0440\u0430\u043d",
+  "probe_reason_nodata": "\u0442\u0443\u043d\u043d\u0435\u043b\u044c \u043f\u0440\u0438\u043d\u044f\u0442, \u043d\u043e UDP-\u0434\u0430\u043d\u043d\u044b\u0435 \u043d\u0435 \u0432\u0435\u0440\u043d\u0443\u043b\u0438\u0441\u044c",
+  "probe_reason_other": "\u0434\u0440\u0443\u0433\u0430\u044f \u0442\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430",
+  "proxy_check_masque_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {hp} \u2014 \u0442\u0443\u043d\u043d\u0435\u043b\u044c MASQUE (HTTP/3 CONNECT-UDP) \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b \u0434\u0430\u043d\u043d\u044b\u0435",
+  "proxy_check_masque_fallback": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: MASQUE \u043d\u0430 {hp} \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0451\u043d \u2014 \u044d\u0442\u043e\u0442 \u0430\u043f\u0441\u0442\u0440\u0438\u043c \u0431\u0443\u0434\u0435\u0442 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u044c HTTP CONNECT",
+  "proxy_check_connect_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {hp} \u2014 \u0442\u0443\u043d\u043d\u0435\u043b\u044c CONNECT \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b \u0434\u0430\u043d\u043d\u044b\u0435 (\u0432\u043d\u0435\u0448\u043d\u0438\u0439 IP {ip})",
+  "proxy_check_connect_fail": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {hp} \u2014 \u0434\u0430\u043d\u043d\u044b\u0435 \u0447\u0435\u0440\u0435\u0437 \u0442\u0443\u043d\u043d\u0435\u043b\u044c \u043d\u0435 \u043f\u0440\u043e\u0448\u043b\u0438 ({reason}); \u0430\u043f\u0441\u0442\u0440\u0438\u043c \u0432\u0441\u0451 \u0440\u0430\u0432\u043d\u043e \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u0442\u0441\u044f",
+  "proxy_check_disabled": "\u041f\u0440\u0435\u0434\u0432\u0430\u0440\u0438\u0442\u0435\u043b\u044c\u043d\u0430\u044f \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043f\u0440\u043e\u043a\u0441\u0438 \u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u0430 (--no-proxy-check): \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e \u0432\u0441\u0435 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b \u0438\u0437 \u0441\u043f\u0438\u0441\u043a\u0430 \u043a\u0430\u043a \u0435\u0441\u0442\u044c.",
+  "doh_selected": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: {provider} ({url}) \u2014 \u0445\u043e\u0441\u0442\u044b \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 Fastly \u0440\u0435\u0437\u043e\u043b\u0432\u044f\u0442\u0441\u044f \u0422\u041e\u041b\u042c\u041a\u041e \u0447\u0435\u0440\u0435\u0437 DoH (\u043a\u0430\u043a TRR \u0432 Firefox); \u0435\u0441\u043b\u0438 \u044d\u0442\u043e\u0442 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d, \u0446\u0435\u043f\u043e\u0447\u043a\u0430 \u043e\u0442\u043a\u0430\u0442\u044b\u0432\u0430\u0435\u0442\u0441\u044f \u043a \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u043c DoH-\u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0430\u043c, \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u2014 \u041f\u041e\u0421\u041b\u0415\u0414\u041d\u0415\u0415 \u0441\u0440\u0435\u0434\u0441\u0442\u0432\u043e.",
+  "doh_system": "DoH \u043e\u0442\u043a\u043b\u044e\u0447\u0451\u043d {_e} \u2014 \u0445\u043e\u0441\u0442\u044b \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0421\u0418\u0421\u0422\u0415\u041c\u041d\u042b\u0419 DNS (\u043e\u0442\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u0439/\u0433\u0435\u043e-\u043d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442 \u043c\u043e\u0436\u0435\u0442 \u0443\u0432\u0435\u0441\u0442\u0438 \u043d\u0430 \u0447\u0443\u0436\u043e\u0439 PoP Fastly, \u043e\u0431\u044b\u0447\u043d\u043e \u0430\u043c\u0435\u0440\u0438\u043a\u0430\u043d\u0441\u043a\u0438\u0439). \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --doh <\u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440> \u0438\u043b\u0438 \u043a\u043b\u0430\u0432\u0438\u0448\u0443 'h'.",
+  "doh_system_short": "\u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (DoH \u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d)",
+  "doh_chain": "\u0426\u0435\u043f\u043e\u0447\u043a\u0430 DoH (\u043f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u0442\u0441\u044f \u0441\u043b\u0435\u0432\u0430 \u043d\u0430\u043f\u0440\u0430\u0432\u043e): {chain} \u2014 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u041f\u041e\u0421\u041b\u0415\u0414\u041d\u0415\u0415 \u0441\u0440\u0435\u0434\u0441\u0442\u0432\u043e. \u0421\u0442\u0440\u043e\u043a\u0430 \u0432\u044b\u0432\u043e\u0434\u0438\u0442\u0441\u044f \u043e\u0434\u0438\u043d \u0440\u0430\u0437 \u043f\u0440\u0438 \u0441\u0442\u0430\u0440\u0442\u0435; \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u044b\u0435 DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0432\u043e \u0432\u0440\u0435\u043c\u044f \u0440\u0430\u0431\u043e\u0442\u044b \u0432 \u043b\u043e\u0433 \u043d\u0435 \u043f\u0438\u0448\u0443\u0442\u0441\u044f.",
+  "geo_echo_no_geo": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d\u0430: echo-\u0441\u0435\u0440\u0432\u0438\u0441 \u00ab{service}\u00bb \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0442\u043e\u043b\u044c\u043a\u043e IP. \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --ip-echo-service ipinfo \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (ipinfo.io/json) \u2014 \u0435\u0433\u043e \u0435\u0434\u0438\u043d\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442 \u0441\u043e\u0434\u0435\u0440\u0436\u0438\u0442 \u0438 IP, \u0438 \u0441\u0442\u0440\u0430\u043d\u0443/\u0433\u043e\u0440\u043e\u0434 \u0432\u044b\u0445\u043e\u0434\u0430.",
+  "foxyproxy_no_proxies": "\u042d\u043a\u0441\u043f\u043e\u0440\u0442 FoxyProxy \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d: \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0441\u0435\u0439\u0447\u0430\u0441 \u043d\u0435 \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u044b.",
+  "foxyproxy_export_cancel": "\u042d\u043a\u0441\u043f\u043e\u0440\u0442 FoxyProxy \u043e\u0442\u043c\u0435\u043d\u0451\u043d \u2014 \u043f\u0443\u0442\u044c \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u044f \u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d.",
+  "foxyproxy_export_done": "\u0424\u0430\u0439\u043b \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a FoxyProxy \u0437\u0430\u043f\u0438\u0441\u0430\u043d: {path} ({n} \u043f\u0440\u043e\u043a\u0441\u0438, \u0444\u043e\u0440\u043c\u0430\u0442: {format})",
+  "foxyproxy_export_fail": "\u041e\u0448\u0438\u0431\u043a\u0430 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a FoxyProxy: {err}",
+  "foxyproxy_import_hint": "\u0418\u043c\u043f\u043e\u0440\u0442 \u0432 FoxyProxy Standard: \u0444\u0430\u0439\u043b ({format}) \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c - \u043a\u043d\u043e\u043f\u043a\u0430 'Import' \u0432\u0432\u0435\u0440\u0445\u0443 \u0441\u0442\u0440\u0430\u043d\u0438\u0446\u044b Options (\u0440\u044f\u0434\u043e\u043c \u0441 Export) \u0418\u041b\u0418 \u0432\u043a\u043b\u0430\u0434\u043a\u0430 Import -> 'Import from older versions'. \u041f\u043e\u0441\u043b\u0435 \u0438\u043c\u043f\u043e\u0440\u0442\u0430 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 'Save', \u0447\u0442\u043e\u0431\u044b \u043f\u0440\u043e\u043a\u0441\u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0441\u044c.",
+  "foxyproxy_path_prompt": "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043f\u0443\u0442\u044c \u0434\u043b\u044f \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u044f \u0444\u0430\u0439\u043b\u0430 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a FoxyProxy (\u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e: {name}): ",
+  "foxyproxy_format_current": "\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 settings JSON (\u0430\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u044b\u0439 v8+/v9.x 'data' + \u0437\u0430\u043f\u0438\u0441\u0438 FoxyProxy 6/7 - \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy)",
+  "foxyproxy_format_legacy": "\u0443\u0441\u0442\u0430\u0440\u0435\u0432\u0448\u0438\u0439 settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7 - \u0434\u043b\u044f 'Import from older versions')",
+  "doh_cache_state_on": "\u041a\u044d\u0448 DoH {_e}: \u0412\u041a\u041b\u042e\u0427\u0401\u041d \u2014 \u043e\u0442\u0432\u0435\u0442\u044b \u043a\u044d\u0448\u0438\u0440\u0443\u044e\u0442\u0441\u044f {ttl} \u0441 (\u043a\u043b\u0430\u0432\u0438\u0448\u0430 'k' \u0438\u043b\u0438 --no-doh-cache \u043e\u0442\u043a\u043b\u044e\u0447\u0430\u0435\u0442).",
+  "doh_cache_state_off": "\u041a\u044d\u0448 DoH {_e}: \u0412\u042b\u041a\u041b\u042e\u0427\u0415\u041d (\u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e) \u2014 \u043a\u0430\u0436\u0434\u044b\u0439 \u0437\u0430\u043f\u0440\u043e\u0441 \u0438\u0434\u0451\u0442 \u0432 DoH-\u0446\u0435\u043f\u043e\u0447\u043a\u0443 \u043d\u0430\u043f\u0440\u044f\u043c\u0443\u044e (\u043a\u043b\u0430\u0432\u0438\u0448\u0430 'k' \u0438\u043b\u0438 --doh-cache \u0432\u043a\u043b\u044e\u0447\u0430\u0435\u0442).",
+  "doh_geo_mismatch": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}), \u0430 \u043b\u043e\u043a\u0430\u0446\u0438\u044f \u2014 {cc} ({cname}). \u0410\u043f\u0441\u0442\u0440\u0438\u043c \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442\u0441\u044f \u043f\u043e \u043d\u0435\u0432\u0435\u0440\u043d\u043e\u043c\u0443 \u043c\u0430\u0440\u0448\u0440\u0443\u0442\u0443 (\u043e\u0431\u044b\u0447\u043d\u043e \u0438\u0437-\u0437\u0430 \u0433\u0435\u043e-\u043d\u0435\u0432\u0435\u0440\u043d\u043e\u0433\u043e DNS-\u043e\u0442\u0432\u0435\u0442\u0430); \u043c\u0430\u0440\u0448\u0440\u0443\u0442 \u043f\u043e IPv6 \u043c\u043e\u0436\u0435\u0442 \u043f\u0440\u0438 \u044d\u0442\u043e\u043c \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u0443\u044e \u0441\u0442\u0440\u0430\u043d\u0443.",
+  "doh_geo_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}) \u2014 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u0441 \u043b\u043e\u043a\u0430\u0446\u0438\u0435\u0439 {cc}.",
+  "doh_menu_hint": "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442):",
   "doh_menu_entry": "  {n} - {name}{url}",
-  "hotkey_doh": "Клавиша 'h': DNS-резолвер переключён на {provider} — новые подключения к апстримам используют его сразу (движок sing-box резолвит сам).",
-  "hotkey_doh_cache": "Клавиша 'k': кэш DoH {state} (зеркалит --doh-cache).",
-  "select_hint": "Введите номер/букву пункта и нажмите Enter. Backspace удаляет последний символ, любая другая клавиша отменяет выбор.",
-  "select_buffer": "Ваш выбор: {buf}",
-  "select_bad": "Пункта '{buf}' нет — отменено.",
-  "locked_note": "Примечание {_e}: в живой коллекции vpn-serverlist почти все страны помечены 'locked', и Firefox их всё равно обслуживает — с v5.0 записи locked включены ПО УМОЛЧАНИЮ (--exclude-locked возвращает старый фильтр).",
-  "upstream_override": "ÐÐµÑÐµÐ¾Ð¿ÑÐµÐ´ÐµÐ»ÐµÐ½Ð¸Ðµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ð°: Ð²ÑÐµ Ð»Ð¾ÐºÐ°ÑÐ¸Ð¸ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÑÑ {host}:{port} Ð²Ð¼ÐµÑÑÐ¾ Ð³Ð¾ÑÐ¾Ð´ÑÐºÐ¸Ñ ÑÐ¾ÑÑÐ¾Ð².",
-  "engine_started": "ÐÐ²Ð¸Ð¶Ð¾Ðº {engine} Ð·Ð°Ð¿ÑÑÐµÐ½: {n} Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ Ð½Ð° {listen}",
+  "hotkey_doh": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'h': DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 {provider} \u2014 \u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u043c \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e \u0441\u0440\u0430\u0437\u0443 (\u0434\u0432\u0438\u0436\u043e\u043a sing-box \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0441\u0430\u043c).",
+  "hotkey_doh_cache": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'k': \u043a\u044d\u0448 DoH {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --doh-cache).",
+  "select_hint": "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u043f\u0443\u043d\u043a\u0442\u0430 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 \u0432\u044b\u0431\u043e\u0440.",
+  "select_buffer": "\u0412\u0430\u0448 \u0432\u044b\u0431\u043e\u0440: {buf}",
+  "select_bad": "\u041f\u0443\u043d\u043a\u0442\u0430 '{buf}' \u043d\u0435\u0442 \u2014 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.",
+  "select_hint_multi": "\u041c\u043d\u043e\u0436\u0435\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0432\u044b\u0431\u043e\u0440: \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0427\u0415\u0420\u0415\u0417 \u041f\u0420\u041e\u0411\u0415\u041b (\u043f\u0440\u0438\u043c\u0435\u0440: 1 3 a) \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter. '0' = \u0432\u0441\u0435 \u043f\u0440\u043e\u043a\u0441\u0438. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442.",
+  "multi_buffer": "\u0412\u044b\u0431\u0440\u0430\u043d\u043e: {buf}",
+  "multi_bad": "\u041f\u0443\u043d\u043a\u0442\u0430 '{tok}' \u043d\u0435\u0442 \u2014 \u043e\u043d \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d.",
+  "countries_menu_hint": "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0442\u043e\u043a\u0435\u043d\u044b \u043f\u0440\u043e\u043a\u0441\u0438 \u0427\u0415\u0420\u0415\u0417 \u041f\u0420\u041e\u0411\u0415\u041b \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (0 = \u0432\u0441\u0435 \u043f\u0440\u043e\u043a\u0441\u0438, Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442):",
+  "countries_menu_entry": "  {n} - {desc}",
+  "filter_all_desc": "\u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0441\u043d\u0438\u043c\u0430\u0435\u0442 \u0444\u0438\u043b\u044c\u0442\u0440)",
+  "countries_filter_applied": "\u0424\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 {_e}: \u0431\u0443\u0434\u0443\u0442 \u043e\u0431\u0441\u043b\u0443\u0436\u0435\u043d\u044b {n} \u0438\u0437 {m} \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 ({list}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u0438 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0435\u0442 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0438 (\u043a\u043b\u0430\u0432\u0438\u0448\u0430 'w' \u0438\u043b\u0438 --countries).",
+  "filter_all_applied": "\u0424\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 {_e}: \u0431\u0443\u0434\u0443\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u044b \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0444\u0438\u043b\u044c\u0442\u0440 \u0441\u043d\u044f\u0442).",
+  "filter_empty_fallback": "\u0421\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0439 \u0444\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435 \u043d\u0430\u0448\u0451\u043b \u043d\u0438 \u043e\u0434\u043d\u043e\u0433\u043e \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430 \u2014 \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u044e\u0442\u0441\u044f \u0412\u0421\u0415 (\u0441\u043d\u0438\u043c\u0438\u0442\u0435 \u0444\u0438\u043b\u044c\u0442\u0440: \u043a\u043b\u0430\u0432\u0438\u0448\u0430 'w' -> 0).",
+  "hotkey_countries": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'w': \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u043e\u0432\u044b\u043c \u0432\u044b\u0431\u043e\u0440\u043e\u043c.",
+  "net_error_retry": "\u0421\u0435\u0442\u0435\u0432\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430 {_e}: {err} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440 \u0447\u0435\u0440\u0435\u0437 30 \u0441 (\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u044b\u0439 \u0441\u0431\u043e\u0439 \u2014 DNS \u0438\u043b\u0438 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u0435; \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u043f\u043e\u043f\u044b\u0442\u043a\u0430 \u043e\u0431\u044b\u0447\u043d\u043e \u0443\u0441\u043f\u0435\u0448\u043d\u0430).",
+  "net_err_dns": "\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u044b\u0439 \u0441\u0431\u043e\u0439 DNS (\u043d\u0435\u0442 \u0430\u0434\u0440\u0435\u0441\u0430, \u0430\u0441\u0441\u043e\u0446\u0438\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u043e\u0433\u043e \u0441 \u0438\u043c\u0435\u043d\u0435\u043c \u0445\u043e\u0441\u0442\u0430)",
+  "net_err_timeout": "\u0438\u0441\u0442\u0451\u043a \u0442\u0430\u0439\u043c\u0430\u0443\u0442",
+  "net_err_conn": "\u0441\u0431\u043e\u0439 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f (\u043e\u0442\u043a\u0430\u0437\u0430\u043d\u043e/\u0441\u0431\u0440\u043e\u0441/\u043d\u0435\u0434\u043e\u0441\u0442\u0438\u0436\u0438\u043c\u043e)",
+  "locked_note": "\u041f\u0440\u0438\u043c\u0435\u0447\u0430\u043d\u0438\u0435 {_e}: \u0432 \u0436\u0438\u0432\u043e\u0439 \u043a\u043e\u043b\u043b\u0435\u043a\u0446\u0438\u0438 vpn-serverlist \u043f\u043e\u0447\u0442\u0438 \u0432\u0441\u0435 \u0441\u0442\u0440\u0430\u043d\u044b \u043f\u043e\u043c\u0435\u0447\u0435\u043d\u044b 'locked', \u0438 Firefox \u0438\u0445 \u0432\u0441\u0451 \u0440\u0430\u0432\u043d\u043e \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u0435\u0442 \u2014 \u0441 v5.0 \u0437\u0430\u043f\u0438\u0441\u0438 locked \u0432\u043a\u043b\u044e\u0447\u0435\u043d\u044b \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e (--exclude-locked \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0441\u0442\u0430\u0440\u044b\u0439 \u0444\u0438\u043b\u044c\u0442\u0440).",
+  "upstream_override": "\u041f\u0435\u0440\u0435\u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0435\u043d\u0438\u0435 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430: \u0432\u0441\u0435 \u043b\u043e\u043a\u0430\u0446\u0438\u0438 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 {host}:{port} \u0432\u043c\u0435\u0441\u0442\u043e \u0433\u043e\u0440\u043e\u0434\u0441\u043a\u0438\u0445 \u0445\u043e\u0441\u0442\u043e\u0432.",
+  "engine_started": "\u0414\u0432\u0438\u0436\u043e\u043a {engine} \u0437\u0430\u043f\u0443\u0449\u0435\u043d: {n} \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0430 {listen}",
   "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]",
-  "port_busy": "ÐÐ¾ÑÑ {port} Ð·Ð°Ð½ÑÑ â Ð¿ÑÐ¾Ð¿ÑÑÐºÐ°Ñ {label} (Ð·Ð°Ð½ÑÑ ÑÑÐ¶Ð¸Ð¼ Ð¿ÑÐ¾ÑÐµÑÑÐ¾Ð¼?).",
-  "no_free_ports": "ÐÐµÑ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½ÑÑ Ð¿Ð¾ÑÑÐ¾Ð² Ð´Ð»Ñ Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ (Ð²ÑÐµ Ð¿Ð¾ÑÑÑ-ÐºÐ°Ð½Ð´Ð¸Ð´Ð°ÑÑ Ð·Ð°Ð½ÑÑÑ).",
-  "no_servers_to_serve": "ÐÐµÑ Ð°Ð¿ÑÑÑÐ¸Ð¼-ÑÐµÑÐ²ÐµÑÐ¾Ð² Ð´Ð»Ñ Ð¾Ð±ÑÐ»ÑÐ¶Ð¸Ð²Ð°Ð½Ð¸Ñ: Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° Ð¾ÑÑÐµÑÐ»Ð° Ð²ÑÑ (Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ --probe-fail keep) Ð»Ð¸Ð±Ð¾ ÑÐ¿Ð¸ÑÐ¾Ðº ÑÐµÑÐ²ÐµÑÐ¾Ð² Ð¿ÑÑÑ.",
-  "tls_plain_http": "Ð°Ð¿ÑÑÑÐ¸Ð¼ Ð¾ÑÐ²ÐµÑÐ¸Ð» Ð¾ÑÐºÑÑÑÑÐ¼ ÑÐµÐºÑÑÐ¾Ð¼ (Ð½Ðµ TLS): {text}",
-  "answer_no_words": "n, no, Ð½, Ð½ÐµÑ",
-  "answer_yes_words": "y, yes, Ð´, Ð´Ð°",
+  "port_busy": "\u041f\u043e\u0440\u0442 {port} \u0437\u0430\u043d\u044f\u0442 \u2014 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430\u044e {label} (\u0437\u0430\u043d\u044f\u0442 \u0447\u0443\u0436\u0438\u043c \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u043c?).",
+  "no_free_ports": "\u041d\u0435\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u044b\u0445 \u043f\u043e\u0440\u0442\u043e\u0432 \u0434\u043b\u044f \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0432\u0441\u0435 \u043f\u043e\u0440\u0442\u044b-\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u044b \u0437\u0430\u043d\u044f\u0442\u044b).",
+  "no_servers_to_serve": "\u041d\u0435\u0442 \u0430\u043f\u0441\u0442\u0440\u0438\u043c-\u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 \u0434\u043b\u044f \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u043d\u0438\u044f: \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043e\u0442\u0441\u0435\u044f\u043b\u0430 \u0432\u0441\u0451 (\u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --probe-fail keep) \u043b\u0438\u0431\u043e \u0441\u043f\u0438\u0441\u043e\u043a \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 \u043f\u0443\u0441\u0442.",
+  "tls_plain_http": "\u0430\u043f\u0441\u0442\u0440\u0438\u043c \u043e\u0442\u0432\u0435\u0442\u0438\u043b \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u043c \u0442\u0435\u043a\u0441\u0442\u043e\u043c (\u043d\u0435 TLS): {text}",
+  "answer_no_words": "n, no, \u043d, \u043d\u0435\u0442",
+  "answer_yes_words": "y, yes, \u0434, \u0434\u0430",
   "deps_manual_hint": "Install manually {_e}: {cmd}",
-  "singbox_missing": "sing-box Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½ Ð² PATH. Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÐµ ÐµÐ³Ð¾ (https://sing-box.sagernet.org/installation/) Ð¸Ð»Ð¸ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ --local-proxy-engine builtin.",
-  "token_updated_builtin": "builtin: Ð½Ð¾Ð²ÑÐ¹ proxyPass Ð¿ÑÐ¸Ð¼ÐµÐ½ÑÐ½ Â«Ð½Ð° Ð»ÐµÑÑÂ» (Ð½Ð¾Ð²ÑÐµ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐµÐ½Ð¸Ñ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÑÑ ÐµÐ³Ð¾, ÑÐµÑÑÐ°ÑÑ Ð½Ðµ Ð½ÑÐ¶ÐµÐ½).",
-  "token_updated_singbox": "sing-box: Ð½Ð¾Ð²ÑÐ¹ proxyPass -> Ð½Ð¾Ð²ÑÐµ ÐºÐ¾Ð½ÑÐ¸Ð³Ð¸ + ÑÐµÑÑÐ°ÑÑ Ð¿ÑÐ¾ÑÐµÑÑÐ¾Ð² ...",
-  "singbox_stopped": "sing-box Ð¾ÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½: {label} ({listen}:{port})",
-  "singbox_died": "sing-box {label} (Ð¿Ð¾ÑÑ {port}) Ð·Ð°Ð²ÐµÑÑÐ¸Ð»ÑÑ (ÐºÐ¾Ð´ {code}).",
-  "proxy_stopping": "ÐÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÑ Ð¿ÑÐ¾ÐºÑÐ¸ ...",
-  "proxy_stopped": "ÐÐ¾ÐºÐ°Ð»ÑÐ½ÑÐµ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¾ÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ.",
-  "relogin_needed": "Ð¢ÑÐµÐ±ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ»Ð¾Ð³Ð¸Ð½ â Ð¿ÑÐ¾Ð±ÑÑ Ð¿Ð¾ ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐ¼ ÑÐµÐºÐ²Ð¸Ð·Ð¸ÑÐ°Ð¼ ...",
-  "blocked_wait": "ÐÑÐ¾Ð´ Ð²ÑÐµÐ¼ÐµÐ½Ð½Ð¾ Ð·Ð°Ð±Ð»Ð¾ÐºÐ¸ÑÐ¾Ð²Ð°Ð½ â Ð¶Ð´Ñ 10 Ð¼Ð¸Ð½ÑÑ Ð¿ÐµÑÐµÐ´ ÑÐ»ÐµÐ´ÑÑÑÐµÐ¹ Ð¿Ð¾Ð¿ÑÑÐºÐ¾Ð¹ (ÑÐ¼. Ð¸Ð½ÑÑÑÑÐºÑÐ¸Ñ Ð¿Ð¾ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ Ð²ÑÑÐµ).",
-  "unexpected_error": "ÐÐµÐ¿ÑÐµÐ´Ð²Ð¸Ð´ÐµÐ½Ð½Ð°Ñ Ð¾ÑÐ¸Ð±ÐºÐ°: {err!r} â Ð¿Ð¾Ð²ÑÐ¾ÑÑ ÑÐµÑÐµÐ· 30 Ñ.",
-  "next_refresh": "Ð¡Ð»ÐµÐ´ÑÑÑÐµÐµ Ð¾Ð±Ð½Ð¾Ð²Ð»ÐµÐ½Ð¸Ðµ {_e} ÑÐµÑÐµÐ· {sec} Ñ ({at} UTC).",
-  "confirm_exit_hint": "Ctrl+C Ð´Ð»Ñ Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸.",
-  "hotkeys_hint": "Горячие клавиши (каждая соответствует параметру скрипта):\n  ♻️ r — перелогин сейчас с полным удалением всех сохранённых данных (--relogin)\n  🧹 c — полностью очистить все сохранённые данные и перезапустить (--clear-cache)\n  🔄 e — сменить движок прокси builtin/sing-box (--local-proxy-engine)\n  🔀 l — сменить адрес прослушивания 127.0.0.1 <-> 0.0.0.0 (--listen)\n  🌐 h — выбрать DNS-резолвер: провайдеры DoH / системный DNS (--doh)\n  💾 k — включить/отключить кэш DoH (--doh-cache)\n  📂 o — открыть каталог конфигураций sing-box (или основной каталог конфигурации)\n  📋 v — скопировать адрес:порт ЛОКАЛЬНОГО прокси\n  📋 b — скопировать адрес:порт АПСТРИМ-прокси\n  🔢 t — показать и скопировать текущий код TOTP\n  🎫 j — показать и скопировать текущий proxyPass JWT\n  🖼️ g — загрузить QR-картинку с секретом 2FA на лету (--qr)\n  👤 u — показать и скопировать логин (email)\n  🔑 p — показать и скопировать пароль\n  📦 d — переустановить ВСЕ Python-зависимости с нуля (--reinstall-deps)\n  ⤴️ s — переустановить sing-box с нуля (--reinstall-singbox)\n  🎨 m — переключить цветовую тему тёмная <-> светлая (--theme)\n  🌈 n — включить/отключить цветной вывод в лог (--no-color)\n  📄 1-9 — открыть файл конфига в системном редакторе по умолчанию\n  🦊 f — экспортировать ВСЕ локальные прокси в настройки FoxyProxy Standard (комбинированный файл: импортируется ЛЮБЫМ путём FoxyProxy) (--foxyproxy-export)\n  🧾 x — экспортировать ВСЕ локальные прокси в УСТАРЕВШИЙ (legacy) settings JSON (НАСТОЯЩИЙ формат экспорта FoxyProxy 6/7, для 'Import from older versions') (--foxyproxy-legacy-export)\n  ⏹️ q — остановка.",
-  "hotkey_relogin": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'r' â»ï¸: ÐÐÐÐÐÐ ÑÐ´Ð°Ð»ÐµÐ½Ð¸Ðµ Ð²ÑÐµÑ ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÑ Ð´Ð°Ð½Ð½ÑÑ â ÐºÑÑÐµÐ¹, ÐºÑÐµÐ´ÐµÐ½ÑÐµÐ»ÑÐ¾Ð², ÐºÐ¾Ð½ÑÐ¸Ð³Ð¾Ð² sing-box â Ð·Ð°ÑÐµÐ¼ ÑÐ²ÐµÐ¶Ð¸Ð¹ Ð²ÑÐ¾Ð´.",
-  "hotkey_clear": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'c' ð§¹: Ð²ÑÐµ ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐµ Ð´Ð°Ð½Ð½ÑÐµ ÑÐ´Ð°Ð»ÐµÐ½Ñ (ÐºÑÑÐ¸, ÐºÑÐµÐ´ÐµÐ½ÑÐµÐ»ÑÑ, ÐºÐ¾Ð½ÑÐ¸Ð³Ð¸ sing-box) â Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÐºÐ°ÑÑÑ Ñ ÑÐ¸ÑÑÐ¾Ð³Ð¾ ÑÐ¾ÑÑÐ¾ÑÐ½Ð¸Ñ.",
-  "hotkey_engine": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'e': Ð¿ÐµÑÐµÐºÐ»ÑÑÐ°Ñ Ð´Ð²Ð¸Ð¶Ð¾Ðº Ð½Ð° {engine} â Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÐµ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÑÑÑÑ Ñ Ð½Ð¸Ð¼.",
-  "hotkey_listen": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'l': Ð¿ÑÐ¾ÑÐ»ÑÑÐ¸Ð²Ð°Ð½Ð¸Ðµ ÑÐµÐ¿ÐµÑÑ Ð½Ð° {host} â Ð»Ð¾ÐºÐ°Ð»ÑÐ½ÑÐµ Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÑÑÑÑ Ñ Ð½Ð¸Ð¼.",
-  "hotkey_totp": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 't' ð¢: ÑÐµÐºÑÑÐ¸Ð¹ ÐºÐ¾Ð´ TOTP â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°.",
-  "hotkey_jwt": "Ð¢ÐµÐºÑÑÐ¸Ð¹ proxyPass JWT {_e} â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°:",
-  "hotkey_jwt_none": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'j' ð«: ÑÐ¾ÐºÐµÐ½Ð° proxyPass ÐµÑÑ Ð½ÐµÑ â Ð¾Ð½ Ð¿Ð¾ÑÐ²Ð¸ÑÑÑ ÑÑÐ°Ð·Ñ Ð¿Ð¾ÑÐ»Ðµ ÑÑÐ¿ÐµÑÐ½Ð¾Ð³Ð¾ Ð²ÑÐ¾Ð´Ð°.",
-  "hotkey_totp_none": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 't' ð¢: ÑÐµÐºÑÐµÑ TOTP Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½. ÐÑÐ¸ÑÐ¸Ð½Ð°: {reason}. Ð¡ÐµÐºÑÐµÑ TOTP ÑÑÐ°Ð½Ð¸ÑÑÑ Ð² credentials.json Ð¸ Ð¿Ð¾Ð¿Ð°Ð´Ð°ÐµÑ ÑÑÐ´Ð° ÑÐ¾Ð»ÑÐºÐ¾ Ð¿Ð¾ÑÐ»Ðµ Ð²ÑÐ¾Ð´Ð° Ñ --qr <QR-ÐºÐ°ÑÑÐ¸Ð½ÐºÐ°> Ð¸Ð»Ð¸ --totp-secret <base32> (Ð»Ð¸Ð±Ð¾ ÑÐµÑÐµÐ· Ð¿ÐµÑÐµÐ¼ÐµÐ½Ð½ÑÑ Ð¾ÐºÑÑÐ¶ÐµÐ½Ð¸Ñ MOZVPN_TOTP_SECRET).",
-  "totp_none_reason_nocreds": "ÑÐ°Ð¹Ð» credentials.json ÐµÑÑ Ð½Ðµ ÑÐ¾Ð·Ð´Ð°Ð½ â Ð½Ð° ÑÑÐ¾Ð¹ Ð¼Ð°ÑÐ¸Ð½Ðµ ÐµÑÑ Ð½Ðµ Ð±ÑÐ»Ð¾ Ð²ÑÐ¾Ð´Ð° Ñ ÑÐ¾ÑÑÐ°Ð½ÐµÐ½Ð¸ÐµÐ¼ ÑÐµÐºÐ²Ð¸Ð·Ð¸ÑÐ¾Ð²",
-  "totp_none_reason_nosecret": "credentials.json ÑÑÑÐµÑÑÐ²ÑÐµÑ, Ð½Ð¾ Ð¿Ð¾Ð»Ñ totp_secret Ð² Ð½ÑÐ¼ Ð½ÐµÑ â ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐ¹ Ð²ÑÐ¾Ð´ Ð±ÑÐ» Ð²ÑÐ¿Ð¾Ð»Ð½ÐµÐ½ Ð±ÐµÐ· --qr / --totp-secret, Ð»Ð¸Ð±Ð¾ Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½Ðµ Ð²ÐºÐ»ÑÑÐµÐ½Ð° 2FA (TOTP)",
-  "hotkey_open_dir_fallback": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'o' ð: ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¹ sing-box ÐµÑÑ Ð½Ðµ ÑÑÑÐµÑÑÐ²ÑÐµÑ (Ð¾Ð½ ÑÐ¾Ð·Ð´Ð°ÑÑÑÑ Ð¿ÑÐ¸ ÑÐ°Ð±Ð¾ÑÐµ Ð´Ð²Ð¸Ð¶ÐºÐ° singbox) â Ð²Ð¼ÐµÑÑÐ¾ Ð½ÐµÐ³Ð¾ Ð¾ÑÐºÑÑÑ Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸ {_e}: {path}",
-  "hotkey_files_hint": "Ð¤Ð°Ð¹Ð»Ñ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸: Ð½Ð°Ð¶Ð¼Ð¸ÑÐµ Ð½Ð¾Ð¼ÐµÑ, ÑÑÐ¾Ð±Ñ Ð¾ÑÐºÑÑÑÑ ÑÐ°Ð¹Ð» Ð² ÑÐ¸ÑÑÐµÐ¼Ð½Ð¾Ð¼ ÑÐµÐ´Ð°ÐºÑÐ¾ÑÐµ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ.",
+  "singbox_missing": "sing-box \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0432 PATH. \u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u0435\u0433\u043e (https://sing-box.sagernet.org/installation/) \u0438\u043b\u0438 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --local-proxy-engine builtin.",
+  "token_updated_builtin": "builtin: \u043d\u043e\u0432\u044b\u0439 proxyPass \u043f\u0440\u0438\u043c\u0435\u043d\u0451\u043d \u00ab\u043d\u0430 \u043b\u0435\u0442\u0443\u00bb (\u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e, \u0440\u0435\u0441\u0442\u0430\u0440\u0442 \u043d\u0435 \u043d\u0443\u0436\u0435\u043d).",
+  "token_updated_singbox": "sing-box: \u043d\u043e\u0432\u044b\u0439 proxyPass -> \u043d\u043e\u0432\u044b\u0435 \u043a\u043e\u043d\u0444\u0438\u0433\u0438 + \u0440\u0435\u0441\u0442\u0430\u0440\u0442 \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u0432 ...",
+  "singbox_stopped": "sing-box \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d: {label} ({listen}:{port})",
+  "singbox_died": "sing-box {label} (\u043f\u043e\u0440\u0442 {port}) \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b\u0441\u044f (\u043a\u043e\u0434 {code}).",
+  "proxy_stopping": "\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 ...",
+  "proxy_stopped": "\u041b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u044b.",
+  "relogin_needed": "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u2014 \u043f\u0440\u043e\u0431\u0443\u044e \u043f\u043e \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u043c \u0440\u0435\u043a\u0432\u0438\u0437\u0438\u0442\u0430\u043c ...",
+  "blocked_wait": "\u0412\u0445\u043e\u0434 \u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e \u0437\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d \u2014 \u0436\u0434\u0443 10 \u043c\u0438\u043d\u0443\u0442 \u043f\u0435\u0440\u0435\u0434 \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0439 \u043f\u043e\u043f\u044b\u0442\u043a\u043e\u0439 (\u0441\u043c. \u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u044e \u043f\u043e \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044e \u0432\u044b\u0448\u0435).",
+  "unexpected_error": "\u041d\u0435\u043f\u0440\u0435\u0434\u0432\u0438\u0434\u0435\u043d\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {err!r} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u044e \u0447\u0435\u0440\u0435\u0437 30 \u0441.",
+  "next_refresh": "\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 {_e} \u0447\u0435\u0440\u0435\u0437 {sec} \u0441 ({at} UTC).",
+  "confirm_exit_hint": "Ctrl+C \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438.",
+  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \u267b\ufe0f r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 sing-box (\u0438\u043b\u0438 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f5bc\ufe0f g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \u2934\ufe0f s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4c4 1-9 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u043a\u043e\u043d\u0444\u0438\u0433\u0430 \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \u23f9\ufe0f q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
+  "hotkey_relogin": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'r' \u267b\ufe0f: \u041f\u041e\u041b\u041d\u041e\u0415 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435 \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 \u2014 \u043a\u044d\u0448\u0435\u0439, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u043e\u0432, \u043a\u043e\u043d\u0444\u0438\u0433\u043e\u0432 sing-box \u2014 \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434.",
+  "hotkey_clear": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'c' \U0001f9f9: \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0443\u0434\u0430\u043b\u0435\u043d\u044b (\u043a\u044d\u0448\u0438, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u044b, \u043a\u043e\u043d\u0444\u0438\u0433\u0438 sing-box) \u2014 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u044e\u0441\u044c \u0441 \u0447\u0438\u0441\u0442\u043e\u0433\u043e \u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u044f.",
+  "hotkey_engine": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'e': \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u044e \u0434\u0432\u0438\u0436\u043e\u043a \u043d\u0430 {engine} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
+  "hotkey_listen": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'l': \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u0435 \u0442\u0435\u043f\u0435\u0440\u044c \u043d\u0430 {host} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
+  "hotkey_totp": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 't' \U0001f522: \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP \u2014 \u0442\u0430\u043a\u0436\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430.",
+  "hotkey_jwt": "\u0422\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT {_e} \u2014 \u0442\u0430\u043a\u0436\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430:",
+  "hotkey_jwt_none": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'j' \U0001f3ab: \u0442\u043e\u043a\u0435\u043d\u0430 proxyPass \u0435\u0449\u0451 \u043d\u0435\u0442 \u2014 \u043e\u043d \u043f\u043e\u044f\u0432\u0438\u0442\u0441\u044f \u0441\u0440\u0430\u0437\u0443 \u043f\u043e\u0441\u043b\u0435 \u0443\u0441\u043f\u0435\u0448\u043d\u043e\u0433\u043e \u0432\u0445\u043e\u0434\u0430.",
+  "hotkey_totp_none": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 't' \U0001f522: \u0441\u0435\u043a\u0440\u0435\u0442 TOTP \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d. \u041f\u0440\u0438\u0447\u0438\u043d\u0430: {reason}. \u0421\u0435\u043a\u0440\u0435\u0442 TOTP \u0445\u0440\u0430\u043d\u0438\u0442\u0441\u044f \u0432 credentials.json \u0438 \u043f\u043e\u043f\u0430\u0434\u0430\u0435\u0442 \u0442\u0443\u0434\u0430 \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e\u0441\u043b\u0435 \u0432\u0445\u043e\u0434\u0430 \u0441 --qr <QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0430> \u0438\u043b\u0438 --totp-secret <base32> (\u043b\u0438\u0431\u043e \u0447\u0435\u0440\u0435\u0437 \u043f\u0435\u0440\u0435\u043c\u0435\u043d\u043d\u0443\u044e \u043e\u043a\u0440\u0443\u0436\u0435\u043d\u0438\u044f MOZVPN_TOTP_SECRET).",
+  "totp_none_reason_nocreds": "\u0444\u0430\u0439\u043b credentials.json \u0435\u0449\u0451 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d \u2014 \u043d\u0430 \u044d\u0442\u043e\u0439 \u043c\u0430\u0448\u0438\u043d\u0435 \u0435\u0449\u0451 \u043d\u0435 \u0431\u044b\u043b\u043e \u0432\u0445\u043e\u0434\u0430 \u0441 \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435\u043c \u0440\u0435\u043a\u0432\u0438\u0437\u0438\u0442\u043e\u0432",
+  "totp_none_reason_nosecret": "credentials.json \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442, \u043d\u043e \u043f\u043e\u043b\u044f totp_secret \u0432 \u043d\u0451\u043c \u043d\u0435\u0442 \u2014 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0439 \u0432\u0445\u043e\u0434 \u0431\u044b\u043b \u0432\u044b\u043f\u043e\u043b\u043d\u0435\u043d \u0431\u0435\u0437 --qr / --totp-secret, \u043b\u0438\u0431\u043e \u0443 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435 \u0432\u043a\u043b\u044e\u0447\u0435\u043d\u0430 2FA (TOTP)",
+  "hotkey_open_dir_fallback": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'o' \U0001f4c2: \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 sing-box \u0435\u0449\u0451 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442 (\u043e\u043d \u0441\u043e\u0437\u0434\u0430\u0451\u0442\u0441\u044f \u043f\u0440\u0438 \u0440\u0430\u0431\u043e\u0442\u0435 \u0434\u0432\u0438\u0436\u043a\u0430 singbox) \u2014 \u0432\u043c\u0435\u0441\u0442\u043e \u043d\u0435\u0433\u043e \u043e\u0442\u043a\u0440\u044b\u0442 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 {_e}: {path}",
+  "hotkey_files_hint": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438: \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440, \u0447\u0442\u043e\u0431\u044b \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e.",
   "hotkey_file_entry": "  {n} - {path}",
-  "hotkey_open": "ÐÑÐºÑÑÐ» Ð² ÑÐ¸ÑÑÐµÐ¼Ð½Ð¾Ð¼ ÑÐµÐ´Ð°ÐºÑÐ¾ÑÐµ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ {_e}: {path}",
-  "hotkey_open_dir": "ÐÑÐºÑÑÐ» ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¹ Ð² ÑÐ¸ÑÑÐµÐ¼Ð½Ð¾Ð¼ ÑÐ°Ð¹Ð»Ð¾Ð²Ð¾Ð¼ Ð¼ÐµÐ½ÐµÐ´Ð¶ÐµÑÐµ {_e}: {path}",
-  "hotkey_open_fail": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¾ÑÐºÑÑÑÑ {path}: {err}",
-  "hotkey_open_missing": "Ð¤Ð°Ð¹Ð» Ð½Ðµ ÑÑÑÐµÑÑÐ²ÑÐµÑ: {path}",
-  "hotkey_copy_local_hint": "Скопировать адрес ЛОКАЛЬНОГО прокси в буфер обмена — введите его номер/букву и нажмите Enter:",
-  "hotkey_copy_remote_hint": "Скопировать адрес АПСТРИМ-прокси в буфер обмена — введите его номер/букву и нажмите Enter:",
+  "hotkey_open": "\u041e\u0442\u043a\u0440\u044b\u043b \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e {_e}: {path}",
+  "hotkey_open_dir": "\u041e\u0442\u043a\u0440\u044b\u043b \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0444\u0430\u0439\u043b\u043e\u0432\u043e\u043c \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0435 {_e}: {path}",
+  "hotkey_open_fail": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043a\u0440\u044b\u0442\u044c {path}: {err}",
+  "hotkey_open_missing": "\u0424\u0430\u0439\u043b \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442: {path}",
+  "hotkey_copy_local_hint": "\u0421\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter:",
+  "hotkey_copy_remote_hint": "\u0421\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter:",
   "hotkey_copy_entry": "  {n} - {addr} ({label})",
-  "hotkey_copied": "Ð¡ÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð» Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð° {_e}: {text}",
-  "hotkey_copy_fail": "ÐÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð° Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½ Ð² ÑÑÐ¾Ð¹ ÑÐ¸ÑÑÐµÐ¼Ðµ: {err}",
-  "hotkey_copy_cancel": "Выбор отменён — нажмите v, b или h, чтобы повторить.",
-  "hotkey_stop": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'q': Ð·Ð°Ð¿ÑÐ¾ÑÐµÐ½Ð° Ð¾ÑÑÐ°Ð½Ð¾Ð²ÐºÐ°.",
-  "retry_wait": "ÐÑÐ¾Ð´ Ð½Ðµ ÑÐ´Ð°Ð»ÑÑ Ñ Ð¿ÐµÑÐ²Ð¾Ð³Ð¾ ÑÐ°Ð·Ð° â Ð¾Ð±ÑÑÐ½Ð¾ Ð¿Ð¾Ð»ÑÑÐ°ÐµÑÑÑ ÑÐ¾ Ð²ÑÐ¾ÑÐ¾Ð³Ð¾. ÐÐÐÐÐÐÐÐ¢Ð: Ð·Ð°Ð¿ÑÐ¾Ñ Ð»Ð¾Ð³Ð¸Ð½Ð°/Ð¿Ð°ÑÐ¾Ð»Ñ/TOTP Ð¿Ð¾ÑÐ²Ð¸ÑÑÑ ÑÐ½Ð¾Ð²Ð° Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¸, Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÐº ÑÐºÑÐ¸Ð¿ÑÐ° Ð½Ðµ Ð½ÑÐ¶ÐµÐ½.",
-  "retry_in": "Ð¡Ð»ÐµÐ´ÑÑÑÐ°Ñ Ð¿Ð¾Ð¿ÑÑÐºÐ° Ð²ÑÐ¾Ð´Ð° ÑÐµÑÐµÐ·:",
-  "theme_switched": "Ð¢ÐµÐ¼Ð° Ð¿ÐµÑÐµÐºÐ»ÑÑÐµÐ½Ð° {_e}: {theme}",
-  "theme_bg_forced": "Ð¤Ð¾Ð½ Ð¾ÐºÐ½Ð° ÐºÐ¾Ð½ÑÐ¾Ð»Ð¸ ÐÐ ÐÐÐ£ÐÐÐ¢ÐÐÐ¬ÐÐ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}: {bg} (escape-Ð¿Ð¾ÑÐ»ÐµÐ´Ð¾Ð²Ð°ÑÐµÐ»ÑÐ½Ð¾ÑÑÑ OSC 11 â ÑÐµÐ¼Ð° ÑÐµÐ¿ÐµÑÑ Ð¿ÐµÑÐµÐºÑÐ°ÑÐ¸Ð²Ð°ÐµÑ Ð¸ ÑÐ°Ð¼Ð¾ Ð¾ÐºÐ½Ð¾, Ð° Ð½Ðµ ÑÐ¾Ð»ÑÐºÐ¾ ÑÑÑÐ¾ÐºÐ¸ Ð»Ð¾Ð³Ð°).",
-  "theme_bg_exit": "ÐÑÐ¸ Ð²ÑÑÐ¾Ð´Ðµ ÑÐ¾Ð½ ÐºÐ¾Ð½ÑÐ¾Ð»Ð¸ Ð¿Ð¾ ÑÐ¼Ð¾Ð»ÑÐ°Ð½Ð¸Ñ Ð±ÑÐ´ÐµÑ Ð²Ð¾ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e} (OSC 111). ÐÑÐ»Ð¸ Ð²Ð°Ñ ÑÐµÑÐ¼Ð¸Ð½Ð°Ð» Ð¸Ð³Ð½Ð¾ÑÐ¸ÑÑÐµÑ ÑÑÐ¾Ñ ÑÐ±ÑÐ¾Ñ, Ð²ÐµÑÐ½Ð¸ÑÐµ ÑÐ²ÐµÑ Ð¾ÐºÐ½Ð° Ð² Ð½Ð°ÑÑÑÐ¾Ð¹ÐºÐ°Ñ ÐµÐ³Ð¾ Ð¿ÑÐ¾ÑÐ¸Ð»Ñ.",
-  "deps_fallback_each": "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð¾Ð´Ð½Ð¾Ð¹ ÐºÐ¾Ð¼Ð°Ð½Ð´Ð¾Ð¹ Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ pip) {_e} â Ð¿Ð¾Ð²ÑÐ¾ÑÑÑ ÐºÐ°Ð¶Ð´ÑÐ¹ Ð¿Ð°ÐºÐµÑ Ð¾ÑÐ´ÐµÐ»ÑÐ½Ð¾ ÐÐÐ --force-reinstall: Ð¿ÑÐ¸Ð½ÑÐ´Ð¸ÑÐµÐ»ÑÐ½Ð°Ñ ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð¾Ð±ÑÐ¸Ñ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ Ð² ÑÐ¾ÑÐ½ÑÐµ Ð²ÐµÑÑÐ¸Ð¸ â Ð¾Ð±ÑÑÐ½Ð°Ñ Ð¿ÑÐ¸ÑÐ¸Ð½Ð° ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑÐ¾Ð².",
-  "deps_fallback_nodeps": "{pkg}: Ð²ÑÑ ÐµÑÑ ÐºÐ¾Ð½ÑÐ»Ð¸ÐºÑ {_e} â ÐºÑÐ°Ð¹Ð½ÑÑ Ð¼ÐµÑÐ°: pip install {pkg} --no-deps (ÑÐ¶Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ð½Ð¾Ðµ Ð´ÐµÑÐµÐ²Ð¾ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ ÑÐ´Ð¾Ð²Ð»ÐµÑÐ²Ð¾ÑÑÐµÑ Ð¸Ð¼Ð¿Ð¾ÑÑÑ).",
-  "deps_pkg_ok": "  {_e} {pkg} â OK",
-  "deps_pkg_fail": "  {_e} {pkg} â ÐÐ Ð£ÐÐÐÐÐ¡Ð¬",
-  "deps_conflict_fail": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ Ð¿Ð°ÐºÐµÑÑ: {pkgs}. Ð¡Ð¼. Ð¾ÑÐ¸Ð±ÐºÐ¸ pip Ð²ÑÑÐµ.",
-  "hotkey_theme": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'm' ð¨: ÑÐµÐ¼Ð° Ð¿ÐµÑÐµÐºÐ»ÑÑÐµÐ½Ð° Ð½Ð° {theme} (--theme).",
-  "color_enabled": "Ð¦Ð²ÐµÑÐ½Ð¾Ð¹ Ð²ÑÐ²Ð¾Ð´ Ð²ÐºÐ»ÑÑÑÐ½ {_e} (Ð¿ÐµÑÐµÐºÐ»ÑÑÐ°ÐµÑÑÑ ÐºÐ»Ð°Ð²Ð¸ÑÐµÐ¹ 'n' / --no-color).",
-  "hotkey_color": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'n' ð: ÑÐ²ÐµÑÐ½Ð¾Ð¹ Ð²ÑÐ²Ð¾Ð´ {state} (Ð·ÐµÑÐºÐ°Ð»Ð¸Ñ --no-color).",
-  "color_state_on": "Ð²ÐºÐ»ÑÑÑÐ½",
-  "color_state_off": "Ð¾ÑÐºÐ»ÑÑÑÐ½",
-  "deps_header": "Python-Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸, ÐºÐ¾ÑÐ¾ÑÑÐµ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐµÑ ÑÑÐ¾Ñ ÑÐºÑÐ¸Ð¿Ñ {_e}:",
-  "singbox_dep_header": "ÐÐ½ÐµÑÐ½ÑÑ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÑ (Ð½Ðµ pip-Ð¿Ð°ÐºÐµÑ) {_e}:",
-  "singbox_dep_ok": "  {_e} sing-box â ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½: {path} (Ð²ÐµÑÑÐ¸Ñ {version})",
-  "singbox_dep_missing": "  {_e} sing-box â ÐÐ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ (Ð½ÐµÐ¾Ð±ÑÐ·Ð°ÑÐµÐ»ÐµÐ½: Ð½ÑÐ¶ÐµÐ½ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð´Ð²Ð¸Ð¶ÐºÐ° 'singbox'; Ð²ÑÑÑÐ¾ÐµÐ½Ð½ÑÐ¹ Ð´Ð²Ð¸Ð¶Ð¾Ðº Ð¿Ð¾Ð»Ð½Ð¾ÑÑÑÑ ÑÐ°Ð±Ð¾ÑÐ°ÐµÑ Ð±ÐµÐ· Ð½ÐµÐ³Ð¾)",
-  "deps_entry_ok": "  {_e} {pip:<12} (Ð¼Ð¾Ð´ÑÐ»Ñ {module:<10}) {version:<12} â ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½",
-  "deps_entry_missing": "  {_e} {pip:<12} (Ð¼Ð¾Ð´ÑÐ»Ñ {module:<10}) â ÐÐ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½{need}",
-  "deps_need_required": " â ÐÐ£ÐÐÐ Ð´Ð»Ñ TOTP/QR",
-  "deps_need_optional": " â Ð½ÐµÐ¾Ð±ÑÐ·Ð°ÑÐµÐ»ÑÐ½ÑÐ¹ (ÑÐµÐ°Ð»ÑÐ½ÑÐ¹ MASQUE / Ð¿ÑÐ¾Ð²ÐµÑÐºÐ° HTTP-3)",
-  "deps_missing_note": "ÐÑÑÑÑÑÑÐ²ÑÑÑ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸: {list}.",
-  "deps_install_q": "Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ Ð½ÐµÐ´Ð¾ÑÑÐ°ÑÑÐ¸Ðµ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ ÑÐµÐ¹ÑÐ°Ñ ÑÐµÑÐµÐ· pip ({cmd})? [Y/n]: ",
-  "deps_installing": "Ð£ÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ {_e}: {pkgs} ...",
-  "deps_install_ok": "ÐÐ°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ ÑÑÐ¿ÐµÑÐ½Ð¾ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ {_e}.",
-  "deps_install_fail": "pip Ð·Ð°Ð²ÐµÑÑÐ¸Ð»ÑÑ Ñ Ð¾ÑÐ¸Ð±ÐºÐ¾Ð¹ (ÐºÐ¾Ð´ {code}): {err}",
-  "deps_frozen_note": "Ð¡ÐºÑÐ¸Ð¿Ñ ÑÐºÐ¾Ð¼Ð¿Ð¸Ð»Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº (frozen) â Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ°Ñ ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð½ÐµÐ²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð°. Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÐµ Ð²ÑÑÑÐ½ÑÑ: {cmd}",
-  "deps_install_declined": "ÐÐ°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ â Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð°Ñ Ð±ÐµÐ· Ð½Ð¸Ñ.",
-  "deps_reinstall_header": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ ÐÐ¡Ð Python-Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ñ Ð½ÑÐ»Ñ {_e}: {pkgs}",
-  "deps_reinstall_ok": "ÐÑÐµ Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ ÑÑÐ¿ÐµÑÐ½Ð¾ Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ {_e}.",
-  "deps_reinstall_fail": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐµÐ¹ Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð´ {code}): {err}",
-  "deps_reinstall_skip_frozen": "Ð¡ÐºÑÐ¸Ð¿Ñ â ÑÐºÐ¾Ð¼Ð¿Ð¸Ð»Ð¸ÑÐ¾Ð²Ð°Ð½Ð½ÑÐ¹ Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº (frozen): Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° ÑÐµÑÐµÐ· pip Ð½ÐµÐ²Ð¾Ð·Ð¼Ð¾Ð¶Ð½Ð°, Ð·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ð²ÑÑÑÐ¾ÐµÐ½Ñ Ð² Ð±Ð¸Ð½Ð°ÑÐ½Ð¸Ðº.",
-  "singbox_install_header": "sing-box Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}. Ð¡ÐºÑÐ¸Ð¿Ñ ÐÐÐÐÐÐ¡Ð¢Ð¬Ð® ÑÐ°Ð±Ð¾ÑÐ°ÐµÑ Ð¸ Ð±ÐµÐ· Ð½ÐµÐ³Ð¾: Ð²ÑÑÑÐ¾ÐµÐ½Ð½ÑÐ¹ Ð´Ð²Ð¸Ð¶Ð¾Ðº Ð¾Ð±ÑÐ»ÑÐ¶Ð¸Ð²Ð°ÐµÑ ÑÐµ Ð¶Ðµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ (MASQUE / HTTP CONNECT) Ð²Ð½ÑÑÑÐ¸ ÑÑÐ¾Ð³Ð¾ Python-Ð¿ÑÐ¾ÑÐµÑÑÐ°. sing-box Ð½ÑÐ¶ÐµÐ½ ÑÐ¾Ð»ÑÐºÐ¾ Ð´Ð»Ñ Ð´Ð²Ð¸Ð¶ÐºÐ° 'singbox'.",
-  "singbox_install_q": "Ð£ÑÑÐ°Ð½Ð¾Ð²Ð¸ÑÑ sing-box ÑÐµÐ¹ÑÐ°Ñ? [y/N]: ",
-  "singbox_install_cmd": "ÐÐ¾Ð¼Ð°Ð½Ð´Ð° ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ Ð´Ð»Ñ ÑÑÐ¾Ð¹ ÑÐ¸ÑÑÐµÐ¼Ñ {_e}: {cmd}",
-  "singbox_install_manual": "Ð ÑÑÐ½Ð°Ñ ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ°: Ð¾ÑÐºÑÐ¾Ð¹ÑÐµ {url} â Ð¾ÑÐ¸ÑÐ¸Ð°Ð»ÑÐ½Ð°Ñ ÑÑÑÐ°Ð½Ð¸ÑÐ° ÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ¸ sing-box.",
-  "singbox_install_started": "Ð£ÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ sing-box {_e}: {cmd}",
-  "singbox_install_ok": "sing-box ÑÑÐ¿ÐµÑÐ½Ð¾ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}: {path}",
-  "singbox_install_fail": "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ° sing-box Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð´ {code}): {err}",
-  "singbox_install_declined": "Ð£ÑÑÐ°Ð½Ð¾Ð²ÐºÐ° sing-box Ð¾ÑÐºÐ»Ð¾Ð½ÐµÐ½Ð° {_e} â Ð²ÑÐ±Ð¾Ñ Ð·Ð°Ð¿Ð¾Ð¼Ð½ÐµÐ½, Ð²Ð¾Ð¿ÑÐ¾Ñ Ð±Ð¾Ð»ÑÑÐµ Ð½Ðµ Ð±ÑÐ´ÐµÑ Ð·Ð°Ð´Ð°Ð²Ð°ÑÑÑÑ (ÐºÑÐ¾Ð¼Ðµ ÑÐ»ÑÑÐ°Ñ, ÐºÐ¾Ð³Ð´Ð° Ð²Ñ Ð²ÑÐ±ÐµÑÐµÑÐµ Ð´Ð²Ð¸Ð¶Ð¾Ðº singbox, Ð° sing-box Ð²ÑÑ ÐµÑÑ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½).",
-  "singbox_windows_hint": "Windows: ÑÐºÐ°ÑÐ°Ð¹ÑÐµ ÑÐµÐ»Ð¸Ð· sing-box Ñ {url} , ÑÐ°ÑÐ¿Ð°ÐºÑÐ¹ÑÐµ Ð¸ Ð´Ð¾Ð±Ð°Ð²ÑÑÐµ Ð² PATH, Ð·Ð°ÑÐµÐ¼ Ð¿ÐµÑÐµÐ·Ð°Ð¿ÑÑÑÐ¸ÑÐµ ÑÐºÑÐ¸Ð¿Ñ.",
-  "singbox_reinstall_header": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°Ñ sing-box Ñ Ð½ÑÐ»Ñ {_e} ...",
-  "singbox_reinstall_ok": "sing-box Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ {_e}: {path}",
-  "singbox_reinstall_fail": "ÐÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²ÐºÐ° sing-box Ð½Ðµ ÑÐ´Ð°Ð»Ð°ÑÑ (ÐºÐ¾Ð´ {code}): {err}",
-  "singbox_engine_still_missing": "sing-box Ð¿Ð¾-Ð¿ÑÐµÐ¶Ð½ÐµÐ¼Ñ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ â Ð¾ÑÑÐ°ÑÑÑ Ð½Ð° Ð²ÑÑÑÐ¾ÐµÐ½Ð½Ð¾Ð¼ Ð´Ð²Ð¸Ð¶ÐºÐµ.",
-  "hotkey_qr_prompt": "ÐÑÑÑ Ðº QR-ÐºÐ°ÑÑÐ¸Ð½ÐºÐµ Ñ ÐºÐ¾Ð´Ð¾Ð¼ 2FA (TOTP) (Enter â Ð¾ÑÐ¼ÐµÐ½Ð°): ",
-  "hotkey_qr_loaded": "QR Ð·Ð°Ð³ÑÑÐ¶ÐµÐ½ {_e}: {path}. Ð¡ÐµÐºÑÐµÑ TOTP ÑÐ¾ÑÑÐ°Ð½ÑÐ½; ÑÐµÐºÑÑÐ¸Ð¹ ÐºÐ¾Ð´: {code} (Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ ÐµÑÑ {sec} Ñ).",
-  "hotkey_qr_fail": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð·Ð°Ð³ÑÑÐ·Ð¸ÑÑ QR: {err}",
-  "hotkey_login": "ÐÐ¾Ð³Ð¸Ð½ (email) {_e}: {email} â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°.",
-  "hotkey_login_none": "Ð¡Ð¾ÑÑÐ°Ð½ÑÐ½Ð½Ð¾Ð³Ð¾ Ð»Ð¾Ð³Ð¸Ð½Ð° Ð½ÐµÑ: ÑÐ½Ð°ÑÐ°Ð»Ð° Ð²ÑÐ¿Ð¾Ð»Ð½Ð¸ÑÐµ Ð²ÑÐ¾Ð´ (--email Ð¸Ð»Ð¸ Ð¸Ð½ÑÐµÑÐ°ÐºÑÐ¸Ð²Ð½ÑÐ¹ Ð·Ð°Ð¿ÑÐ¾Ñ).",
-  "hotkey_password": "ÐÐ°ÑÐ¾Ð»Ñ {_e}: {password} â ÑÐ°ÐºÐ¶Ðµ ÑÐºÐ¾Ð¿Ð¸ÑÐ¾Ð²Ð°Ð½ Ð² Ð±ÑÑÐµÑ Ð¾Ð±Ð¼ÐµÐ½Ð°.",
-  "hotkey_password_none": "Ð¡Ð¾ÑÑÐ°Ð½ÑÐ½Ð½Ð¾Ð³Ð¾ Ð¿Ð°ÑÐ¾Ð»Ñ Ð½ÐµÑ: ÑÐ½Ð°ÑÐ°Ð»Ð° Ð²ÑÐ¿Ð¾Ð»Ð½Ð¸ÑÐµ Ð²ÑÐ¾Ð´ (--password Ð¸Ð»Ð¸ Ð¸Ð½ÑÐµÑÐ°ÐºÑÐ¸Ð²Ð½ÑÐ¹ Ð·Ð°Ð¿ÑÐ¾Ñ).",
-  "hotkey_deps_reinstalled": "ÐÐ°Ð²Ð¸ÑÐ¸Ð¼Ð¾ÑÑÐ¸ Ð¿ÐµÑÐµÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ñ {_e}.",
-  "protocol_summary": "Ð¡Ð²Ð¾Ð´ÐºÐ° Ð¿Ð¾ Ð¿ÑÐ¾ÑÐ¾ÐºÐ¾Ð»Ð°Ð¼ Ð°Ð¿ÑÑÑÐ¸Ð¼Ð¾Ð² {_e}: {m} Ð°Ð¿ÑÑÑÐ¸Ð¼(Ð¾Ð²) ÑÐµÑÐµÐ· MASQUE (HTTP/3 CONNECT-UDP â Ð¿ÑÐ¸Ð¾ÑÐ¸ÑÐµÑÐ½ÑÐ¹ Ð¿ÑÐ¾ÑÐ¾ÐºÐ¾Ð»), {c} Ð°Ð¿ÑÑÑÐ¸Ð¼(Ð¾Ð²) ÑÐµÑÐµÐ· HTTP CONNECT (ÑÑÐ½Ð½ÐµÐ»Ñ HTTPS-Ð¿ÑÐ¾ÐºÑÐ¸ Ð¿Ð¾Ð²ÐµÑÑ TLS â Ð¾ÑÐºÐ°Ñ, ÐºÐ¾Ð³Ð´Ð° MASQUE Ð½Ðµ Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ).",
-  "proto_chosen_masque": "ÐÑÐ¾ÑÐ¾ÐºÐ¾Ð» Ð´Ð»Ñ {hp}: masque (HTTP/3 CONNECT-UDP) â Ð¿ÑÐ¸Ð¾ÑÐ¸ÑÐµÑÐ½ÑÐ¹ Ð¿ÑÐ¾ÑÐ¾ÐºÐ¾Ð»; ÑÑÐ½Ð½ÐµÐ»Ñ MASQUE Ð¿ÑÐ¾Ð¿ÑÑÑÐ¸Ð» Ð´Ð°Ð½Ð½ÑÐµ.",
-  "proto_fallback_connect": "ÐÑÐ¾ÑÐ¾ÐºÐ¾Ð» Ð´Ð»Ñ {hp}: HTTP CONNECT â Ð¾ÑÐºÐ°Ñ Ñ masque, ÐºÐ¾ÑÐ¾ÑÑÐ¹ Ð·Ð´ÐµÑÑ Ð½ÐµÐ´Ð¾ÑÑÑÐ¿ÐµÐ½: {reason}",
-  "proto_masque_no_lib": "ÐÐ»Ñ masque Ð½ÑÐ¶ÐµÐ½ Ð¿Ð°ÐºÐµÑ aioquic â Ð¾Ð½ Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½, Ð¿Ð¾ÑÑÐ¾Ð¼Ñ Ð²ÑÐµ Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ Ð±ÑÐ´ÑÑ Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÑ Ð¾ÑÐºÐ°Ñ HTTP CONNECT.",
-  "test_commands_header": "Ð§ÑÐ¾Ð±Ñ Ð¿ÑÐ¾ÑÐµÑÑÐ¸ÑÐ¾Ð²Ð°ÑÑ ÐÐÐÐÐÐ¬ÐÐ«Ð Ð¿ÑÐ¾ÐºÑÐ¸, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ ÑÑÐ¸ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ {_e}:",
-  "test_commands_hidden": "Ð¢ÐµÑÑÐ¾Ð²ÑÐµ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ curl ÑÐºÑÑÑÑ {_e} â Ð²ÐºÐ»ÑÑÐ¸ÑÐµ Ð¸Ñ Ð¿Ð°ÑÐ°Ð¼ÐµÑÑÐ¾Ð¼ --show-test-commands (env MOZVPN_SHOW_TEST_COMMANDS=1).",
+  "hotkey_copied": "\u0421\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043b \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 {_e}: {text}",
+  "hotkey_copy_fail": "\u0411\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d \u0432 \u044d\u0442\u043e\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u0435: {err}",
+  "hotkey_copy_cancel": "\u0412\u044b\u0431\u043e\u0440 \u043e\u0442\u043c\u0435\u043d\u0451\u043d \u2014 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 v, b \u0438\u043b\u0438 h, \u0447\u0442\u043e\u0431\u044b \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u044c.",
+  "hotkey_stop": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'q': \u0437\u0430\u043f\u0440\u043e\u0448\u0435\u043d\u0430 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
+  "retry_wait": "\u0412\u0445\u043e\u0434 \u043d\u0435 \u0443\u0434\u0430\u043b\u0441\u044f \u0441 \u043f\u0435\u0440\u0432\u043e\u0433\u043e \u0440\u0430\u0437\u0430 \u2014 \u043e\u0431\u044b\u0447\u043d\u043e \u043f\u043e\u043b\u0443\u0447\u0430\u0435\u0442\u0441\u044f \u0441\u043e \u0432\u0442\u043e\u0440\u043e\u0433\u043e. \u041f\u041e\u0414\u041e\u0416\u0414\u0418\u0422\u0415: \u0437\u0430\u043f\u0440\u043e\u0441 \u043b\u043e\u0433\u0438\u043d\u0430/\u043f\u0430\u0440\u043e\u043b\u044f/TOTP \u043f\u043e\u044f\u0432\u0438\u0442\u0441\u044f \u0441\u043d\u043e\u0432\u0430 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438, \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a \u0441\u043a\u0440\u0438\u043f\u0442\u0430 \u043d\u0435 \u043d\u0443\u0436\u0435\u043d.",
+  "retry_in": "\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u043f\u043e\u043f\u044b\u0442\u043a\u0430 \u0432\u0445\u043e\u0434\u0430 \u0447\u0435\u0440\u0435\u0437:",
+  "theme_switched": "\u0422\u0435\u043c\u0430 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0430 {_e}: {theme}",
+  "theme_bg_forced": "\u0424\u043e\u043d \u043e\u043a\u043d\u0430 \u043a\u043e\u043d\u0441\u043e\u043b\u0438 \u041f\u0420\u0418\u041d\u0423\u0414\u0418\u0422\u0415\u041b\u042c\u041d\u041e \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d {_e}: {bg} (escape-\u043f\u043e\u0441\u043b\u0435\u0434\u043e\u0432\u0430\u0442\u0435\u043b\u044c\u043d\u043e\u0441\u0442\u044c OSC 11 \u2014 \u0442\u0435\u043c\u0430 \u0442\u0435\u043f\u0435\u0440\u044c \u043f\u0435\u0440\u0435\u043a\u0440\u0430\u0448\u0438\u0432\u0430\u0435\u0442 \u0438 \u0441\u0430\u043c\u043e \u043e\u043a\u043d\u043e, \u0430 \u043d\u0435 \u0442\u043e\u043b\u044c\u043a\u043e \u0441\u0442\u0440\u043e\u043a\u0438 \u043b\u043e\u0433\u0430).",
+  "theme_bg_exit": "\u041f\u0440\u0438 \u0432\u044b\u0445\u043e\u0434\u0435 \u0444\u043e\u043d \u043a\u043e\u043d\u0441\u043e\u043b\u0438 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0431\u0443\u0434\u0435\u0442 \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d {_e} (OSC 111). \u0415\u0441\u043b\u0438 \u0432\u0430\u0448 \u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b \u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0435\u0442 \u044d\u0442\u043e\u0442 \u0441\u0431\u0440\u043e\u0441, \u0432\u0435\u0440\u043d\u0438\u0442\u0435 \u0446\u0432\u0435\u0442 \u043e\u043a\u043d\u0430 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430\u0445 \u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f.",
+  "deps_fallback_each": "\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 \u043e\u0434\u043d\u043e\u0439 \u043a\u043e\u043c\u0430\u043d\u0434\u043e\u0439 \u043d\u0435 \u0443\u0434\u0430\u043b\u0430\u0441\u044c (\u043a\u043e\u043d\u0444\u043b\u0438\u043a\u0442 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 pip) {_e} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u044f\u044e \u043a\u0430\u0436\u0434\u044b\u0439 \u043f\u0430\u043a\u0435\u0442 \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u043e \u0411\u0415\u0417 --force-reinstall: \u043f\u0440\u0438\u043d\u0443\u0434\u0438\u0442\u0435\u043b\u044c\u043d\u0430\u044f \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 \u043e\u0431\u0449\u0438\u0445 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 \u0432 \u0442\u043e\u0447\u043d\u044b\u0435 \u0432\u0435\u0440\u0441\u0438\u0438 \u2014 \u043e\u0431\u044b\u0447\u043d\u0430\u044f \u043f\u0440\u0438\u0447\u0438\u043d\u0430 \u043a\u043e\u043d\u0444\u043b\u0438\u043a\u0442\u043e\u0432.",
+  "deps_fallback_nodeps": "{pkg}: \u0432\u0441\u0451 \u0435\u0449\u0451 \u043a\u043e\u043d\u0444\u043b\u0438\u043a\u0442 {_e} \u2014 \u043a\u0440\u0430\u0439\u043d\u044f\u044f \u043c\u0435\u0440\u0430: pip install {pkg} --no-deps (\u0443\u0436\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043d\u043e\u0435 \u0434\u0435\u0440\u0435\u0432\u043e \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 \u0443\u0434\u043e\u0432\u043b\u0435\u0442\u0432\u043e\u0440\u044f\u0435\u0442 \u0438\u043c\u043f\u043e\u0440\u0442\u044b).",
+  "deps_pkg_ok": "  {_e} {pkg} \u2014 OK",
+  "deps_pkg_fail": "  {_e} {pkg} \u2014 \u041d\u0415 \u0423\u0414\u0410\u041b\u041e\u0421\u042c",
+  "deps_conflict_fail": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u043f\u0430\u043a\u0435\u0442\u044b: {pkgs}. \u0421\u043c. \u043e\u0448\u0438\u0431\u043a\u0438 pip \u0432\u044b\u0448\u0435.",
+  "hotkey_theme": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'm' \U0001f3a8: \u0442\u0435\u043c\u0430 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0430 \u043d\u0430 {theme} (--theme).",
+  "color_enabled": "\u0426\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432\u043a\u043b\u044e\u0447\u0451\u043d {_e} (\u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0435\u0439 'n' / --no-color).",
+  "hotkey_color": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'n' \U0001f308: \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --no-color).",
+  "color_state_on": "\u0432\u043a\u043b\u044e\u0447\u0451\u043d",
+  "color_state_off": "\u043e\u0442\u043a\u043b\u044e\u0447\u0451\u043d",
+  "deps_header": "Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438, \u043a\u043e\u0442\u043e\u0440\u044b\u0435 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u0442 \u044d\u0442\u043e\u0442 \u0441\u043a\u0440\u0438\u043f\u0442 {_e}:",
+  "singbox_dep_header": "\u0412\u043d\u0435\u0448\u043d\u044f\u044f \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u044c (\u043d\u0435 pip-\u043f\u0430\u043a\u0435\u0442) {_e}:",
+  "singbox_dep_ok": "  {_e} sing-box \u2014 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d: {path} (\u0432\u0435\u0440\u0441\u0438\u044f {version})",
+  "singbox_dep_missing": "  {_e} sing-box \u2014 \u041d\u0415 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d (\u043d\u0435\u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u0435\u043d: \u043d\u0443\u0436\u0435\u043d \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0434\u0432\u0438\u0436\u043a\u0430 'singbox'; \u0432\u0441\u0442\u0440\u043e\u0435\u043d\u043d\u044b\u0439 \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u0431\u0435\u0437 \u043d\u0435\u0433\u043e)",
+  "deps_entry_ok": "  {_e} {pip:<12} (\u043c\u043e\u0434\u0443\u043b\u044c {module:<10}) {version:<12} \u2014 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d",
+  "deps_entry_missing": "  {_e} {pip:<12} (\u043c\u043e\u0434\u0443\u043b\u044c {module:<10}) \u2014 \u041d\u0415 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d{need}",
+  "deps_need_required": " \u2014 \u041d\u0423\u0416\u0415\u041d \u0434\u043b\u044f TOTP/QR",
+  "deps_need_optional": " \u2014 \u043d\u0435\u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u044c\u043d\u044b\u0439 (\u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0439 MASQUE / \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 HTTP-3)",
+  "deps_missing_note": "\u041e\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u044e\u0442 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438: {list}.",
+  "deps_install_q": "\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u043d\u0435\u0434\u043e\u0441\u0442\u0430\u044e\u0449\u0438\u0435 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441\u0435\u0439\u0447\u0430\u0441 \u0447\u0435\u0440\u0435\u0437 pip ({cmd})? [Y/n]: ",
+  "deps_installing": "\u0423\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u044e \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 {_e}: {pkgs} ...",
+  "deps_install_ok": "\u0417\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0443\u0441\u043f\u0435\u0448\u043d\u043e \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u044b {_e}.",
+  "deps_install_fail": "pip \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b\u0441\u044f \u0441 \u043e\u0448\u0438\u0431\u043a\u043e\u0439 (\u043a\u043e\u0434 {code}): {err}",
+  "deps_frozen_note": "\u0421\u043a\u0440\u0438\u043f\u0442 \u0441\u043a\u043e\u043c\u043f\u0438\u043b\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0438\u043d\u0430\u0440\u043d\u0438\u043a (frozen) \u2014 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 \u043d\u0435\u0432\u043e\u0437\u043c\u043e\u0436\u043d\u0430. \u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u0432\u0440\u0443\u0447\u043d\u0443\u044e: {cmd}",
+  "deps_install_declined": "\u0417\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u044b \u2014 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0430\u044e \u0431\u0435\u0437 \u043d\u0438\u0445.",
+  "deps_reinstall_header": "\u041f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u044e \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f {_e}: {pkgs}",
+  "deps_reinstall_ok": "\u0412\u0441\u0435 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0443\u0441\u043f\u0435\u0448\u043d\u043e \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u044b {_e}.",
+  "deps_reinstall_fail": "\u041f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 \u043d\u0435 \u0443\u0434\u0430\u043b\u0430\u0441\u044c (\u043a\u043e\u0434 {code}): {err}",
+  "deps_reinstall_skip_frozen": "\u0421\u043a\u0440\u0438\u043f\u0442 \u2014 \u0441\u043a\u043e\u043c\u043f\u0438\u043b\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0431\u0438\u043d\u0430\u0440\u043d\u0438\u043a (frozen): \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 \u0447\u0435\u0440\u0435\u0437 pip \u043d\u0435\u0432\u043e\u0437\u043c\u043e\u0436\u043d\u0430, \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0432\u0441\u0442\u0440\u043e\u0435\u043d\u044b \u0432 \u0431\u0438\u043d\u0430\u0440\u043d\u0438\u043a.",
+  "singbox_install_header": "sing-box \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d {_e}. \u0421\u043a\u0440\u0438\u043f\u0442 \u041f\u041e\u041b\u041d\u041e\u0421\u0422\u042c\u042e \u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u0438 \u0431\u0435\u0437 \u043d\u0435\u0433\u043e: \u0432\u0441\u0442\u0440\u043e\u0435\u043d\u043d\u044b\u0439 \u0434\u0432\u0438\u0436\u043e\u043a \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u0435\u0442 \u0442\u0435 \u0436\u0435 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b (MASQUE / HTTP CONNECT) \u0432\u043d\u0443\u0442\u0440\u0438 \u044d\u0442\u043e\u0433\u043e Python-\u043f\u0440\u043e\u0446\u0435\u0441\u0441\u0430. sing-box \u043d\u0443\u0436\u0435\u043d \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0434\u0432\u0438\u0436\u043a\u0430 'singbox'.",
+  "singbox_install_q": "\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441\u0435\u0439\u0447\u0430\u0441? [y/N]: ",
+  "singbox_install_cmd": "\u041a\u043e\u043c\u0430\u043d\u0434\u0430 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438 \u0434\u043b\u044f \u044d\u0442\u043e\u0439 \u0441\u0438\u0441\u0442\u0435\u043c\u044b {_e}: {cmd}",
+  "singbox_install_manual": "\u0420\u0443\u0447\u043d\u0430\u044f \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430: \u043e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 {url} \u2014 \u043e\u0444\u0438\u0446\u0438\u0430\u043b\u044c\u043d\u0430\u044f \u0441\u0442\u0440\u0430\u043d\u0438\u0446\u0430 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438 sing-box.",
+  "singbox_install_started": "\u0423\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u044e sing-box {_e}: {cmd}",
+  "singbox_install_ok": "sing-box \u0443\u0441\u043f\u0435\u0448\u043d\u043e \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d {_e}: {path}",
+  "singbox_install_fail": "\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 sing-box \u043d\u0435 \u0443\u0434\u0430\u043b\u0430\u0441\u044c (\u043a\u043e\u0434 {code}): {err}",
+  "singbox_install_declined": "\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 sing-box \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u0430 {_e} \u2014 \u0432\u044b\u0431\u043e\u0440 \u0437\u0430\u043f\u043e\u043c\u043d\u0435\u043d, \u0432\u043e\u043f\u0440\u043e\u0441 \u0431\u043e\u043b\u044c\u0448\u0435 \u043d\u0435 \u0431\u0443\u0434\u0435\u0442 \u0437\u0430\u0434\u0430\u0432\u0430\u0442\u044c\u0441\u044f (\u043a\u0440\u043e\u043c\u0435 \u0441\u043b\u0443\u0447\u0430\u044f, \u043a\u043e\u0433\u0434\u0430 \u0432\u044b \u0432\u044b\u0431\u0435\u0440\u0435\u0442\u0435 \u0434\u0432\u0438\u0436\u043e\u043a singbox, \u0430 sing-box \u0432\u0441\u0451 \u0435\u0449\u0451 \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d).",
+  "singbox_windows_hint": "Windows: \u0441\u043a\u0430\u0447\u0430\u0439\u0442\u0435 \u0440\u0435\u043b\u0438\u0437 sing-box \u0441 {url} , \u0440\u0430\u0441\u043f\u0430\u043a\u0443\u0439\u0442\u0435 \u0438 \u0434\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0432 PATH, \u0437\u0430\u0442\u0435\u043c \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441\u043a\u0440\u0438\u043f\u0442.",
+  "singbox_reinstall_header": "\u041f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u044e sing-box \u0441 \u043d\u0443\u043b\u044f {_e} ...",
+  "singbox_reinstall_ok": "sing-box \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d {_e}: {path}",
+  "singbox_reinstall_fail": "\u041f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430 sing-box \u043d\u0435 \u0443\u0434\u0430\u043b\u0430\u0441\u044c (\u043a\u043e\u0434 {code}): {err}",
+  "singbox_engine_still_missing": "sing-box \u043f\u043e-\u043f\u0440\u0435\u0436\u043d\u0435\u043c\u0443 \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d \u2014 \u043e\u0441\u0442\u0430\u044e\u0441\u044c \u043d\u0430 \u0432\u0441\u0442\u0440\u043e\u0435\u043d\u043d\u043e\u043c \u0434\u0432\u0438\u0436\u043a\u0435.",
+  "hotkey_qr_prompt": "\u041f\u0443\u0442\u044c \u043a QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0435 \u0441 \u043a\u043e\u0434\u043e\u043c 2FA (TOTP) (Enter \u2014 \u043e\u0442\u043c\u0435\u043d\u0430): ",
+  "hotkey_qr_loaded": "QR \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043d {_e}: {path}. \u0421\u0435\u043a\u0440\u0435\u0442 TOTP \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d; \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434: {code} (\u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0435\u0449\u0451 {sec} \u0441).",
+  "hotkey_qr_fail": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR: {err}",
+  "hotkey_login": "\u041b\u043e\u0433\u0438\u043d (email) {_e}: {email} \u2014 \u0442\u0430\u043a\u0436\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430.",
+  "hotkey_login_none": "\u0421\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u043e\u0433\u043e \u043b\u043e\u0433\u0438\u043d\u0430 \u043d\u0435\u0442: \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u0432\u044b\u043f\u043e\u043b\u043d\u0438\u0442\u0435 \u0432\u0445\u043e\u0434 (--email \u0438\u043b\u0438 \u0438\u043d\u0442\u0435\u0440\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0439 \u0437\u0430\u043f\u0440\u043e\u0441).",
+  "hotkey_password": "\u041f\u0430\u0440\u043e\u043b\u044c {_e}: {password} \u2014 \u0442\u0430\u043a\u0436\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430.",
+  "hotkey_password_none": "\u0421\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u043e\u0433\u043e \u043f\u0430\u0440\u043e\u043b\u044f \u043d\u0435\u0442: \u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u0432\u044b\u043f\u043e\u043b\u043d\u0438\u0442\u0435 \u0432\u0445\u043e\u0434 (--password \u0438\u043b\u0438 \u0438\u043d\u0442\u0435\u0440\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0439 \u0437\u0430\u043f\u0440\u043e\u0441).",
+  "hotkey_deps_reinstalled": "\u0417\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u044b {_e}.",
+  "protocol_summary": "\u0421\u0432\u043e\u0434\u043a\u0430 \u043f\u043e \u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b\u0430\u043c \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 {_e}: {m} \u0430\u043f\u0441\u0442\u0440\u0438\u043c(\u043e\u0432) \u0447\u0435\u0440\u0435\u0437 MASQUE (HTTP/3 CONNECT-UDP \u2014 \u043f\u0440\u0438\u043e\u0440\u0438\u0442\u0435\u0442\u043d\u044b\u0439 \u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b), {c} \u0430\u043f\u0441\u0442\u0440\u0438\u043c(\u043e\u0432) \u0447\u0435\u0440\u0435\u0437 HTTP CONNECT (\u0442\u0443\u043d\u043d\u0435\u043b\u044c HTTPS-\u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u043e\u0432\u0435\u0440\u0445 TLS \u2014 \u043e\u0442\u043a\u0430\u0442, \u043a\u043e\u0433\u0434\u0430 MASQUE \u043d\u0435 \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b \u0434\u0430\u043d\u043d\u044b\u0435).",
+  "proto_chosen_masque": "\u041f\u0440\u043e\u0442\u043e\u043a\u043e\u043b \u0434\u043b\u044f {hp}: masque (HTTP/3 CONNECT-UDP) \u2014 \u043f\u0440\u0438\u043e\u0440\u0438\u0442\u0435\u0442\u043d\u044b\u0439 \u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b; \u0442\u0443\u043d\u043d\u0435\u043b\u044c MASQUE \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b \u0434\u0430\u043d\u043d\u044b\u0435.",
+  "proto_fallback_connect": "\u041f\u0440\u043e\u0442\u043e\u043a\u043e\u043b \u0434\u043b\u044f {hp}: HTTP CONNECT \u2014 \u043e\u0442\u043a\u0430\u0442 \u0441 masque, \u043a\u043e\u0442\u043e\u0440\u044b\u0439 \u0437\u0434\u0435\u0441\u044c \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d: {reason}",
+  "proto_masque_no_lib": "\u0414\u043b\u044f masque \u043d\u0443\u0436\u0435\u043d \u043f\u0430\u043a\u0435\u0442 aioquic \u2014 \u043e\u043d \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d, \u043f\u043e\u044d\u0442\u043e\u043c\u0443 \u0432\u0441\u0435 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b \u0431\u0443\u0434\u0443\u0442 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u044c \u043e\u0442\u043a\u0430\u0442 HTTP CONNECT.",
+  "test_commands_header": "\u0427\u0442\u043e\u0431\u044b \u043f\u0440\u043e\u0442\u0435\u0441\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u042b\u0415 \u043f\u0440\u043e\u043a\u0441\u0438, \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u044d\u0442\u0438 \u043a\u043e\u043c\u0430\u043d\u0434\u044b {_e}:",
+  "test_commands_hidden": "\u0422\u0435\u0441\u0442\u043e\u0432\u044b\u0435 \u043a\u043e\u043c\u0430\u043d\u0434\u044b curl \u0441\u043a\u0440\u044b\u0442\u044b {_e} \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u0435 \u0438\u0445 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u043e\u043c --show-test-commands (env MOZVPN_SHOW_TEST_COMMANDS=1).",
   "test_command_local": "  {_e} {cmd}   [{label}, {proto}]",
-  "test_commands_remote_header": "Ð§ÑÐ¾Ð±Ñ Ð¿ÑÐ¾ÑÐµÑÑÐ¸ÑÐ¾Ð²Ð°ÑÑ ÐÐÐ¡Ð¢Ð ÐÐ (ÑÐ´Ð°Ð»ÑÐ½Ð½ÑÐµ) Ð¿ÑÐ¾ÐºÑÐ¸ Ð½Ð°Ð¿ÑÑÐ¼ÑÑ, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ ÑÑÐ¸ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ:",
+  "test_commands_remote_header": "\u0427\u0442\u043e\u0431\u044b \u043f\u0440\u043e\u0442\u0435\u0441\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0410\u041f\u0421\u0422\u0420\u0418\u041c (\u0443\u0434\u0430\u043b\u0451\u043d\u043d\u044b\u0435) \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0430\u043f\u0440\u044f\u043c\u0443\u044e, \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u044d\u0442\u0438 \u043a\u043e\u043c\u0430\u043d\u0434\u044b:",
   "test_command_remote": "  {_e} {cmd}   [{label}]",
-  "clear_will_remove_header": "ÐÐ»Ð°Ð²Ð¸ÑÐ° 'c' / 'r' / --clear-cache / --relogin ÑÐ´Ð°Ð»Ð¸Ñ ÐÐ¡Ð ÑÑÐ¾ {_e}:",
+  "clear_will_remove_header": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'c' / 'r' / --clear-cache / --relogin \u0443\u0434\u0430\u043b\u0438\u0442 \u0412\u0421\u0401 \u044d\u0442\u043e {_e}:",
   "clear_will_remove_entry": "  - {path}",
-  "clear_will_remove_dir": "  - {path} (Ð²ÐµÑÑ ÐºÐ°ÑÐ°Ð»Ð¾Ð³ ÐºÐ¾Ð½ÑÐ¸Ð³ÑÑÐ°ÑÐ¸Ð¸ â Ð²ÑÑ Ð¿ÐµÑÐµÑÐ¸ÑÐ»ÐµÐ½Ð½Ð¾Ðµ Ð²ÑÑÐµ Ð½Ð°ÑÐ¾Ð´Ð¸ÑÑÑ Ð²Ð½ÑÑÑÐ¸ Ð½ÐµÐ³Ð¾)",
-  "clear_wiped_note": "Ð£Ð´Ð°Ð»ÐµÐ½Ð¾: ÐºÑÑÐ¸ ÑÐµÑÑÐ¸Ð¸, ÑÐ¾ÑÑÐ°Ð½ÑÐ½Ð½ÑÐµ ÐºÑÐµÐ´ÐµÐ½ÑÐµÐ»ÑÑ (email/Ð¿Ð°ÑÐ¾Ð»Ñ/ÑÐµÐºÑÐµÑ TOTP), cookie Fastly Ð¸ ÐºÐ¾Ð½ÑÐ¸Ð³Ð¸ sing-box. ÐÑÐ¸ ÑÐ²ÐµÐ¶ÐµÐ¼ Ð²ÑÐ¾Ð´Ðµ Ð»Ð¾Ð³Ð¸Ð½-Ð´Ð°Ð½Ð½ÑÐµ Ð·Ð°Ð¿ÑÐ¾ÑÑÑÑÑ Ð·Ð°Ð½Ð¾Ð²Ð¾.",
-  "jwt_decoded_header": "Ð Ð°ÑÑÐ¸ÑÑÐ¾Ð²Ð°Ð½Ð½ÑÐ¹ proxyPass JWT {_e}:",
+  "clear_will_remove_dir": "  - {path} (\u0432\u0435\u0441\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 \u2014 \u0432\u0441\u0451 \u043f\u0435\u0440\u0435\u0447\u0438\u0441\u043b\u0435\u043d\u043d\u043e\u0435 \u0432\u044b\u0448\u0435 \u043d\u0430\u0445\u043e\u0434\u0438\u0442\u0441\u044f \u0432\u043d\u0443\u0442\u0440\u0438 \u043d\u0435\u0433\u043e)",
+  "clear_wiped_note": "\u0423\u0434\u0430\u043b\u0435\u043d\u043e: \u043a\u044d\u0448\u0438 \u0441\u0435\u0441\u0441\u0438\u0438, \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u044b (email/\u043f\u0430\u0440\u043e\u043b\u044c/\u0441\u0435\u043a\u0440\u0435\u0442 TOTP), cookie Fastly \u0438 \u043a\u043e\u043d\u0444\u0438\u0433\u0438 sing-box. \u041f\u0440\u0438 \u0441\u0432\u0435\u0436\u0435\u043c \u0432\u0445\u043e\u0434\u0435 \u043b\u043e\u0433\u0438\u043d-\u0434\u0430\u043d\u043d\u044b\u0435 \u0437\u0430\u043f\u0440\u043e\u0441\u044f\u0442\u0441\u044f \u0437\u0430\u043d\u043e\u0432\u043e.",
+  "jwt_decoded_header": "\u0420\u0430\u0441\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 proxyPass JWT {_e}:",
   "jwt_decoded_part": "  {part} {json}",
-  "jwt_decoded_exp": "  exp (Ð´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÐµÐ½ Ð´Ð¾): {time} UTC   iat (Ð²ÑÐ´Ð°Ð½): {iat} UTC",
-  "confirm_exit_prompt": "ÐÐ¾Ð»ÑÑÐµÐ½ Ctrl+C. ÐÐ°Ð¶Ð¼Ð¸ÑÐµ Ctrl+C ÐµÑÑ ÑÐ°Ð· Ð² ÑÐµÑÐµÐ½Ð¸Ðµ 5 Ñ Ð´Ð»Ñ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÐµÐ½Ð¸Ñ Ð²ÑÑÐ¾Ð´Ð°, Ð¸Ð»Ð¸ Ð¿Ð¾Ð´Ð¾Ð¶Ð´Ð¸ÑÐµ, ÑÑÐ¾Ð±Ñ Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð¸ÑÑ.",
-  "confirm_exit_abort": "ÐÑÑÐ¾Ð´ Ð¾ÑÐ¼ÐµÐ½ÑÐ½, Ð¿ÑÐ¾Ð´Ð¾Ð»Ð¶Ð°Ñ.",
-  "sigterm": "ÐÐ¾Ð»ÑÑÐµÐ½ ÑÐ¸Ð³Ð½Ð°Ð» Ð·Ð°Ð²ÐµÑÑÐµÐ½Ð¸Ñ, Ð¾ÑÑÐ°Ð½Ð°Ð²Ð»Ð¸Ð²Ð°ÑÑÑ.",
-  "recommended_server": "Ð ÐµÐºÐ¾Ð¼ÐµÐ½Ð´Ð¾Ð²Ð°Ð½Ð½ÑÐ¹ ÑÐµÑÐ²ÐµÑ: {country} / {city}",
+  "jwt_decoded_exp": "  exp (\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043b\u0435\u043d \u0434\u043e): {time} UTC   iat (\u0432\u044b\u0434\u0430\u043d): {iat} UTC",
+  "confirm_exit_prompt": "\u041f\u043e\u043b\u0443\u0447\u0435\u043d Ctrl+C. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 Ctrl+C \u0435\u0449\u0451 \u0440\u0430\u0437 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f \u0432\u044b\u0445\u043e\u0434\u0430, \u0438\u043b\u0438 \u043f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435, \u0447\u0442\u043e\u0431\u044b \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c.",
+  "confirm_exit_abort": "\u0412\u044b\u0445\u043e\u0434 \u043e\u0442\u043c\u0435\u043d\u0451\u043d, \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0430\u044e.",
+  "sigterm": "\u041f\u043e\u043b\u0443\u0447\u0435\u043d \u0441\u0438\u0433\u043d\u0430\u043b \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0438\u044f, \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u044e\u0441\u044c.",
+  "recommended_server": "\u0420\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0441\u0435\u0440\u0432\u0435\u0440: {country} / {city}",
   "curl_hint": "    {_e} curl -x https://{host}:{port} --proxy-header \"Proxy-Authorization: Bearer {token}\" {echo}",
-  "test_running": "Ð¢ÐµÑÑ {host}:{port} ...",
-  "test_external_ip": "ÐÐ½ÐµÑÐ½Ð¸Ð¹ IP: {ip}",
-  "waf_406": "HTTP 406 Ð¾Ñ *.firefox.com Ð´Ð°Ð¶Ðµ Ð¿Ð¾ÑÐ»Ðµ Ð°Ð²ÑÐ¾Ð¼Ð°ÑÐ¸ÑÐµÑÐºÐ¾Ð³Ð¾ ÑÐµÑÐµÐ½Ð¸Ñ challenge.\nÐÐ¾ÑÐ¾Ð¶Ðµ, Fastly Ð¸Ð·Ð¼ÐµÐ½Ð¸Ð» ÑÐ°Ð·Ð¼ÐµÑÐºÑ/Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼ challenge. Ð¡Ð²ÐµÑÑÑÐµ regex'Ñ:\n  - github.com/pagpeter/fastly-antibot (pkg/solver/solver.go â regex'Ñ script id Ð¸ token)\n  - PR #22 Ð² Mikescher/firefox-sync-client (syncclient/fastly.go â Ð¿Ð¾ÑÑ ÑÑÐ¾Ð³Ð¾ Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼Ð°)\nÐ¤Ð¾Ð»Ð±ÑÐº â Ð¿ÐµÑÐµÐ¸ÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ ÑÐµÑÑÐ¸Ñ Firefox:\n  1) ÐÐ¾Ð¹Ð´Ð¸ÑÐµ Ð² Mozilla-Ð°ÐºÐºÐ°ÑÐ½Ñ Ð² Ð±ÑÐ°ÑÐ·ÐµÑÐµ Firefox (2FA Ð²Ð²Ð¾Ð´Ð¸ÑÑÑ ÑÐ°Ð¼).\n  2) ÐÐ·Ð²Ð»ÐµÐºÐ¸ÑÐµ sessionToken Ð¸Ð· Ð¿ÑÐ¾ÑÐ¸Ð»Ñ, Ð½Ð°Ð¿ÑÐ¸Ð¼ÐµÑ ÑÑÐ¸Ð»Ð¸ÑÐ¾Ð¹ firefox_decrypt\n     (github.com/unode/firefox_decrypt): Ð·Ð°Ð¿Ð¸ÑÑ Â«Firefox Accounts credentialsÂ»\n     ÑÑÐ°Ð½Ð¸Ñ JSON Ñ Ð¿Ð¾Ð»ÐµÐ¼ sessionToken.\n  3) ÐÐ°Ð¿ÑÑÑÐ¸ÑÐµ:  python3 mozvpn.py --session-token <hex> --email you@example.com",
-  "session_token_hex": "sessionToken Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð±ÑÑÑ hex-ÑÑÑÐ¾ÐºÐ¾Ð¹.",
-  "masque_no_aioquic": "aioquic Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½",
+  "test_running": "\u0422\u0435\u0441\u0442 {host}:{port} ...",
+  "test_external_ip": "\u0412\u043d\u0435\u0448\u043d\u0438\u0439 IP: {ip}",
+  "waf_406": "HTTP 406 \u043e\u0442 *.firefox.com \u0434\u0430\u0436\u0435 \u043f\u043e\u0441\u043b\u0435 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u043e\u0433\u043e \u0440\u0435\u0448\u0435\u043d\u0438\u044f challenge.\n\u041f\u043e\u0445\u043e\u0436\u0435, Fastly \u0438\u0437\u043c\u0435\u043d\u0438\u043b \u0440\u0430\u0437\u043c\u0435\u0442\u043a\u0443/\u0430\u043b\u0433\u043e\u0440\u0438\u0442\u043c challenge. \u0421\u0432\u0435\u0440\u044c\u0442\u0435 regex'\u044b:\n  - github.com/pagpeter/fastly-antibot (pkg/solver/solver.go \u2014 regex'\u044b script id \u0438 token)\n  - PR #22 \u0432 Mikescher/firefox-sync-client (syncclient/fastly.go \u2014 \u043f\u043e\u0440\u0442 \u044d\u0442\u043e\u0433\u043e \u0430\u043b\u0433\u043e\u0440\u0438\u0442\u043c\u0430)\n\u0424\u043e\u043b\u0431\u044d\u043a \u2014 \u043f\u0435\u0440\u0435\u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u0441\u0435\u0441\u0441\u0438\u044e Firefox:\n  1) \u0412\u043e\u0439\u0434\u0438\u0442\u0435 \u0432 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u0432 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0435 Firefox (2FA \u0432\u0432\u043e\u0434\u0438\u0442\u0441\u044f \u0442\u0430\u043c).\n  2) \u0418\u0437\u0432\u043b\u0435\u043a\u0438\u0442\u0435 sessionToken \u0438\u0437 \u043f\u0440\u043e\u0444\u0438\u043b\u044f, \u043d\u0430\u043f\u0440\u0438\u043c\u0435\u0440 \u0443\u0442\u0438\u043b\u0438\u0442\u043e\u0439 firefox_decrypt\n     (github.com/unode/firefox_decrypt): \u0437\u0430\u043f\u0438\u0441\u044c \u00abFirefox Accounts credentials\u00bb\n     \u0445\u0440\u0430\u043d\u0438\u0442 JSON \u0441 \u043f\u043e\u043b\u0435\u043c sessionToken.\n  3) \u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435:  python3 mozvpn.py --session-token <hex> --email you@example.com",
+  "session_token_hex": "sessionToken \u0434\u043e\u043b\u0436\u0435\u043d \u0431\u044b\u0442\u044c hex-\u0441\u0442\u0440\u043e\u043a\u043e\u0439.",
+  "masque_no_aioquic": "aioquic \u043d\u0435 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d",
   "masque_probe_error": "{err}",
-  "builtin_connect_failed": "ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ¸ÑÑÑÑ Ðº Ð°Ð¿ÑÑÑÐ¸Ð¼Ñ: {err}",
-  "builtin_no_token": "proxyPass-ÑÐ¾ÐºÐµÐ½ ÐµÑÑ Ð½Ðµ Ð¿Ð¾Ð»ÑÑÐµÐ½",
+  "builtin_connect_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0443: {err}",
+  "builtin_no_token": "proxyPass-\u0442\u043e\u043a\u0435\u043d \u0435\u0449\u0451 \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d",
 },
 }
 
@@ -1782,6 +2332,16 @@ _EMOJI = {
     "select_hint": "\u2328 ",
     "select_buffer": "\u2328 ",
     "select_bad": "\U0000274C ",
+    "select_hint_multi": "\u2328 ",
+    "multi_buffer": "\u2328 ",
+    "multi_bad": "\U0000274C ",
+    "countries_menu_hint": "\U0001F30D ",
+    "countries_menu_entry": "\U0001F517 ",
+    "countries_filter_applied": "\U0001F30D ",
+    "filter_all_applied": "\U0001F30D ",
+    "filter_empty_fallback": "\u26A0\uFE0F  ",
+    "hotkey_countries": "\U0001F504 ",
+    "net_error_retry": "\U0001F4E1 ",
     "upstream_override": "\U0001F9ED ",      # compass (route override)
     "next_refresh": "\u23F3 ",              # hourglass
     "confirm_exit_prompt": "\u2753 ",
@@ -1999,9 +2559,12 @@ def tr(key: str, **kw) -> str:
     fallback and attach the message's emoji decoration. A template may
     contain the placeholder {_e} - the emoji is placed THERE (in the
     middle of the sentence, at the meaningful spot); templates without
-    the placeholder get the emoji as a prefix."""
+    the placeholder get the emoji as a prefix.
+    v5.13: a caller may OVERRIDE the emoji decoration by passing
+    _e=... in kw (e.g. the per-proxy national flag in proxy_line);
+    without the override the _EMOJI map entry is used as before."""
     raw = STR.get(_LANG, {}).get(key) or STR["en"].get(key) or key
-    emo = _EMOJI.get(key, "")
+    emo = kw.pop("_e", None) or _EMOJI.get(key, "")
     if "{_e}" in raw:
         txt = raw.replace("{_e}", emo)
     else:
@@ -2010,6 +2573,185 @@ def tr(key: str, **kw) -> str:
         txt = txt.format(**kw)
     return txt
 
+# v5.19: the flag representation of the proxy lines. The pixel art was
+# REDRAWN from scratch as a REAL 6x2 PIXEL GRID rendered with the
+# upper-half block (U+2580): each terminal cell = TWO vertically stacked
+# pixels (the truecolor FOREGROUND paints the top half, the BACKGROUND
+# the bottom half - the standard technique of pixterm/ascii-magic-style
+# terminal graphics; verified online 2026-09-28: the upper half block
+# fills the top half of the cell and block elements give two pixels per
+# cell, and Windows Terminal STILL has no Kitty graphics protocol or
+# Sixel in the stock build, so half-block truecolor remains the ONLY
+# portable way to show a pixel PICTURE in a console). Every flag is
+# therefore EXACTLY 6 cells wide (12 pixels), stored as two 6-char
+# strings (top row / bottom row) + a small palette dict at the top of
+# the code - no emoji, no mixed quarter/diagonal glyphs, so every line
+# is perfectly aligned (the old table mixed 2- and 3-cell entries, which
+# is why e.g. Japan sat one column left). The RECOMMENDED anycast
+# (REC/unknown) gets a REAL flag too: a solid white flag in the dark
+# theme and a solid black flag in the light theme (drawn as ART in art
+# mode, so it aligns exactly like the country flags; the single-glyph
+# white/black flag emoji in emoji mode). "auto" (the DEFAULT) keeps the
+# v5.18 behavior: the pixel art on Windows (no flag emoji font there),
+# the ready-made emoji pair everywhere else; "emoji"/"art" force a style.
+_FLAG_STYLE = "auto"
+
+# The width of every flag representation, in console columns. The art
+# is FLAG_COLS cells + 1 trailing space; the emoji fallbacks are padded
+# to the same total so the listen-address column never moves.
+FLAG_COLS = 6
+
+def country_flag(cc) -> str:
+    """The flag of an ISO 3166-1 alpha-2 country code for the proxy
+    lines. v5.19: in ART mode every flag is a truecolor 6x2 PIXEL GRID
+    painted with the upper-half block (U+2580: fg = the top pixel of
+    the column, bg = the bottom pixel) - clean rectangles instead of
+    the old mixed quarter/diagonal glyphs, and EXACTLY 6 cells for
+    every country, so all proxy lines stay in the same columns. In
+    EMOJI mode it is the regional-indicator pair (U+1F1E6..U+1F1FF),
+    padded to the same 7-column total. 'UK' becomes the GB flag. The
+    RECOMMENDED anycast / unknown codes get a real flag as well:
+    solid WHITE in the dark theme, solid BLACK in the light theme
+    (art in art mode - perfectly aligned with the country flags -
+    or the single-glyph white/black flag emoji in emoji mode)."""
+    cc = (cc or "").strip().upper()
+    if cc == "UK":
+        cc = "GB"
+    style = _FLAG_STYLE
+    if style == "auto":
+        # v5.18: flag pictures exist ONLY via the art on Windows.
+        style = "art" if os.name == "nt" else "emoji"
+    if len(cc) != 2 or not cc.isalpha():
+        # v5.19: REC / unknown - a real WHITE (dark theme) or BLACK
+        # (light theme) flag, drawn as ART in art mode so it aligns
+        # exactly like the country flags (7 columns, like every line).
+        if style == "art" and _USE_COLOR:
+            col = "#FFFFFF" if _THEME == "dark" else "#000000"
+            return _flag_paint(("W" * FLAG_COLS, "W" * FLAG_COLS,
+                                {"W": col}))
+        flag = "\U0001F3F3\uFE0F" if _THEME == "dark" else "\U0001F3F4"
+        return flag + " " * (FLAG_COLS - 1)
+    if style == "art" and _USE_COLOR:
+        px = _FLAG_PIXELS.get(cc)
+        if px:
+            return _flag_paint(px)
+        # no art data: the emoji pair, padded to keep the alignment
+        pair = "".join(chr(0x1F1E6 + (ord(ch) - 0x41)) for ch in cc)
+        return pair + " " * (FLAG_COLS - 1)
+    if style == "art" and not _USE_COLOR:
+        pass                      # fall through to the emoji pair below
+    # emoji style: the regional-indicator pair (2 columns) + padding
+    pair = "".join(chr(0x1F1E6 + (ord(ch) - 0x41)) for ch in cc)
+    return pair + " " * (FLAG_COLS - 1)
+
+# ---------------------------------------------------------------------------
+# v5.19: the flag PIXEL table. Every entry is (TOP, BOTTOM, PALETTE):
+# two 6-character strings - one character per PIXEL COLUMN - and a
+# dict mapping each character to the official '#RRGGBB' shade. The
+# renderer paints column i with the upper-half block U+2580, the
+# FOREGROUND color = PALETTE[TOP[i]] (the top pixel) and the
+# BACKGROUND color = PALETTE[BOTTOM[i]] (the bottom pixel): 6 cells,
+# 12 pixels, one console line. Horizontal tricolors use the
+# A*3+B*3 / B*3+C*3 layout (the middle stripe appears on both rows, so
+# the flag reads as three bands); vertical tricolors repeat one string.
+# Emblems (crosses, crescents, discs, stars) are approximated with 1-4
+# pixels - the maximum a 6x2 grid can carry. Countries = the Mozilla
+# VPN network plus neighbors; any other ISO code falls back to the
+# emoji pair. Official shades verified online (v5.0-v5.18 notes).
+_FLAG_PIXELS = {
+    "US": ("BBBRRR", "WWWWRR", {"B": "#3C3B6E", "R": "#B22234", "W": "#FFFFFF"}),
+    "GB": ("BWBWBW", "WBWBWB", {"B": "#012169", "W": "#C8102E"}),
+    "AU": ("BBBBBW", "BWBWBB", {"B": "#012169", "W": "#FFFFFF"}),
+    "NZ": ("BBBBBW", "BWBBWB", {"B": "#012169", "W": "#FFFFFF"}),
+    "CA": ("RWWWWR", "RWWWWR", {"R": "#FF0000", "W": "#FFFFFF"}),
+    "DE": ("KKKRRR", "RRRGGG", {"K": "#000000", "R": "#DD0000", "G": "#FFCE00"}),
+    "FR": ("BBWWRR", "BBWWRR", {"B": "#002395", "W": "#FFFFFF", "R": "#ED2939"}),
+    "IT": ("GGWWRR", "GGWWRR", {"G": "#008C45", "W": "#F4F5F0", "R": "#CD212A"}),
+    "IE": ("GGWWOO", "GGWWOO", {"G": "#169B62", "W": "#FFFFFF", "O": "#FF883E"}),
+    "ES": ("RRRYYY", "YYYRRR", {"R": "#AA151B", "Y": "#F1BF00"}),
+    "AT": ("RRRWWW", "WWWRRR", {"R": "#ED2939", "W": "#FFFFFF"}),
+    "NL": ("RRRWWW", "WWWBBB", {"R": "#AE1C28", "W": "#FFFFFF", "B": "#21468B"}),
+    "BE": ("KKYYRR", "KKYYRR", {"K": "#000000", "Y": "#FDDA24", "R": "#EF3340"}),
+    "LU": ("RRRWWW", "WWWBBB", {"R": "#ED2939", "W": "#FFFFFF", "B": "#00A1DE"}),
+    "CH": ("RRWWRR", "WWWWWW", {"R": "#DA291C", "W": "#FFFFFF"}),
+    "SE": ("BBYYBB", "YYYYYY", {"B": "#006AA7", "Y": "#FECC02"}),
+    "NO": ("RRWWRR", "WWBBWW", {"R": "#BA0C2F", "W": "#FFFFFF", "B": "#00205B"}),
+    "DK": ("RRWWRR", "WWWWWW", {"R": "#C8102E", "W": "#FFFFFF"}),
+    "FI": ("BBWWBB", "WWWWWW", {"B": "#003580", "W": "#FFFFFF"}),
+    "PL": ("WWWWWW", "RRRRRR", {"W": "#FFFFFF", "R": "#DC143C"}),
+    "PT": ("GGGRRR", "GGYRRR", {"G": "#006600", "R": "#FF0000", "Y": "#FFDD00"}),
+    "CZ": ("BBWWWW", "BBRRRR", {"B": "#11457E", "W": "#FFFFFF", "R": "#D7141A"}),
+    "GR": ("BBBBBB", "WBWBWB", {"B": "#0D5EAF", "W": "#FFFFFF"}),
+    "HU": ("RRRWWW", "WWWGGG", {"R": "#CE2939", "W": "#FFFFFF", "G": "#436F4D"}),
+    "RO": ("BBYYRR", "BBYYRR", {"B": "#002B7F", "Y": "#FCD116", "R": "#CE1126"}),
+    "BG": ("WWWGGG", "GGGRRR", {"W": "#FFFFFF", "G": "#00966E", "R": "#D62612"}),
+    "HR": ("RRRWWW", "WWWBBB", {"R": "#FF0000", "W": "#FFFFFF", "B": "#171796"}),
+    "SI": ("WWWBBB", "BBBRRR", {"W": "#FFFFFF", "B": "#005DA4", "R": "#ED1C24"}),
+    "SK": ("WWWBBB", "BBBRRR", {"W": "#FFFFFF", "B": "#0B4EA2", "R": "#EE1C25"}),
+    "EE": ("BBBKKK", "KKKWWW", {"B": "#0072CE", "K": "#000000", "W": "#FFFFFF"}),
+    "LV": ("RRRWWW", "WWWRRR", {"R": "#9E3039", "W": "#FFFFFF"}),
+    "LT": ("YYYGGG", "GGGRRR", {"Y": "#FDB913", "G": "#006A44", "R": "#C1272D"}),
+    "UA": ("BBBBBB", "YYYYYY", {"B": "#0057B7", "Y": "#FFD700"}),
+    "RU": ("WWWBBB", "BBBRRR", {"W": "#FFFFFF", "B": "#0039A6", "R": "#D52B1E"}),
+    "BY": ("RRRRRR", "GGWWGG", {"R": "#CE1720", "G": "#4AA657", "W": "#FFFFFF"}),
+    "TR": ("RRWWRR", "RWWWRR", {"R": "#E30A17", "W": "#FFFFFF"}),
+    "CY": ("WWWCWW", "WWCCWW", {"W": "#FFFFFF", "C": "#D57800"}),
+    "MT": ("WWWRRR", "WWWRRR", {"W": "#FFFFFF", "R": "#CF142B"}),
+    "JP": ("WWRRWW", "WWRRWW", {"W": "#FFFFFF", "R": "#BC002D"}),
+    "KR": ("WWWRRR", "BBBWWW", {"W": "#FFFFFF", "R": "#CD2E3A", "B": "#0047A0"}),
+    "CN": ("RYYRRR", "RRRRRR", {"R": "#DE2910", "Y": "#FFDE00"}),
+    "TW": ("BWBRRR", "BBRRRR", {"B": "#000095", "W": "#FFFFFF", "R": "#FE0000"}),
+    "IN": ("OOOWWW", "WWWGGG", {"O": "#FF9933", "W": "#FFFFFF", "G": "#138808"}),
+    "ID": ("RRRRRR", "WWWWWW", {"R": "#CE1126", "W": "#FFFFFF"}),
+    "VN": ("RRYRRR", "RYYYRR", {"R": "#DA251D", "Y": "#FFFF00"}),
+    "TH": ("RRWWWW", "WBBBBW", {"R": "#A51931", "W": "#FFFFFF", "B": "#2D2A4A"}),
+    "MY": ("BBBRRW", "BBYRRW", {"B": "#01006D", "R": "#CC0001", "W": "#FFFFFF", "Y": "#FFCC00"}),
+    "SG": ("RRRWWW", "RWWRWW", {"R": "#ED2939", "W": "#FFFFFF"}),
+    "PH": ("BBWWWW", "RRWWYY", {"B": "#0038A8", "W": "#FFFFFF", "R": "#CE1126", "Y": "#FCD116"}),
+    "AE": ("RGGGGG", "RWWKKK", {"R": "#EF3340", "G": "#00732F", "W": "#FFFFFF", "K": "#000000"}),
+    "SA": ("GGGGGG", "GWWWWG", {"G": "#165D31", "W": "#FFFFFF"}),
+    "IL": ("BBBBBB", "WWBWBW", {"B": "#0038B8", "W": "#FFFFFF"}),
+    "EG": ("RRRYYY", "YYYKKK", {"R": "#CE1126", "Y": "#C09300", "K": "#000000"}),
+    "GH": ("RRRYYY", "YYKKGG", {"R": "#CE1126", "Y": "#FCD116", "K": "#000000", "G": "#006B3F"}),
+    "KE": ("KKKRRR", "RRWWGG", {"K": "#000000", "R": "#BB0000", "W": "#FFFFFF", "G": "#006600"}),
+    "NG": ("GWWGGG", "GWWGGG", {"G": "#008751", "W": "#FFFFFF"}),
+    "ZA": ("KKRRGG", "KKGGBB", {"K": "#000000", "R": "#DE3831", "G": "#007A4D", "B": "#002395"}),
+    "MA": ("RRGRRR", "RRRGRR", {"R": "#C1272D", "G": "#006233"}),
+    "SN": ("GGYYRR", "GGYYRR", {"G": "#00853F", "Y": "#FDEF42", "R": "#E31B23"}),
+    "BD": ("GRRGGG", "GRRGGG", {"G": "#006A4E", "R": "#F42A41"}),
+    "BR": ("GGYYGG", "GYBBYG", {"G": "#009C3B", "Y": "#FFDF00", "B": "#002776"}),
+    "CO": ("YYYBBB", "BBBRRR", {"Y": "#FCD116", "B": "#003893", "R": "#CE1126"}),
+    "PE": ("RWWRRR", "RWWRRR", {"R": "#D91023", "W": "#FFFFFF"}),
+    "CL": ("BBWWWW", "RRRRRR", {"B": "#0032A0", "W": "#FFFFFF", "R": "#D52B1E"}),
+    "AR": ("AAAYWW", "WWYAAA", {"A": "#74ACDF", "Y": "#F6B40E", "W": "#FFFFFF"}),
+    "MX": ("GWWRRR", "GWYRRR", {"G": "#006341", "W": "#FFFFFF", "R": "#C8102E", "Y": "#C09300"}),
+    "KZ": ("BYYBBB", "BBYBBB", {"B": "#00AFCA", "Y": "#FEC50C"}),
+}
+
+def _flag_rgb(hexstr: str) -> "tuple[int, int, int]":
+    """'#RRGGBB' -> (r, g, b) for the truecolor escape sequences."""
+    h = hexstr.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+def _flag_paint(px) -> str:
+    """v5.19: paint one flag PIXEL GRID. px = (TOP, BOTTOM, PALETTE):
+    two 6-character strings (one char per pixel column) and a dict
+    mapping chars to '#RRGGBB'. Every column is ONE cell with the
+    upper-half block U+2580: the TRUECOLOR foreground paints the TOP
+    pixel, the background the BOTTOM pixel - 6 cells, 12 pixels, one
+    console line, exactly FLAG_COLS cells wide for EVERY country (the
+    old quarter/diagonal-glyph table mixed 2- and 3-cell entries and
+    its mixed glyphs read as noise; the pixel grid reads as a clean
+    mini-flag). One trailing reset + space separates the flag from the
+    listen address and keeps every proxy line in the same columns."""
+    top, bottom, pal = px
+    out = []
+    for i in range(min(len(top), len(bottom), FLAG_COLS)):
+        fr, fgg, fb = _flag_rgb(pal[top[i]])
+        br, bgg, bb = _flag_rgb(pal[bottom[i]])
+        out.append(f"\x1b[38;2;{fr};{fgg};{fb}m"
+                   f"\x1b[48;2;{br};{bgg};{bb}m\u2580")
+    return "".join(out) + "\x1b[0m "
 # ---------------------------------------------------------------------------
 # Colored logging (req. 16): soft, readable ANSI shades, --no-color to disable.
 # ---------------------------------------------------------------------------
@@ -2136,6 +2878,12 @@ _RE_TOKENS = re.compile(
     r'|(?P<time>\b\d{2}:\d{2}:\d{2}\b)'
     r'|(?P<count>\b\d+/\d+\b|\b\d{6}\b)')
 
+# v5.14: embedded ANSI sequences (the truecolor pixel-art flags of the
+# proxy lines bake their codes into the stored history message) are
+# STRIPPED when the colorless render prints / redraws the log, so a
+# color toggle via hotkey 'n' never shows raw escape garbage.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 # Log history: every emitted line is remembered so the WHOLE visible log
 # can be redrawn when the theme or the color mode is switched on the fly
 # (hotkeys 'm' / 'n'). Capped to keep the memory bounded.
@@ -2156,7 +2904,9 @@ def _render(level: str, msg: str):
     gets its own color, with --flags / IPs / protocol names inside it
     still highlighted separately."""
     if not _USE_COLOR:
-        print(msg)
+        # v5.14: strip embedded ANSI sequences (the pixel-art flags) so
+        # the colorless log and the hotkey-'n' redraw stay clean text
+        print(_ANSI_RE.sub("", msg))
         return
     t = _THEMES[_THEME]
     lvl = t[level]
@@ -2599,6 +3349,213 @@ def hawk_session(session_token: str, method: str, path: str,
 
 # ---------------- http ----------------
 
+def _is_transient_net_error(e) -> bool:
+    """v5.12: True for TRANSIENT network errors that usually resolve
+    themselves within seconds (the Termux/arm live runs showed
+    gaierror(7) 'No address associated with hostname' blips that broke
+    ONE loop iteration and were fine on the retry): a URLError whose
+    reason is a gaierror/timeout/connection error, socket.gaierror,
+    timeouts and connection errors, plus a text fallback. HTTPError is
+    NOT transient (it is a real server answer)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return False
+    if isinstance(e, urllib.error.URLError):
+        r = getattr(e, "reason", None)
+        if isinstance(r, (socket.gaierror, socket.timeout, TimeoutError,
+                          ConnectionError, OSError)):
+            return True
+        t = str(r).lower()
+        return any(s in t for s in ("gaierror", "timed out", "timeout",
+                                    "connection reset", "refused",
+                                    "unreachable", "network is down",
+                                    "no address associated"))
+    if isinstance(e, (socket.gaierror, socket.timeout, TimeoutError,
+                      ConnectionError)):
+        return True
+    t = str(e).lower()
+    return any(s in t for s in ("gaierror", "timed out", "timed out",
+                                "connection reset", "refused",
+                                "no address associated"))
+
+def _net_err_public(e) -> str:
+    """v5.12: a SHORT localized reason for a transient network error, so
+    the log stays friendly instead of showing raw exception reprs like
+    URLError(gaierror(7, 'No address associated with hostname'))."""
+    t = str(getattr(e, "reason", e)).lower()
+    if ("gaierror" in t or "no address associated" in t
+            or "name or service" in t):
+        return tr("net_err_dns")
+    if "timed out" in t or "timeout" in t:
+        return tr("net_err_timeout")
+    return tr("net_err_conn")
+
+# ---------------------------------------------------------------------------
+# v5.13: DIRECT-IP HTTPS FALLBACK (packaged Android binaries).
+# On Android/Termux PACKAGED binaries (PyInstaller/Nuitka) the SYSTEM
+# resolver may fail with gaierror(7) 'No address associated with
+# hostname' while the same code runs fine as a plain script in the same
+# shell - a KNOWN packaged-Python-on-Android problem (python-for-android
+# #1447, kivy #7087, PyInstaller #3721: getaddrinfo is broken in the
+# packaged runtime while nslookup/the browser work fine). The DoH
+# presets are hostname-based, so they cannot help either when
+# getaddrinfo is broken. The fallback bypasses the system resolver
+# ENTIRELY:
+#   (1) _emergency_doh_resolve() asks the well-known DoH resolver IPs
+#       directly over HTTPS - NO name resolution anywhere (the SNI and
+#       the Host header stay the resolver hostname, the TCP connect
+#       goes to the IP literal);
+#   (2) _raw_https() sends ONE raw HTTPS/1.1 request straight to the
+#       resolved IP with the correct Host header and SNI;
+#   (3) _req_ip_fallback() wraps (1)+(2) into a req()-compatible call
+#       (redirect following, the shared cookie jar, JSON parsing).
+# ---------------------------------------------------------------------------
+
+_DOH_IP_BOOTSTRAP = (
+    # (resolver IP, SNI/Host hostname, port, JSON DoH endpoint)
+    ("1.1.1.1", "cloudflare-dns.com", 443,  "/dns-query"),
+    ("8.8.8.8", "dns.google",         443,  "/resolve"),
+    ("9.9.9.9", "dns.quad9.net",      5053,  "/dns-query"),
+)
+
+def _raw_https(ip: str, sni_host: str, port: int, method: str, path: str,
+               headers: dict, body: "bytes | None" = None,
+               timeout: int = 10) -> "tuple[int, dict, bytes]":
+    """v5.13: ONE raw HTTPS/1.1 request straight to `ip` - NO system DNS
+    anywhere: the TCP connect goes to the IP literal, the TLS SNI and
+    the Host header stay `sni_host`. Returns (status_code, header_dict,
+    body_bytes) or raises OSError/socket errors."""
+    s = socket.create_connection((ip, port), timeout=timeout)
+    tls = None
+    try:
+        s.settimeout(timeout)
+        tls = _ssl_ctx().wrap_socket(s, server_hostname=sni_host)
+        hdrs = {"Host": sni_host, "Connection": "close",
+                "Accept-Encoding": "identity"}
+        for k, v in (headers or {}).items():
+            if k.lower() != "host":
+                hdrs[k] = v
+        if body is not None:
+            hdrs["Content-Length"] = str(len(body))
+        head = (f"{method.upper()} {path} HTTP/1.1\r\n"
+                + "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())
+                + "\r\n").encode("latin-1", "replace")
+        tls.sendall(head + (body or b""))
+        chunks = []
+        while True:
+            b = tls.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+            if len(b"".join(chunks)) > 1048576:
+                break
+        status_line, hdict, resp_body = _http_dechunked_body(b"".join(chunks))
+        if not status_line:
+            raise OSError(f"unparsable HTTP response from {ip}:{port}")
+        parts = status_line.split()
+        code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        return code, hdict, resp_body
+    finally:
+        for _sock in (tls, s):
+            try:
+                if _sock is not None:
+                    _sock.close()
+            except Exception:
+                pass
+
+def _emergency_doh_resolve(host: str) -> "list[str] | None":
+    """v5.13: resolve a hostname when the SYSTEM resolver is broken: ask
+    the well-known DoH resolver IPs DIRECTLY (the resolver hostnames are
+    never resolved - SNI only). Returns the A/AAAA answer list or None.
+    Works regardless of the --doh setting (even with DoH 'off')."""
+    for ip, sni, rport, path in _DOH_IP_BOOTSTRAP:
+        try:
+            q = (path + ("&" if "?" in path else "?")
+                 + "name=" + quote(host, safe="") + "&type=A")
+            code, _h, resp = _raw_https(ip, sni, rport, "GET", q,
+                                       {"Accept": "application/dns-json",
+                                        "User-Agent": "mozvpn/5.13"},
+                                       None, DOH_TIMEOUT)
+            if code != 200 or not resp:
+                continue
+            data = json.loads(resp.decode("utf-8", "replace"))
+            ips = [str(a.get("data")) for a in data.get("Answer") or []
+                   if a.get("type") in (1, 28) and a.get("data")]
+            if ips:
+                return ips
+        except Exception:
+            continue
+    return None
+
+class _RawRespInfo:
+    """v5.13: the minimal response shim for COOKIE_JAR.extract_cookies():
+    the jar only needs response.info() with get_all('Set-Cookie') and a
+    real urllib Request (which already provides every attribute it
+    reads)."""
+
+    def __init__(self, hdict: dict):
+        from email.message import Message
+        self._msg = Message()
+        for k, v in (hdict or {}).items():
+            self._msg[k] = v
+
+    def info(self):
+        return self._msg
+
+def _req_ip_fallback(method: str, url: str, data, headers,
+                     timeout: int) -> "tuple[int, dict] | None":
+    """v5.13: req() LAST RESORT after the system resolver failed (the
+    packaged-binary-on-Android case): resolve the URL host over the
+    emergency DoH, then ONE raw HTTPS request to the IP with the
+    correct Host header + SNI, redirect following and the shared
+    cookie jar included. Returns the req() (status, json) shape, or
+    None when the fallback cannot help (the URL is not HTTPS or the
+    emergency DoH itself failed)."""
+    u = urlparse(url)
+    if (u.scheme or "https").lower() != "https" or not u.hostname:
+        return None
+    ips = _emergency_doh_resolve(u.hostname)
+    if not ips:
+        return None
+    base_headers = dict(BROWSER_HEADERS)
+    base_headers.update(headers or {})
+    cur_url, cur_method, cur_body = url, (method or "GET").upper(), \
+        (json.dumps(data).encode() if data is not None else None)
+    for _hop in range(5):                   # follow up to 5 redirects
+        u2 = urlparse(cur_url)
+        if u2.hostname != u.hostname:       # cross-host redirect
+            ips = _emergency_doh_resolve(u2.hostname) or ips
+        path = (u2.path or "/") + (("?" + u2.query) if u2.query else "")
+        # a REAL urllib Request only as the cookie-jar interface
+        creq = urllib.request.Request(cur_url, data=cur_body,
+                                      headers=dict(base_headers),
+                                      method=cur_method)
+        try:
+            COOKIE_JAR.add_cookie_header(creq)
+        except Exception:
+            pass
+        send = dict(base_headers)
+        send.update({k: v for k, v in creq.header_items()
+                     if k.lower() != "host"})
+        code, hdict, resp_body = _raw_https(
+            ips[0], u2.hostname, u2.port or 443, cur_method, path,
+            send, cur_body, timeout)
+        _note_server_date(hdict)            # time sync for TOTP, as in req()
+        try:
+            COOKIE_JAR.extract_cookies(_RawRespInfo(hdict), creq)
+        except Exception:
+            pass
+        if code in (301, 302, 303, 307, 308) and hdict.get("location"):
+            cur_url = urllib.parse.urljoin(cur_url, hdict["location"])
+            if code == 303 or (code in (301, 302) and cur_method == "POST"):
+                cur_method, cur_body = "GET", None
+            continue
+        if not resp_body:
+            return code, {}
+        try:
+            return code, json.loads(resp_body)
+        except Exception:
+            return code, {}
+
 def req(method: str, url: str, data=None, headers=None, timeout=30, _fastly_retry=False):
     h = dict(BROWSER_HEADERS); h.update(headers or {})
     body = json.dumps(data).encode() if data is not None else None
@@ -2618,6 +3575,30 @@ def req(method: str, url: str, data=None, headers=None, timeout=30, _fastly_retr
             return req(method, url, data, headers, timeout, _fastly_retry=True)
         try:    return e.code, (json.loads(raw) if raw else {})
         except Exception: return e.code, {}
+    except urllib.error.URLError as e:
+        # v5.12: a TRANSIENT network error (a gaierror blip, a momentary
+        # timeout - seen in the Termux/arm live runs) is retried ONCE
+        # after a short pause instead of bubbling up as a scary
+        # 'Unexpected error'. _fastly_retry doubles as the single-retry
+        # flag here (it only guards against a retry loop).
+        if _is_transient_net_error(e):
+            if not _fastly_retry:
+                time.sleep(1.5)
+                return req(method, url, data, headers, timeout, _fastly_retry=True)
+            # v5.13: the retry failed too -> the SYSTEM resolver is most
+            # likely broken (the PACKAGED-binary-on-Android case: gaierror
+            # (7) 'No address associated with hostname' in the binary while
+            # the plain script works - see the comment block above the
+            # _DOH_IP_BOOTSTRAP table). Bypass the system resolver
+            # entirely: emergency DoH straight to the resolver IPs + ONE
+            # raw HTTPS request to the resolved IP (Host + SNI kept).
+            try:
+                out = _req_ip_fallback(method, url, data, headers, timeout)
+                if out is not None:
+                    return out
+            except Exception:
+                pass
+        raise
 
 # ---------------- session / credential caches ----------------
 
@@ -2650,12 +3631,27 @@ def wipe_all_saved_data(creds: dict) -> bool:
     the in-memory state (the creds dict passed in, the Fastly cookie jar),
     so the next sign-in cannot reuse anything and asks for the login data
     again. Used by the 'c' hotkey, the 'r' hotkey, --clear-cache, --relogin."""
-    global COOKIE_JAR
+    global COOKIE_JAR, _OPENER
     ok_caches = clear_all_caches()
     # In-memory leftovers are why a re-login used to succeed after a wipe:
     # creds (email/password/totp_secret) and the Fastly cookie must go too.
     creds.clear()
+    # v5.23: _OPENER holds the ORIGINAL jar forever (build_opener captured
+    # it at import). Reassigning COOKIE_JAR alone left the opener wired to
+    # the DEAD jar: the challenge flow stored the solved _fs_ch_cp_* cookie
+    # into the old jar while the code read the NEW, empty one ("cookie not
+    # received after a successful solution"), and no request ever sent the
+    # new jar's cookies. Rebuild the opener on the fresh jar.
     COOKIE_JAR = http.cookiejar.CookieJar()
+    _OPENER = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(COOKIE_JAR))
+    # v5.23: the challenge latch survived every wipe - after ONE failure
+    # failed=True disabled solving for the REST OF THE PROCESS (every retry
+    # skipped straight to the 406), which is exactly why the endless
+    # relogin-retry loop never recovered while a RESTART always worked.
+    # The state is part of the Fastly session and resets with it.
+    _fastly_state["solved"] = False
+    _fastly_state["failed"] = False
     info(tr("clear_wiped_note"))
     return ok_caches
 
@@ -2667,6 +3663,105 @@ def save_cache(email, session_token):
         _chmod600(CACHE)
     except OSError:
         pass
+
+# ---------------- v5.12: --countries / hotkey 'w' filter cache ----------------
+
+COUNTRIES_CACHE = os.path.join(CONF_DIR, "countries.json")
+
+def parse_countries_arg(value) -> "list[str]":
+    """v5.12: parse --countries (comma/space-separated ISO codes, full
+    country names, 'rec' allowed) into a list of lowercase tokens."""
+    if not value:
+        return []
+    out = []
+    for tok in re.split(r"[,\s]+", str(value).strip()):
+        tok = tok.strip().lower()
+        if tok and tok not in out:
+            out.append(tok)
+    return out
+
+def save_countries_filter(countries=None, keys=None):
+    """v5.12: persist the local-proxy filter (--countries or the hotkey
+    'w' selection) so it survives restarts. `keys` (the per-proxy tokens
+    of the hotkey 'w' menu) take precedence over `countries`; an 'all'
+    selection (token '0') CLEARS the filter (the file is removed)."""
+    data = {}
+    if countries:
+        data["countries"] = list(countries)
+    if keys:
+        data["keys"] = list(keys)
+    try:
+        os.makedirs(os.path.dirname(COUNTRIES_CACHE), exist_ok=True)
+        with open(COUNTRIES_CACHE, "w") as f:
+            json.dump(data, f)
+        _chmod600(COUNTRIES_CACHE)
+    except OSError:
+        pass
+
+def load_countries_filter() -> dict:
+    """v5.12: {'countries': [...], 'keys': [...]} saved by --countries or
+    the hotkey 'w' ('keys' take precedence). Empty when no filter is set."""
+    try:
+        with open(COUNTRIES_CACHE) as f:
+            c = json.load(f)
+        if isinstance(c, dict):
+            return c
+    except Exception:
+        pass
+    return {}
+
+def clear_countries_filter():
+    """v5.12: drop the saved --countries / hotkey 'w' filter ('all')."""
+    try:
+        os.remove(COUNTRIES_CACHE)
+    except OSError:
+        pass
+
+def _match_country_token(srv: dict, tokens: "list[str]") -> bool:
+    """v5.12: does the upstream match one of the --countries tokens?
+    A token may be an ISO code ('us', 'de', 'rec') or a full lowercase
+    country name ('france')."""
+    cc = (srv.get("countryCode") or "").strip().lower()
+    name = (srv.get("countryName") or "").strip().lower()
+    for t in tokens:
+        if t == cc or t == name:
+            return True
+    return False
+
+def apply_countries_filter(args, verified: list) -> list:
+    """v5.12: filter the verified upstreams by the --countries list or
+    the saved hotkey 'w' selection (countries.json; the per-proxy keys
+    take precedence over the country list). --countries given on THIS
+    run wins and is persisted for the next restarts. Returns the
+    filtered list (unchanged when no filter is set); when a saved
+    filter matches nothing, ALL upstreams are served with a warning so
+    the script never ends up with zero local proxies."""
+    flt = load_countries_filter()
+    keys = [str(k).strip().lower() for k in (flt.get("keys") or [])
+            if str(k).strip()]
+    countries = [str(c).strip().lower() for c in (flt.get("countries") or [])
+                 if str(c).strip()]
+    cli = parse_countries_arg(getattr(args, "countries", None))
+    if cli:
+        countries = cli
+        keys = []
+        save_countries_filter(countries=countries)
+    if not keys and not countries:
+        return verified
+    if keys:
+        tokmap = {selection_token(i): s for i, s in enumerate(verified)}
+        out = [tokmap[t] for t in keys if t in tokmap]
+    else:
+        out = [s for s in verified if _match_country_token(s, countries)]
+    if not out:
+        warn(tr("filter_empty_fallback"))
+        return verified
+    if len(out) != len(verified):
+        cc_list = ", ".join(sorted({(s.get("countryCode") or "?").upper()
+                                     for s in out})) or "-"
+        info(tr("countries_filter_applied", n=len(out), m=len(verified),
+                list=cc_list))
+    return out
 
 _CRED_KEYS = ("email", "password", "totp_secret",
               "totp_digits", "totp_period", "totp_algorithm")
@@ -3480,9 +4575,22 @@ def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
         raw = None
         try:
             raw = _connect_resolved_ips(ips, host, port, timeout)
+        except Exception as e:
+            # v5.14: a TCP-LAYER failure (connect timeout / refused /
+            # unreachable) means NO ClientHello was ever sent - the
+            # ClientHello profile of the remaining attempts CANNOT
+            # change this outcome. The v5.8 changelog already noted that
+            # 'a fully-failing run is bounded by the profile matrix x
+            # the per-attempt timeout' (up to 4 x 5 s wasted per
+            # upstream in the probe); abort the matrix immediately.
+            last_err = e
+            break
+        try:
             raw.settimeout(timeout)
             return ctx.wrap_socket(raw, server_hostname=host)
         except Exception as e:
+            # a TLS-HANDSHAKE failure: the next ClientHello profile may
+            # still succeed - walk on (the preserved v5.6 behavior)
             last_err = e
             extra = _peek_plain(raw) if raw else ""
             if extra:
@@ -3583,6 +4691,19 @@ def _hp(host: str, port, width: int = 34) -> str:
     the per-upstream probe / geo / protocol log lines all start their
     message text in the SAME column regardless of the hostname length."""
     return f"{host}:{port}".ljust(width)
+
+def _proxy_label_width(proxies) -> int:
+    """v5.19: the label-column width of the proxy lines: the WIDEST
+    label of ALL proxies, at least 30 (the {label:<30} minimum of the
+    proxy_line template). Padding every label to this width BEFORE the
+    template runs is what keeps the '->' arrow column identical on
+    every line - including the long 'Recomended Location/Recomended
+    City' line, which used to overflow the fixed 30 and push its
+    arrow further right than every other proxy line."""
+    try:
+        return max([len(str(p.get("label") or "")) for p in proxies] + [30])
+    except Exception:
+        return 30
 
 def _connect_tunnel_open(server: dict, token: str,
                          dst_host: str, dst_port: int):
@@ -3744,64 +4865,202 @@ def probe_geo(server: dict, token: str) -> "tuple[str | None, str | None]":
 def probe_masque(server: dict, token: str, echo_url: str) -> "tuple[bool, str]":
     """Probe one upstream for real MASQUE (HTTP/3 CONNECT-UDP over QUIC,
     RFC 9298 + RFC 9114 extended CONNECT). Uses the popular `aioquic`
-    package when installed. A successful probe requires actual data to be
-    tunneled through the MASQUE session (the request travels as UDP
-    datagrams in capsules). Returns (ok, detail)."""
+    package when installed.
+    v5.15 (req. 3): a 2xx answer to the extended CONNECT is NOT a
+    successful probe by itself anymore. The probe now TUNNELS REAL DATA:
+    a minimal DNS query (A mozilla.com) is sent through the CONNECT-UDP
+    tunnel to the public resolver 1.1.1.1:53 as a DATAGRAM capsule
+    (RFC 9297: capsule type 0x00 = DATAGRAM, framing varint type +
+    varint length; the HTTP Datagram is Context ID 0 + the raw UDP
+    payload - with Context ID 0 the payload goes to the tunnel target
+    from the CONNECT URI, RFC 9298) and the probe SUCCEEDS ONLY when the
+    DNS ANSWER comes back through the tunnel (matched by the random
+    2-byte DNS transaction ID + the QR bit). '200 but no data' is a
+    FAILURE now. The CONNECT request also gained the RFC 9298-required
+    'capsule-protocol: ?1' header, the correct :authority (the PROXY
+    host:port, not the tunnel target - RFC 9298 section 5.1) and
+    end_stream=False (the stream must STAY OPEN for the capsules).
+    Returns (ok, detail)."""
     if aioquic is None:
         return False, tr("masque_no_aioquic")
     try:
         import asyncio
-        from urllib.parse import quote
 
         async def _run():
             from aioquic.asyncio import connect as quic_connect
             from aioquic.h3.connection import H3_ALPN, H3Connection
-            from aioquic.h3.events import HeadersReceived, DataReceived
+            from aioquic.h3.events import (DataReceived, DatagramReceived,
+                                           HeadersReceived)
             from aioquic.quic.configuration import QuicConfiguration
-            from aioquic.quic.events import ConnectionTerminated
+            from aioquic.quic.events import StreamReset
 
-            u = urlparse(echo_url)
-            echo_host = u.hostname
-            # target: UDP 443 of the echo service (HTTPS over QUIC side of MASQUE
-            # cannot be assumed; instead we datagram a DNS-like UDP probe is not
-            # applicable either - the standard verification used by clients is
-            # an HTTP/3 request to the echo service itself via CONNECT-UDP)
+            # --- the tunneled UDP payload: a minimal DNS query (A mozilla.com)
+            # The 2-byte transaction ID is random, so the ANSWER is matched
+            # unambiguously: same ID + the DNS QR (response) bit set.
+            qid = os.urandom(2)
+            qname = b"".join(bytes([len(lbl)]) + lbl
+                            for lbl in b"mozilla.com".split(b".")) + b"\x00"
+            dns_q = (qid + b"\x01\x00"              # ID, flags: RD=1
+                     + b"\x00\x01" + b"\x00\x00" * 3   # QDCOUNT=1, AN/NS/AR=0
+                     + qname + b"\x00\x01" + b"\x00\x01")  # QNAME, A, IN
+            # RFC 9297 DATAGRAM capsule: type 0x00, varint length, then the
+            # HTTP Datagram "Context ID 0 + UDP payload" (RFC 9298: the
+            # datagram with Context ID 0 carries the UDP payload for the
+            # target host:port of the CONNECT URI). The capsule value is
+            # 1 context byte + the 29-byte query = 30 - well under the 64
+            # that still fits a ONE-byte varint length.
+            capsule = bytes([0x00, 1 + len(dns_q), 0x00]) + dns_q
+
             cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
             cfg.server_name = server["protocolHost"]
-            async with quic_connect(server["protocolHost"],
-                                    server["protocolPort"], configuration=cfg,
-                                    wait_connected=2.0) as client:
+            # v5.13 (speed/robustness 1): connect to the DoH-resolved IP -
+            # aioquic resolves the hostname with the SYSTEM resolver
+            # (broken in packaged Android binaries, slow/filtered on some
+            # networks); the SNI above keeps the REAL hostname.
+            m_ips = resolve_host(server["protocolHost"]) or []
+            m_host = m_ips[0] if m_ips else server["protocolHost"]
+            async with quic_connect(m_host,
+                                   server["protocolPort"], configuration=cfg,
+                                   wait_connected=2.0) as client:
                 h3 = H3Connection(client._quic)
                 stream_id = client._quic.get_next_available_stream_id()
-                target = quote(f"{echo_host}:443", safe="")
-                masque_path = f"/.well-known/masque/udp/{target}/".encode()
+                # RFC 9298 section 5.1: the URI template target is the UDP
+                # destination; :authority is the UDP PROXY (the egress).
+                # The probe tunnels DNS to the public resolver 1.1.1.1:53 -
+                # a UDP service that answers EVERY client from ANY source
+                # address (the egress), so the probe needs no extra setup.
                 headers = [
                     (b":method", b"CONNECT"),
-                    (b":authority", f"{echo_host}:443".encode()),
+                    (b":authority",
+                     f"{server['protocolHost']}:{server['protocolPort']}"
+                     .encode()),
                     (b":scheme", b"https"),
-                    (b":path", masque_path),
+                    (b":path", b"/.well-known/masque/udp/1.1.1.1/53/"),
                     (b":protocol", b"connect-udp"),
+                    (b"capsule-protocol", b"?1"),
                     (b"proxy-authorization", f"Bearer {token}".encode()),
                     (b"user-agent", b"curl/8.0"),
                 ]
-                # RFC 9298 extended CONNECT to a MASQUE (connect-udp) egress.
-                h3.send_headers(stream_id=stream_id, headers=headers, end_stream=True)
+                # end_stream=False: the CONNECT stream STAYS OPEN - the
+                # capsules with the tunneled datagrams flow on it (the
+                # v5.14 probe closed its send side, so no data could ever
+                # be tunneled; a 2xx answer was all it ever saw).
+                h3.send_headers(stream_id=stream_id, headers=headers,
+                                end_stream=False)
                 client.transmit()
-                # Data-transfer verification: keep the QUIC session alive for a
-                # few seconds (v5.4: 8 -> 5, the live-run 'long probes'
-                # complaint). A server that does not support connect-udp resets
-                # the stream / closes the connection; if the session survives
-                # and headers were sent, we treat the probe as successful.
+                # v5.13 (speed 2) / v5.14 (speed 1) / v5.15 (req. 3): the
+                # protocol event callback is hooked (an instance attribute
+                # shadows QuicConnectionProtocol.quic_event_received - the
+                # class calls it for every QUIC event) and
+                # H3Connection.handle_event() (the aioquic docs) RETURNS
+                # the decoded H3 events. The verdict machine:
+                #   - 2xx HEADERS  -> SEND the DNS query capsule through
+                #     the tunnel (NOT a success yet!)
+                #   - the DNS ANSWER (matching ID + QR bit) in a
+                #     DataReceived (DATAGRAM capsule on the stream) or a
+                #     DatagramReceived (QUIC DATAGRAM frame) -> SUCCESS
+                #   - non-2xx HEADERS -> rejection, StreamReset -> refusal
+                #   - the 5 s deadline -> failure; '200 but no data' is
+                #     reported as exactly that
+                state = {"sent_at": 0.0, "resends": 0, "dg_tried": False}
+                verdict = []
+                status_seen = []
+                def _find_answer(data: bytes) -> bool:
+                    """The DNS ANSWER: the random transaction ID at some
+                    offset in the datagram + the QR (response) bit set."""
+                    i = data.find(qid)
+                    return (i >= 0 and i + 3 <= len(data)
+                            and data[i + 2] & 0x80)
+                def _on_quic_event(ev):
+                    try:
+                        for h3ev in h3.handle_event(ev):
+                            if isinstance(h3ev, HeadersReceived) and \
+                                    h3ev.stream_id == stream_id:
+                                st = ""
+                                for hk, hv in h3ev.headers:
+                                    if hk == b":status":
+                                        st = hv.decode("latin-1", "replace")
+                                        break
+                                status_seen.append(st)
+                                if st.startswith("2"):
+                                    # tunnel established: push the UDP
+                                    # datagram through it and remember when.
+                                    # h3.send_data wraps the capsule in an
+                                    # H3 DATA frame - exactly how RFC 9297
+                                    # section 3.1 says the data stream of
+                                    # an HTTP/3 request travels ("all
+                                    # bytes sent in DATA frames"); the
+                                    # server concatenates the DATA frame
+                                    # payloads and parses the capsules.
+                                    h3.send_data(stream_id=stream_id,
+                                                 data=capsule,
+                                                 end_stream=False)
+                                    client.transmit()
+                                    state["sent_at"] = time.time()
+                                else:
+                                    verdict.append("refused")
+                            elif isinstance(h3ev, (DataReceived,
+                                                  DatagramReceived)):
+                                # DataReceived: the server's DATAGRAM
+                                #   capsule arrived in an H3 DATA frame -
+                                #   aioquic already stripped the frame
+                                #   header, h3ev.data IS the capsule bytes
+                                #   (type, length, Context ID + UDP
+                                #   payload).
+                                # DatagramReceived: an HTTP/3 DATAGRAM
+                                #   (QUIC DATAGRAM frame) - h3ev.data is
+                                #   "Context ID + UDP payload" (aioquic
+                                #   stripped the quarter stream ID).
+                                # Both are scanned for the DNS answer.
+                                if h3ev.stream_id == stream_id and \
+                                        _find_answer(h3ev.data):
+                                    verdict.append("ok")
+                    except Exception:
+                        pass
+                    if isinstance(ev, StreamReset) and \
+                            ev.stream_id == stream_id:
+                        verdict.append("reset")
+                client.quic_event_received = _on_quic_event
                 deadline = time.time() + 5
-                closed = False
-                while time.time() < deadline:
-                    await asyncio.sleep(0.1)
+                while time.time() < deadline and not verdict:
+                    await asyncio.sleep(0.05)
+                    # UDP can DROP the query: re-send it once per second
+                    # (max twice), the second time ALSO via the QUIC
+                    # DATAGRAM frame variant (h3.send_datagram) - some H3
+                    # deployments prefer frames over capsules.
+                    if (state["sent_at"]
+                            and time.time() - state["sent_at"] >= 1
+                            and state["resends"] < 2):
+                        h3.send_data(stream_id=stream_id, data=capsule,
+                                     end_stream=False)
+                        if not state["dg_tried"]:
+                            try:
+                                h3.send_datagram(stream_id,
+                                                 b"\x00" + dns_q)
+                            except Exception:
+                                pass
+                            state["dg_tried"] = True
+                        client.transmit()
+                        state["resends"] += 1
+                        state["sent_at"] = time.time()
                     if client._quic._close_event.is_set():
-                        closed = True
-                        break
-                if closed:
-                    return False, "QUIC connection closed by server"
-                return True, "h3 session established, CONNECT-UDP accepted"
+                        return False, "QUIC connection closed by server"
+                if verdict:
+                    v = verdict[0]
+                    if v == "ok":
+                        return True, ("UDP datagram tunneled and answered "
+                                       "(DNS via MASQUE)")
+                    if v == "refused":
+                        return False, (f"CONNECT-UDP refused by server: "
+                                       f"HTTP {status_seen[0] or '?'}")
+                    if v == "reset":
+                        return False, "CONNECT-UDP stream reset by server"
+                # v5.15 (req. 3): 2xx WITHOUT a tunneled answer = FAILURE
+                if status_seen and status_seen[0].startswith("2"):
+                    return False, ("tunnel accepted (HTTP "
+                                   f"{status_seen[0]}) but no UDP data "
+                                   "came back through it")
+                return False, "no CONNECT-UDP answer from server"
 
         return asyncio.run(_run())
     except Exception as e:
@@ -3810,16 +5069,40 @@ def probe_masque(server: dict, token: str, echo_url: str) -> "tuple[bool, str]":
 def check_upstream(server: dict, token: str, echo_url: str) -> dict:
     """Full check of one upstream: MASQUE first (if advertised or if the node
     looks MASQUE-capable), HTTP CONNECT as the fallback. Returns a result
-    dict: {server, protocol, ok, detail}."""
+    dict: {server, protocol, ok, detail}.
+    v5.13: for a MASQUE upstream the CONNECT fallback now runs
+    CONCURRENTLY with the MASQUE probe (a 1-thread pool), no longer
+    AFTER it - a UDP-blocked network used to pay the full masque
+    attempt (up to 2 s QUIC connect + 5 s data wait) and THEN the
+    whole CONNECT probe on top, per upstream: the last serial part of
+    the probe phase. The masque verdict keeps priority; the connect
+    result is simply already there when masque fails.
+    v5.14: the fallback moved from a per-upstream ThreadPoolExecutor
+    to a plain DAEMON thread + an Event - a pool's worker threads are
+    NOT daemon and the interpreter JOINS them at exit (bpo-36780), so
+    a fallback still running at shutdown delayed the exit; a daemon
+    thread never does. Same concurrency, same wait semantics."""
     if server["protocol"] == PROTO_MASQUE:
+        fallback = dict(server, protocol=PROTO_CONNECT)
+        done = threading.Event()
+        holder = {}
+        def _bg_connect():
+            try:
+                holder["res"] = probe_connect(fallback, token, echo_url)
+            except Exception as e:
+                holder["res"] = (False, repr(e), None, None)
+            done.set()
+        threading.Thread(target=_bg_connect, daemon=True,
+                         name="mozvpn-connect-fallback").start()
         ok_m, detail_m = probe_masque(server, token, echo_url)
         if ok_m:
             return {"server": server, "protocol": PROTO_MASQUE,
                     "ok": True, "detail": detail_m,
                     "geo": None, "geoCity": None}
-        # MASQUE failed -> automatic fallback to HTTP CONNECT (req. 2)
-        fallback = dict(server, protocol=PROTO_CONNECT)
-        ok_c, detail_c, geo_c, city_c = probe_connect(fallback, token, echo_url)
+        # MASQUE failed -> the CONNECT fallback result (already computed
+        # concurrently; the wait matches the old future.result())
+        done.wait()
+        ok_c, detail_c, geo_c, city_c = holder["res"]
         return {"server": fallback, "protocol": PROTO_CONNECT,
                 "ok": ok_c, "detail": detail_c,
                 "geo": geo_c, "geoCity": city_c,
@@ -3853,10 +5136,12 @@ def _probe_reason_public(detail: str) -> str:
         return tr("probe_reason_unreachable")
     if "no ip in echo response" in d:
         return tr("probe_reason_echo")
+    if "no udp data" in d:
+        return tr("probe_reason_nodata")
     return tr("probe_reason_other")
 
 def probe_upstreams_parallel(servers: list, token: str, echo_url: str,
-                             echo_name: str, max_workers: int = 32) -> list:
+                             echo_name: str, max_workers: int = 64) -> list:
     """Probe all upstreams in parallel (req. 7) and return the list of result
     dicts. Logging is done AFTER all checks complete as grouped summary
     lines so parallel output does not interleave."""
@@ -4309,9 +5594,12 @@ class BuiltinProxyEngine:
             self._threads.append(t)
             started.append(p)
         for p in started:
-            info(tr("proxy_line", port=p["port"], label=p["label"],
+            # v5.13: the electric-plug emoji is replaced with the NATIONAL
+            # FLAG of the proxy's country (REC/unknown keep the plug)
+            info(tr("proxy_line", port=p["port"], label=p["label"].ljust(_proxy_label_width(self.proxies)),
                     host=p["host"], uport=p["upstreamPort"], proto=p["protocol"],
-                    listen=self.listen_host))
+                    listen=self.listen_host,
+                    _e=country_flag(p.get("countryCode"))))
         if not started:
             raise MozVpnError(tr("no_free_ports"))
         # Same log shape as the sing-box engine (only the engine name differs)
@@ -4543,9 +5831,12 @@ class SingBoxEngine:
                                     stderr=subprocess.DEVNULL)
             self.procs[p["port"]] = (proc, p["path"], p["label"])
             started.append(p)
-            info(tr("proxy_line", port=p["port"], label=p["label"],
+            # v5.13: the electric-plug emoji is replaced with the NATIONAL
+            # FLAG of the proxy's country (REC/unknown keep the plug)
+            info(tr("proxy_line", port=p["port"], label=p["label"].ljust(_proxy_label_width(self.proxies)),
                     host=p["host"], uport=p["upstreamPort"], proto=p["protocol"],
-                    listen=self.listen_host))
+                    listen=self.listen_host,
+                    _e=country_flag(p.get("countryCode"))))
         if not started:
             raise MozVpnError(tr("no_free_ports"))
         ok(tr("engine_started", engine=tr("engine_singbox"), n=len(started),
@@ -4754,17 +6045,24 @@ def collect_verified_servers(args, locations, token: str) -> list:
     # data probe (a second thread pool) - the startup no longer waits for
     # the probe to finish before the geo requests even begin.
     probed_hp = {(s["protocolHost"], s["protocolPort"]) for s in probe_servers}
-    # v5.1 (req. 7): PRE-RESOLVE every unique egress hostname over DoH in
-    # parallel BEFORE the probe starts, so the probe threads do not repeat
-    # the same DoH round-trips. The answers are cached only when the DoH
-    # cache is enabled (it is OFF by default - req. 4), so the prefill
-    # runs only in that mode (without a cache the answers would be thrown
-    # away and the probes resolve in parallel anyway).
-    if doh_cache_enabled() and probe_servers:
+    # v5.1 (req. 7): PRE-RESOLVE every unique egress hostname over DoH
+    # BEFORE the probe starts, so the probe threads do not repeat the
+    # same DoH round-trips. v5.12: this runs ALWAYS (not only with the
+    # opt-in long cache) - the always-on 60 s memo (v5.6) keeps the
+    # answers, so the prefill pays off in every mode.
+    # v5.14: the prefill is no longer a SERIAL phase before the probes -
+    # it starts in daemon threads and the probe phase begins
+    # IMMEDIATELY; the v5.14 IN-FLIGHT dedup in resolve_host() makes
+    # every probe worker that hits the same host JOIN the already
+    # running prefill query instead of duplicating it (and vice versa:
+    # whichever thread touches the host first becomes the query owner).
+    # The DNS warming now OVERLAPS the probes instead of adding its
+    # whole duration to the startup wall time.
+    if probe_servers:
         pre_hosts = sorted({s["protocolHost"] for s in probe_servers})
-        if pre_hosts:
-            with ThreadPoolExecutor(max_workers=min(8, len(pre_hosts))) as ex:
-                list(ex.map(resolve_host, pre_hosts))
+        for h in pre_hosts:
+            threading.Thread(target=resolve_host, args=(h,), daemon=True,
+                             name="mozvpn-doh-prefill").start()
     geo_mode = getattr(args, "probe_geo", "warn")
     # v5.2 (req. 3): ONE request per probe. The default echo service
     # (ipinfo.io/json) answers with the external IP AND the exit geo
@@ -4856,6 +6154,7 @@ def run_manager(args, creds, totp_provider):
     copy_mode = None        # None | "local" | "remote" | "doh" | "files" (v5.1)
     select_buf = ""        # v5.1: the typed selection token (confirmed by Enter)
     select_items = []      # v5.1: [{"token": ..., ...}] of the active list
+    select_pad = 0         # v5.12.1: length of the in-place 'w' selection line
     totp_secret = (args.totp_secret or "").strip() or creds.get("totp_secret")
 
     signal.signal(signal.SIGINT, _on_sigint)
@@ -4933,7 +6232,11 @@ def run_manager(args, creds, totp_provider):
                     # The token must be in the holder BEFORE build_proxies():
                     # the sing-box engine bakes the Bearer into its configs.
                     engine.token_holder.set(token)
-                    engine.proxies = engine.build_proxies(locations, verified_servers)
+                    # v5.12: --countries / hotkey 'w' filter - only the
+                    # selected upstreams get local proxies (the filter is
+                    # cached in countries.json and survives restarts).
+                    serve_servers = apply_countries_filter(args, verified_servers)
+                    engine.proxies = engine.build_proxies(locations, serve_servers)
                     engine.start_all()
                     # v5.5 (req. 3 + 4): --foxyproxy-export /
                     # --foxyproxy-legacy-export (with the paired --*-out
@@ -5014,13 +6317,102 @@ def run_manager(args, creds, totp_provider):
                         _reset_confirm()
                 k = _key_pressed()
                 if copy_mode and k:
-                    # v5.1: generic SELECTION sub-mode (v/b proxy copy, 'h'
-                    # DoH menu, 1-9 config files when there are more than 9).
-                    # A token may be several characters long (1-9, a-z,
-                    # aa, ab, ...), so the choice is confirmed with ENTER;
-                    # Backspace deletes the last typed character, any other
-                    # key cancels the sub-mode.
-                    if k in ("\r", "\n"):
+                    if copy_mode == "multi":
+                        # v5.12: the MULTI selection of hotkey 'w': the
+                        # tokens of SEVERAL proxies are typed SEPARATED
+                        # BY SPACES. SPACE = the token separator, alnum
+                        # = append to the current token, Backspace
+                        # deletes, ENTER applies the selection (token
+                        # '0' = ALL local proxies), any other key
+                        # cancels the sub-mode.
+                        # v5.12.1: the typed tokens are echoed in ONE
+                        # in-place line that REWRITES itself (\r) - not
+                        # a new log line per keystroke.
+                        if k in ("\r", "\n"):
+                            # finish the in-place line first, so the
+                            # apply/cancel summary starts on a clean row
+                            _multi_line_clear(select_pad)
+                            select_pad = 0
+                            toks = [t for t in select_buf.split(" ") if t]
+                            if not toks:
+                                info(tr("hotkey_copy_cancel"))
+                            elif "0" in toks:
+                                # '0' = ALL proxies: clear the saved filter
+                                clear_countries_filter()
+                                ok(tr("filter_all_applied"))
+                            else:
+                                known = {it["token"] for it in select_items}
+                                good = []
+                                for t in toks:
+                                    if t in known:
+                                        good.append(t)
+                                    else:
+                                        warn(tr("multi_bad", tok=t))
+                                if good:
+                                    save_countries_filter(keys=good)
+                                    cc_list = ", ".join(sorted(
+                                        {(it["srv"].get("countryCode")
+                                          or "?").upper()
+                                         for it in select_items
+                                         if it["token"] in good})) or "-"
+                                    ok(tr("countries_filter_applied",
+                                          n=len(good),
+                                          m=len(verified_servers),
+                                          list=cc_list))
+                            if toks:
+                                # Restart the engine so the new selection
+                                # takes effect immediately (the next loop
+                                # iteration rebuilds the local proxies).
+                                info(tr("hotkey_countries"))
+                                if engine:
+                                    engine.stop_all()
+                                engine = None
+                                break
+                            select_buf = ""
+                            copy_mode = None
+                            select_items = []
+                            k = ""
+                        elif k == " ":
+                            select_buf += " "
+                            # v5.13: KEEP the trailing space visible - the
+                            # user is asked to separate tokens WITH spaces,
+                            # so the echo must show the separator (the old
+                            # .strip() hid it); only accidental DOUBLE
+                            # spaces are collapsed.
+                            select_pad = _multi_line_show(
+                                re.sub(r" {2,}", " ", select_buf),
+                                select_pad)
+                            k = ""
+                        elif k in ("\x7f", "\x08"):
+                            if select_buf:
+                                select_buf = select_buf[:-1]
+                                select_pad = _multi_line_show(
+                                    re.sub(r" {2,}", " ", select_buf),
+                                    select_pad)
+                            k = ""
+                        elif k.isalnum() and len(k) == 1:
+                            select_buf += k
+                            select_pad = _multi_line_show(
+                                re.sub(r" {2,}", " ", select_buf),
+                                select_pad)
+                            k = ""
+                        else:
+                            # Any other key cancels the selection sub-mode
+                            _multi_line_clear(select_pad)
+                            select_pad = 0
+                            info(tr("hotkey_copy_cancel"))
+                            select_buf = ""
+                            copy_mode = None
+                            select_items = []
+                            k = ""
+                    elif k in ("\r", "\n"):
+                        # v5.1: generic SELECTION sub-mode (v/b proxy
+                        # copy, 'h' DoH menu, 1-9 config files when there
+                        # are more than 9). A token may be several
+                        # characters long (1-9, a-z, aa, ab, ...), so the
+                        # choice is confirmed with ENTER; Backspace
+                        # deletes the last typed character, any other key
+                        # cancels the sub-mode.
                         # ENTER: confirm the buffered token
                         item = None
                         for it in select_items:
@@ -5091,7 +6483,27 @@ def run_manager(args, creds, totp_provider):
                     info(tr("hotkey_relogin"))
                     _hotkey_mode(False)
                     wipe_all_saved_data(creds)
+                    # v5.22: ALL credential information is a wipe target -
+                    # the disk caches went above; the IN-MEMORY leftovers go
+                    # here. ensure_session() reads args.email / args.password /
+                    # args.session_token FIRST (before creds), so a relogin
+                    # that does not clear them re-logs-in silently with the
+                    # old email/password - the leak seen live: after 'r' the
+                    # script asked only for TOTP and signed in without ever
+                    # asking for the login data. The live totp_provider
+                    # closure (built from --qr of this run) and the CLI/env
+                    # TOTP values are leftovers of exactly the same kind and
+                    # go too: a fresh sign-in asks for email, password and
+                    # the 2FA code (or gets them from a NEW --qr/--totp-secret
+                    # --qr sign-in), reusing nothing from before the wipe.
                     totp_secret = None
+                    totp_provider = None
+                    args.email = None
+                    args.password = None
+                    args.session_token = None
+                    args.qr = None
+                    args.totp_secret = None
+                    args.totp = None
                     session_token = None
                     force_relogin = True
                     # The wipe removed the sing-box config directory with all
@@ -5109,7 +6521,18 @@ def run_manager(args, creds, totp_provider):
                     _hotkey_mode(False)
                     info(tr("hotkey_clear"))
                     wipe_all_saved_data(creds)
+                    # v5.22: same full in-memory wipe as 'r' (see there):
+                    # args.email/password/session_token and the live
+                    # totp_provider are credential leftovers a fresh sign-in
+                    # must not be able to reuse.
                     totp_secret = None
+                    totp_provider = None
+                    args.email = None
+                    args.password = None
+                    args.session_token = None
+                    args.qr = None
+                    args.totp_secret = None
+                    args.totp = None
                     session_token = None
                     force_relogin = True
                     # Same as 'r': the engine's config files were just wiped -
@@ -5154,6 +6577,38 @@ def run_manager(args, creds, totp_provider):
                         engine.stop_all()
                     engine = None
                     break
+                elif k == "w" and verified_servers:
+                    # v5.12: choose WHICH local proxies to run. A MULTI
+                    # selection: the tokens of several proxies are typed
+                    # SEPARATED BY SPACES and confirmed with Enter; token
+                    # '0' = ALL local proxies (clears the filter). The
+                    # choice is cached in countries.json (the same file
+                    # --countries persists to) and survives restarts.
+                    copy_mode = "multi"
+                    select_buf = ""
+                    select_items = [{"token": "0", "all": True}]
+                    select_items += [{"token": selection_token(i), "srv": srv}
+                                     for i, srv in enumerate(verified_servers)]
+                    flt_now = load_countries_filter()
+                    active_keys = {str(x).strip().lower()
+                                   for x in (flt_now.get("keys") or [])}
+                    info(tr("countries_menu_hint"))
+                    hint(tr("select_hint_multi"))
+                    for it in select_items:
+                        if it.get("all"):
+                            hint(tr("countries_menu_entry", n=it["token"],
+                                    desc=tr("filter_all_desc")))
+                        else:
+                            s = it["srv"]
+                            mark = " [x]" if it["token"] in active_keys else ""
+                            hint(tr("countries_menu_entry", n=it["token"],
+                                    desc=(f"{s.get('countryName', '?')}/"
+                                          f"{s.get('cityName', '?')} "
+                                          f"{s.get('protocolHost', '')}"
+                                          f"{mark}")))
+                    # v5.12.1: ONE in-place line collects the typed tokens
+                    # (every keystroke REWRITES it, like the countdown)
+                    select_pad = _multi_line_show("", select_pad)
                 elif k == "o":
                     # Open the singbox config directory in the file manager.
                     # If it does not exist yet (only the singbox engine
@@ -5350,6 +6805,16 @@ def run_manager(args, creds, totp_provider):
                     # -> re-force the theme background (idempotent, so a
                     # no-op while it was never released); colors off ->
                     # release it back to the terminal default.
+                    # v5.17 FIX: 'global _BG_CURRENT' - without the
+                    # declaration the assignment below made the name a
+                    # LOCAL of the watch-loop function, so the
+                    # 'elif _BG_CURRENT is not None' read raised
+                    # UnboundLocalError("cannot access local variable
+                    # '_BG_CURRENT' where it is not associated with a
+                    # value") and killed the handler after set_color()
+                    # had already flipped the mode (the outer retry loop
+                    # reported it as 'Unexpected error').
+                    global _BG_CURRENT
                     set_color(not _USE_COLOR)
                     if _USE_COLOR:
                         _force_terminal_bg(_THEME)
@@ -5442,7 +6907,14 @@ def run_manager(args, creds, totp_provider):
         except KeyboardInterrupt:
             break
         except Exception as e:
-            warn(tr("unexpected_error", err=e))
+            # v5.12: a TRANSIENT network error (a DNS blip like
+            # gaierror(7), a momentary timeout) gets a FRIENDLY short
+            # localized reason instead of the raw exception repr; the
+            # retry wait stays the same 30 s.
+            if _is_transient_net_error(e):
+                warn(tr("net_error_retry", err=_net_err_public(e)))
+            else:
+                warn(tr("unexpected_error", err=e))
             _sleep_interruptible(30)
 
     cleanup()
@@ -5475,7 +6947,7 @@ def _hotkey_mode(on: bool):
 #
 # 1) WINDOWS - fully layout-independent via the PHYSICAL key position:
 #    msvcrt.getwch() returns the character produced by the CURRENT
-#    layout (e.g. 'Ð¹' when Russian ÐÐ¦Ð£ÐÐÐ is active), so the raw char
+#    layout (e.g. '\u0439' when Russian JCUKEN is active), so the raw char
 #    alone is not enough. The chain  char -> VkKeyScanW -> virtual key
 #    -> MapVirtualKeyW(MAPVK_VK_TO_VSC) -> scan code  recovers the
 #    PHYSICAL key: VkKeyScanW maps a character to the virtual key that
@@ -5487,7 +6959,7 @@ def _hotkey_mode(on: bool):
 #    VkKeyScanW and MapVirtualKeyW).
 # 2) POSIX - terminals report only the layout-translated character in
 #    the input stream (there is no scan-code channel), so a translation
-#    table for the standard Cyrillic ÐÐ¦Ð£ÐÐÐ family (Russian, and the
+#    table for the standard Cyrillic JCUKEN family (Russian, and the
 #    position-compatible Belarusian/Ukrainian letters) maps the typed
 #    letter to the English key in the SAME physical position.
 _SCAN_TO_KEY = {
@@ -5503,23 +6975,23 @@ _SCAN_TO_KEY = {
 }
 
 _CYR_TO_LATIN = {
-    # standard Russian ÐÐ¦Ð£ÐÐÐ: typed letter -> English key in the same
+    # standard Russian JCUKEN: typed letter -> English key in the same
     # physical position (Belarusian/Ukrainian layouts share the letter
     # row positions; their unique letters sit where [];' etc. are and
     # are not used by any hotkey)
-    "Ð¹": "q", "Ñ": "w", "Ñ": "e", "Ðº": "r", "Ðµ": "t",
-    "Ð½": "y", "Ð³": "u", "Ñ": "i", "Ñ": "o", "Ð·": "p",
-    "Ñ": "a", "Ñ": "s", "Ð²": "d", "Ð°": "f", "Ð¿": "g",
-    "Ñ": "h", "Ð¾": "j", "Ð»": "k", "Ð´": "l",
-    "Ñ": "z", "Ñ": "x", "Ñ": "c", "Ð¼": "v", "Ð¸": "b",
-    "Ñ": "n", "Ñ": "m", "Ñ": "s", "Ñ": "s", "Ñ": "f",
+    "\u0439": "q", "\u0446": "w", "\u0443": "e", "\u043a": "r", "\u0435": "t",
+    "\u043d": "y", "\u0433": "u", "\u0448": "i", "\u0449": "o", "\u0437": "p",
+    "\u0444": "a", "\u044b": "s", "\u0432": "d", "\u0430": "f", "\u043f": "g",
+    "\u0440": "h", "\u043e": "j", "\u043b": "k", "\u0434": "l",
+    "\u044f": "z", "\u0447": "x", "\u0441": "c", "\u043c": "v", "\u0438": "b",
+    "\u0442": "n", "\u044c": "m", "\u0457": "s", "\u0456": "s", "\u045e": "f",
     # uppercase too (Caps Lock)
-    "Ð": "q", "Ð¦": "w", "Ð£": "e", "Ð": "r", "Ð": "t",
-    "Ð": "y", "Ð": "u", "Ð¨": "i", "Ð©": "o", "Ð": "p",
-    "Ð¤": "a", "Ð«": "s", "Ð": "d", "Ð": "f", "Ð": "g",
-    "Ð ": "h", "Ð": "j", "Ð": "k", "Ð": "l",
-    "Ð¯": "z", "Ð§": "x", "Ð¡": "c", "Ð": "v", "Ð": "b",
-    "Ð¢": "n", "Ð¬": "m", "Ð": "s", "Ð": "s", "Ð": "f",
+    "\u0419": "q", "\u0426": "w", "\u0423": "e", "\u041a": "r", "\u0415": "t",
+    "\u041d": "y", "\u0413": "u", "\u0428": "i", "\u0429": "o", "\u0417": "p",
+    "\u0424": "a", "\u042b": "s", "\u0412": "d", "\u0410": "f", "\u041f": "g",
+    "\u0420": "h", "\u041e": "j", "\u041b": "k", "\u0414": "l",
+    "\u042f": "z", "\u0427": "x", "\u0421": "c", "\u041c": "v", "\u0418": "b",
+    "\u0422": "n", "\u042c": "m", "\u0407": "s", "\u0406": "s", "\u040e": "f",
 }
 
 def _normalize_key(k: str) -> str:
@@ -5545,9 +7017,24 @@ def _normalize_key(k: str) -> str:
             pass
     return _CYR_TO_LATIN.get(k, low)
 
+_KEY_BUF = b""
+
 def _key_pressed() -> str:
     """Non-blocking single-key read; returns the canonical hotkey letter
-    (independent of the active keyboard layout, see _normalize_key) or ''."""
+    (independent of the active keyboard layout, see _normalize_key) or ''.
+    v5.15: the POSIX read is now BUFFERED. One keypress can be a
+    MULTI-BYTE UTF-8 character (a non-English layout) or an ESCAPE
+    sequence (arrows etc.), and the kernel may deliver those bytes
+    across SEVERAL read() calls - the v5.13 code re-read the UTF-8
+    continuation bytes with a BLOCKING os.read(), which could FREEZE
+    the whole hotkey loop forever when a lead byte arrived alone (a
+    split write is exactly what happens on some PTYs). Now every poll
+    reads ALL currently available bytes at once, keeps the leftover in
+    _KEY_BUF and returns ONE complete character per call; escape
+    sequences are consumed whole (an arrow key must not leak its tail
+    as a hotkey letter); a partial UTF-8 sequence is completed with a
+    few BOUNDED 20 ms waits - never a blocking read."""
+    global _KEY_BUF
     try:
         if os.name == "nt":
             import msvcrt
@@ -5557,12 +7044,51 @@ def _key_pressed() -> str:
                 return _normalize_key(k) if len(k) == 1 else ""
             return ""
         import select
-        r, _, _ = select.select([sys.stdin], [], [], 0)
-        if r:
-            k = sys.stdin.read(1)
-            return _normalize_key(k)
+        fd = sys.stdin.fileno()
+        if not _KEY_BUF:
+            r, _, _ = select.select([sys.stdin], [], [], 0)
+            if not r:
+                return ""
+            # everything that is available RIGHT NOW (the whole UTF-8
+            # sequence of the pressed key arrives in one terminal write)
+            _KEY_BUF = os.read(fd, 32)
+            if not _KEY_BUF:
+                return ""
+        c = _KEY_BUF[0]
+        if c == 0x1B:                       # ESC - or the start of ESC [ ...
+            r, _, _ = select.select([sys.stdin], [], [], 0.02)
+            if r:
+                _KEY_BUF += os.read(fd, 32)
+            if len(_KEY_BUF) > 1:
+                # an escape sequence (arrows, Home etc.): consume it
+                # whole and produce NO hotkey letter
+                _KEY_BUF = b""
+                return ""
+            _KEY_BUF = b""
+            return "\x1b"                   # a BARE Esc keeps its old role
+        if c >= 0xC0:                       # UTF-8 lead byte
+            need = 1 if c < 0xE0 else (2 if c < 0xF0 else 3)
+            while len(_KEY_BUF) < 1 + need:
+                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if not r:
+                    break                   # bounded wait - never blocks
+                _KEY_BUF += os.read(fd, 32)
+            take, _KEY_BUF = _KEY_BUF[:1 + need], _KEY_BUF[1 + need:]
+            k = take.decode("utf-8", "replace")
+            # an INCOMPLETE sequence (the continuation bytes never came
+            # within the bounded waits) decodes to U+FFFD - return NO key
+            # instead of leaking a truthy garbage char into the hotkey
+            # loop (it would cancel the selection sub-modes)
+            return _normalize_key(k) if "\ufffd" not in k else ""
+        if 0x80 <= c < 0xC0:
+            # a stray continuation byte (leftover garbage): skip it
+            _KEY_BUF = _KEY_BUF[1:]
+            return ""
+        take, _KEY_BUF = _KEY_BUF[0:1], _KEY_BUF[1:]
+        return _normalize_key(take.decode("utf-8", "replace"))
     except Exception:
         pass
+    _KEY_BUF = b""
     return ""
 
 def _sleep_interruptible(seconds: float):
@@ -5633,6 +7159,22 @@ def selection_token(index: int) -> str:
 def selection_tokens(count: int) -> "list[str]":
     """The token list for a list of `count` items."""
     return [selection_token(i) for i in range(count)]
+
+def _multi_line_show(buf: str, prev_len: int) -> int:
+    """v5.12.1: ONE in-place echo line for the hotkey 'w' multi-selection.
+    The typed tokens are shown by REWRITING this very line (\r, the same
+    technique as the retry countdown) - NOT by adding a new log line per
+    keystroke (v5.12 did that and the log filled with 'Selected: ...'
+    duplicates). Returns the printed length for the next rewrite."""
+    line = "  " + tr("multi_buffer", buf=buf)
+    # erase the previous content first (+4 slack for the emoji columns)
+    print("\r" + " " * (prev_len + 4) + "\r" + line, end="", flush=True)
+    return len(line)
+
+def _multi_line_clear(prev_len: int):
+    """v5.12.1: erase the in-place multi-selection line (on apply/cancel),
+    so the summary lines that follow start on a clean row."""
+    print("\r" + " " * (prev_len + 4) + "\r", end="", flush=True)
 
 def is_frozen() -> bool:
     """True when running as a compiled binary: PyInstaller sets sys.frozen,
@@ -6186,6 +7728,16 @@ def main():
                     help="Refresh the proxyPass this many seconds before exp (default 45)")
     ap.add_argument("--country")
     ap.add_argument("--city")
+    ap.add_argument("--countries", metavar="LIST", default=None,
+                    help="Run local proxies ONLY for these countries: a "
+                         "comma/space-separated list of ISO country codes "
+                         "(lower or upper case), full country names, or "
+                         "'rec' for the recommended anycast egress. "
+                         "Example: --countries \"us,de,jp\" (or "
+                         "--countries \"us rec France\"). Default: not "
+                         "used - all countries are served. The choice is "
+                         "saved to the config and survives restarts; "
+                         "hotkey 'w' changes it interactively.")
     ap.add_argument("--test", action="store_true",
                     help="Test a proxy (external IP) after fetching the credentials")
     ap.add_argument("--show-test-commands", dest="show_test_commands",
@@ -6248,6 +7800,18 @@ def main():
                     help="Color theme for the colored log: dark (default, "
                          "near-black background) or light (white background). "
                          "Env: MOZVPN_THEME")
+    ap.add_argument("--flag-style", dest="flag_style",
+                    choices=["auto", "emoji", "art"], default="auto",
+                    help="Country-flag style of the proxy lines (v5.19): "
+                         "'auto' (default) - the truecolor 6x2 half-block "
+                         "pixel-art mini-flag on Windows (the ONLY way to "
+                         "get flag pictures there: Windows ships no "
+                         "flag-glyph font, the emoji pairs print as "
+                         "two-letter codes) and the ready-made Unicode "
+                         "flag pair everywhere else (the real colored "
+                         "flag); 'emoji' - force the pair (letters on "
+                         "Windows / stock Termux fonts); 'art' - force "
+                         "the pixel art (needs colors on)")
     ap.add_argument("--confirm-exit", action="store_true",
                     help="Require a second Ctrl+C within 5s to stop (by default the "
                          "first Ctrl+C stops immediately)")
@@ -6294,6 +7858,11 @@ def main():
     set_language(a.lang)
     set_color(not a.no_color)
     set_theme(a.theme)
+    # v5.18: the flag representation of the proxy lines (see
+    # country_flag); "auto" (the default) resolves per platform inside
+    # country_flag: the pixel art on Windows, the emoji pair elsewhere.
+    global _FLAG_STYLE
+    _FLAG_STYLE = a.flag_style
     if a.no_color:
         info(tr("color_disabled"))
 
@@ -6432,6 +8001,18 @@ def main():
     # leftover in-memory credentials, which is exactly what it must not do)
     if a.relogin:
         wipe_all_saved_data(creds)
+        # v5.22: --relogin is the same FULL wipe as the 'r' hotkey - the
+        # in-memory CLI/env credential copies go too, otherwise
+        # ensure_session() below would re-login with the old
+        # email/password and make_totp_provider() would rebuild a TOTP
+        # generator from the old --qr/--totp-secret values, so the fresh
+        # sign-in would never actually ask for anything.
+        a.email = None
+        a.password = None
+        a.session_token = None
+        a.qr = None
+        a.totp_secret = None
+        a.totp = None
 
     totp_provider = make_totp_provider(a, creds)
 
