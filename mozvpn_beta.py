@@ -4,6 +4,180 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-09-29 (v5.26) - REFERENCE PARITY of the whole sign-in path +
+  an honest RETRACTION of the v5.25 theory:
+
+  RETRACT 0) The v5.25 claim 'a restart always fixed it' was WRONG - the
+     user's live report: mozvpn_beta NEVER worked under Termux, restart
+     included, while the reference mozvpn.py works EVERY time on the
+     same phone. v5.25 therefore could not have found the real root
+     cause: a per-call retry-flag reorder (the v5.25 theory) would
+     have failed only SOMETIMES (when a transient error preceded the
+     406), not on every single run. The v5.25 changelog entry is kept
+     above for the history only - do not rely on its analysis.
+  PARITY 1) req() is the reference mozvpn.py EXACTLY again: one retry
+     flag (_fastly_retry) for the Fastly 406 challenge and NOTHING
+     else. The v5.12-v5.25 transient-network retry (_net_retry) and
+     the _req_ip_fallback() emergency raw-HTTPS call are REMOVED from
+     req(). Rationale: the user's reference script - the ground truth
+     that always works - has no such path; every extra retry layer is
+     an extra way to reorder the challenge sequence on a mobile
+     network. The helpers (_raw_https, _emergency_doh_resolve,
+     _req_ip_fallback) stay DEFINED but are no longer wired into
+     req(). The only kept passive addition is _note_server_date() (a
+     Date-header read for the TOTP clock sync; it never alters a
+     request). Transient errors now bubble up like in the reference
+     and the watch loop retries the whole cycle (with a friendly
+     localized reason via _is_transient_net_error).
+  PARITY 2) fxa_login(): the unverified-session branch follows the
+     reference CONTROL FLOW exactly - the TOTP route is entered ONLY
+     when the server announces verificationMethod 'totp-2fa'/'totp';
+     the v5.24 speculative try_totp attempt (a TOTP request even when
+     the server announced 'email') is REMOVED. The reference script
+     never makes that extra request, so neither does the beta. Kept
+     from v5.24 (prompt robustness only, no server-flow change): the
+     code prompt goes through prompt_line() and is allowed when the
+     caller's flag is set OR stdin is a real tty (_can_prompt()) -
+     a redirected stdin produces a clear localized error, not an
+     EOFError crash.
+  TERM 3) A REAL POSIX-ONLY bug is fixed that v5.24-v5.25 only
+     half-addressed: when an exception fired during the hotkey/cbreak
+     phase (e.g. a failed proxyPass refresh inside the sleep window),
+     the run_manager except handlers ran the retry countdown and
+     looped back to ensure_session() WITHOUT restoring the cooked
+     terminal - the next email/password/TOTP prompt then read a
+     raw-cbreak tty (broken line editing, Enter not submitting,
+     stray hotkey-phase keystrokes leaking into the answers), so the
+     retry attempt failed again and again. Fixed on three levels:
+       a) every run_manager except handler calls _hotkey_mode(False)
+          FIRST (it is idempotent and a no-op on Windows);
+       b) the top of every watch-loop iteration calls _hotkey_mode(False)
+          as a belt-and-suspenders guard before any prompt can run;
+       c) _sleep_with_countdown()/_sleep_interruptible() never poll
+          keys themselves (verified) - the countdown can no longer
+          depend on the cbreak state.
+     This cannot explain a FIRST-never-worked fresh run by itself (the
+     first sign-in happens before any hotkey phase), but it fully
+     explains the endless failing RETRY loop after the first error on
+     POSIX, and it is a genuine difference from Windows 11 (where
+     _hotkey_mode is a no-op).
+  NOTE 4) The Fastly WAF solver (FASTLY_UA .. ensure_fastly_cookie)
+     was re-diffed line by line against the reference mozvpn.py: the
+     algorithm is IDENTICAL (only the log strings are localized). The
+     solver is NOT the difference between the scripts.
+
+VERSION 2026-09-29 (v5.25) - THE REAL TERMUX ROOT CAUSE FOUND AND FIXED (the
+  live symptom: email+password entered -> one failed attempt -> the
+  waf_406 'retry form' with the manual-sessionToken instructions, over
+  and over; a RESTART always fixed it; the reference mozvpn.py NEVER
+  failed on the same phone; Windows 11 never failed):
+
+  ROOT CAUSE - ONE SHARED RETRY FLAG FOR TWO DIFFERENT RETRIES IN req().
+  Since v5.12 req() had TWO retry paths guarded by the SAME parameter
+  _fastly_retry: (a) the Fastly 406 challenge retry and (b) the
+  TRANSIENT-network retry (a gaierror blip / a momentary timeout - the
+  v5.12 addition for the Termux/arm live runs). Sequence that broke
+  the sign-in on Termux, step by step:
+    1) POST /account/login, attempt 1 -> a transient network error
+       (routine on a mobile network after a wipe: cold DNS, a flaky
+       first TLS) -> req() sleeps 1.5 s and RETRIES WITH
+       _fastly_retry=True;
+    2) attempt 2 -> the Fastly NGWAF answers its normal 406 with an
+       empty body (a fresh run has no _fs_ch_cp_* cookie - this is the
+       EXPECTED first answer, the whole reason the challenge solver
+       exists);
+    3) the 406 handler checked `not _fastly_retry` - already True from
+       step 1 - so the CHALLENGE SOLUTION WAS SKIPPED, the raw 406 was
+       returned to fxa_login and it raised waf_406: exactly the
+       observed 'one failed attempt + the retry form with the manual
+       sessionToken instructions'. Every in-process retry repeated the
+       same dance (the flag is per-call, but so is the flaky first
+       connection on a mobile network), and only a RESTART helped.
+  WHY mozvpn.py ALWAYS WORKS: it has NO transient-retry path at all -
+  its 406 handler ALWAYS runs ensure_fastly_cookie() and retries. The
+  beta's extra robustness (the transient retry) is exactly what
+  disabled the challenge on the network where transient errors are
+  common. Windows 11 never failed because its stable network rarely
+  produces a transient error before the 406.
+  FIX 1) req() now uses TWO independent flags: _fastly_retry (the 406
+     challenge retry) and _net_retry (the transient retry). A
+     transient first attempt no longer suppresses the challenge; both
+     retries still happen at most once each.
+  FIX 2) _req_ip_fallback() (the emergency raw-HTTPS path after a
+     double transient failure) had NO 406 handling either - a raw 406
+     bubbled up as the same waf_406 form. Now the raw path solves the
+     challenge (ensure_fastly_cookie) and redoes the SAME hop once
+     with the fresh cookie attached.
+  REVERT 3) get_credentials_status() is back to the EXACT reference
+     mozvpn.py behavior (silent v1 fallback on any error). The v5.24
+     hard-error experiment is withdrawn: the reference script with the
+     same silent fallback ALWAYS works on Termux, so the v2-poisoning
+     theory was wrong for this symptom (and req() itself now solves
+     the 406 challenge reliably). The unused stretch_status_failed
+     strings are removed.
+  REVERT 4) the v5.24 'same TOTP code sent twice -> fail fast' check
+     is REMOVED: the reference mozvpn.py retries the same fixed --totp
+     code up to 3 times without any such check and always logs in, so
+     the retry semantics are back to the reference exactly.
+  KEPT 5) the v5.24 fixes that do NOT change the reference server
+     flow remain: the TOTP gate never silently skips the 2FA step
+     (auto-provider first, then a prompt whenever stdin is a real
+     tty), prompt_line/prompt_secret give a clear localized error
+     instead of an EOFError crash on broken stdin, and the POSIX
+     cbreak hardening of _hotkey_mode (double-True no longer
+     overwrites the saved terminal state; leaving hotkey mode
+     flushes the pending input queue so stray keystrokes cannot
+     corrupt the email/password/TOTP answers).
+
+VERSION 2026-09-29 (v5.24) - THE TERMUX/ANDROID SIGN-IN BUG FIXED (3 variants:
+  after a wipe/relogin the sign-in under Termux failed forever while the
+  same script worked on Windows 11; the reference mozvpn.py worked on the
+  same phone because its simpler TOTP path had none of these pitfalls):
+  1) NO TOTP PROMPT AFTER EMAIL/PASSWORD (variant 1). The v5.23 TOTP gate
+     required the caller's interactive FLAG; whenever that flag was not
+     True the script silently skipped the whole 2FA step and went to the
+     email-confirmation dead end - the sign-in was re-attempted WITHOUT
+     a 2FA code and failed forever. The gate now tries the TOTP route
+     for EVERY unverified session (except an unverified signup): the
+     auto-provider first, then a prompt whenever the flag says
+     interactive OR stdin is a real tty (_can_prompt() - the physical
+     ability to read a line, not the flag).
+  2) BROKEN PROMPTS CRASHED THE LOOP (variant 1's hidden form). input()
+     and getpass.getpass() can raise EOFError/OSError on Android
+     (wrappers/launchers with a redirected stdin, /dev/tty problems in
+     Termux) - the generic 'Unexpected error' retry loop hid the cause.
+     All interactive reads now go through prompt_line()/prompt_secret()
+     with a CLEAR localized error (prompt_read_error) that says exactly
+     what to do on Termux: run directly in the Termux terminal.
+  3) THE TERMINAL COULD STAY IN CBREAK AFTER HOTKEYS (Termux/POSIX
+     only - _hotkey_mode is a no-op on Windows, which is why Windows
+     was unaffected). A double _hotkey_mode(True) (nested handler
+     pairs) overwrote the saved 'old' attributes with the ALREADY
+     CBREAK state, so a later _hotkey_mode(False) restored CBREAK
+     instead of cooked mode - the following email/password/TOTP
+     prompts misbehaved (line editing broken, the prompt looked
+     'skipped'). Now a second True never overwrites the saved state,
+     and leaving hotkey mode FLUSHES the pending input queue
+     (termios.tcflush TCIFLUSH) and clears the _KEY_BUF leftover, so
+     stray cbreak-mode keystrokes can no longer corrupt the answers.
+  4) FIXED --totp CODE WAS RESENT 3 TIMES (variant 3: --email
+     --password --totp still failed). A rejected code can NEVER be
+     accepted again (server-side replay protection), but the retry
+     loop re-sent the IDENTICAL fixed --totp value after a 30 s
+     window wait - a guaranteed 100% failure. A repeated identical
+     code now fails fast with the clear 'code rejected' message;
+     only GENERATED codes (auto-TOTP from --qr/--totp-secret) are
+     regenerated fresh for the next window.
+  5) get_credentials_status NO LONGER SILENTLY DOWNGRADES TO v1
+     (variant 1/2 root-cause candidate on mobile IPs): when the
+     Fastly NGWAF / a flaky mobile network blocks
+     /account/credentials/status, the old v1 fallback computed the
+     WRONG authPW for a v2 account -> an endless errno 103
+     'Incorrect password' loop (while Windows, unblocked, worked).
+     Now: one retry with the Fastly cookie ensured, then a clear
+     localized error (stretch_status_failed) instead of a poisoned
+     login. Both en and ru strings + icons added.
+
 VERSION 2026-09-28 (v5.23) - the endless failing relogin loop FIXED (the
   "restart always works, retry never does" live-run signature):
 
@@ -1756,6 +1930,7 @@ STR = {
   "email_confirm_required": "Sign-in email confirmation is required and the account has no TOTP (otherwise the script would have verified the session itself). What to do:\n  1) Open the mailbox, find the Mozilla letter 'New sign-in to Firefox' and confirm\n     (or enter the code from the letter on accounts.firefox.com);\n  2) re-run the script afterwards - the session becomes trusted;\n  3) or enable TOTP in account settings (Two-step authentication);\n  4) or sign in inside Firefox and run with --session-token <hex>.",
   "session_unverified": "Session not verified (method: {method}, reason: {reason}).",
   "totp_missing": "The account requires 2FA but the TOTP secret is unknown. Run with --qr <image> or --totp-secret.",
+  "prompt_read_error": "Could not read the input ({err}) - stdin/terminal is not usable for interactive prompts. On Android/Termux run the script DIRECTLY in the Termux terminal (a real tty), not through a wrapper/launcher with a redirected stdin.",
   "oauth_fetching": "Obtaining OAuth token (grant fxa-credentials, scope 'profile https://identity.mozilla.com/apps/vpn')...",
   "oauth_scope_fallback": "Primary scope rejected by the server, used '{scope}'.",
   "oauth_scope_denied": "Scope '{scope}' not allowed (errno 114), trying the next one ...",
@@ -2032,6 +2207,7 @@ STR = {
   "email_confirm_required": "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u0435 \u0432\u0445\u043e\u0434\u0430 \u043f\u043e email, \u0430 \u0443 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435 \u0432\u043a\u043b\u044e\u0447\u0451\u043d TOTP (\u0438\u043d\u0430\u0447\u0435 \u0441\u043a\u0440\u0438\u043f\u0442 \u0432\u0435\u0440\u0438\u0444\u0438\u0446\u0438\u0440\u043e\u0432\u0430\u043b \u0431\u044b \u0441\u0435\u0441\u0441\u0438\u044e \u0441\u0430\u043c). \u0427\u0442\u043e \u0434\u0435\u043b\u0430\u0442\u044c:\n  1) \u041e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u043f\u043e\u0447\u0442\u0443, \u043d\u0430\u0439\u0434\u0438\u0442\u0435 \u043f\u0438\u0441\u044c\u043c\u043e Mozilla \u00abNew sign-in to Firefox\u00bb \u0438 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 \u0432\u0445\u043e\u0434\n     (\u043b\u0438\u0431\u043e \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u043a\u043e\u0434 \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 \u043d\u0430 accounts.firefox.com);\n  2) \u043f\u043e\u0441\u043b\u0435 \u044d\u0442\u043e\u0433\u043e \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0437\u0430\u043f\u0443\u0441\u043a \u2014 \u0441\u0435\u0441\u0441\u0438\u044f \u0441\u0442\u0430\u043d\u0435\u0442 \u0434\u043e\u0432\u0435\u0440\u0435\u043d\u043d\u043e\u0439;\n  3) \u043b\u0438\u0431\u043e \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u0435 TOTP \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430\u0445 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 (Two-step authentication);\n  4) \u043b\u0438\u0431\u043e \u0432\u043e\u0439\u0434\u0438\u0442\u0435 \u0432 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0435 Firefox \u0438 \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441 --session-token <hex>.",
   "session_unverified": "\u0421\u0435\u0441\u0441\u0438\u044f \u043d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0430 (\u043c\u0435\u0442\u043e\u0434: {method}, \u043f\u0440\u0438\u0447\u0438\u043d\u0430: {reason}).",
   "totp_missing": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u0442\u0440\u0435\u0431\u0443\u0435\u0442 2FA, \u0430 TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u0435\u043d. \u0417\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441 --qr <\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0430> \u0438\u043b\u0438 --totp-secret.",
+  "prompt_read_error": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0447\u0438\u0442\u0430\u0442\u044c \u0432\u0432\u043e\u0434 ({err}) \u2014 stdin/\u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b \u043d\u0435 \u043f\u0440\u0438\u0433\u043e\u0434\u0435\u043d \u0434\u043b\u044f \u0438\u043d\u0442\u0435\u0440\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u0432. \u041d\u0430 Android/Termux \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0439\u0442\u0435 \u0441\u043a\u0440\u0438\u043f\u0442 \u041f\u0420\u042f\u041c\u041e \u0432 \u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b\u0435 Termux (\u043d\u0430\u0441\u0442\u043e\u044f\u0449\u0438\u0439 tty), \u0430 \u043d\u0435 \u0447\u0435\u0440\u0435\u0437 \u043e\u0431\u0435\u0440\u0442\u043a\u0443 \u0441 \u043f\u0435\u0440\u0435\u043d\u0430\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u043c stdin.",
   "oauth_fetching": "\u041f\u043e\u043b\u0443\u0447\u0435\u043d\u0438\u0435 OAuth-\u0442\u043e\u043a\u0435\u043d\u0430 (grant fxa-credentials, scope 'profile https://identity.mozilla.com/apps/vpn')...",
   "oauth_scope_fallback": "\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 scope \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u043c, \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d '{scope}'.",
   "oauth_scope_denied": "Scope '{scope}' \u043d\u0435 \u0440\u0430\u0437\u0440\u0435\u0448\u0451\u043d (errno 114), \u043f\u0440\u043e\u0431\u0443\u044e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 ...",
@@ -2491,6 +2667,7 @@ _EMOJI = {
     "totp_missing": "\u274C ",
     "totp_rejected_final": "\u274C ",
     "totp_unknown_error": "\u274C ",
+    "prompt_read_error": "\u274C ",
     "oauth_session_invalid": "\u274C ",
     "oauth_error": "\u274C ",
     "oauth_all_scopes_denied": "\u274C ",
@@ -3520,6 +3697,7 @@ def _req_ip_fallback(method: str, url: str, data, headers,
     base_headers.update(headers or {})
     cur_url, cur_method, cur_body = url, (method or "GET").upper(), \
         (json.dumps(data).encode() if data is not None else None)
+    waf_retried = False            # v5.25: one challenge retry per raw call
     for _hop in range(5):                   # follow up to 5 redirects
         u2 = urlparse(cur_url)
         if u2.hostname != u.hostname:       # cross-host redirect
@@ -3539,6 +3717,16 @@ def _req_ip_fallback(method: str, url: str, data, headers,
         code, hdict, resp_body = _raw_https(
             ips[0], u2.hostname, u2.port or 443, cur_method, path,
             send, cur_body, timeout)
+        # v5.25 (Termux fix): the RAW path could answer 406 with an empty
+        # body exactly like the normal req() path (the Fastly NGWAF
+        # blocks this raw request too until a _fs_ch_cp_* cookie
+        # exists) - but the raw path had NO challenge handling at all,
+        # so the 406 bubbled up as the waf_406 'retry form'. Solve the
+        # challenge, re-attach the fresh cookie and redo the hop ONCE.
+        if (code == 406 and not resp_body and not waf_retried
+                and _is_firefox_host(cur_url) and ensure_fastly_cookie()):
+            waf_retried = True
+            continue                # same hop again, now with the cookie
         _note_server_date(hdict)            # time sync for TOTP, as in req()
         try:
             COOKIE_JAR.extract_cookies(_RawRespInfo(hdict), creq)
@@ -3556,7 +3744,22 @@ def _req_ip_fallback(method: str, url: str, data, headers,
         except Exception:
             return code, {}
 
-def req(method: str, url: str, data=None, headers=None, timeout=30, _fastly_retry=False):
+def req(method: str, url: str, data=None, headers=None, timeout=30,
+        _fastly_retry=False):
+    # v5.26 (REFERENCE PARITY): the request algorithm is EXACTLY the
+    # reference mozvpn.py req() again - ONE retry flag (_fastly_retry)
+    # for the Fastly 406 challenge and NOTHING else. The v5.12-v5.25
+    # transient-network retry (_net_retry + the _req_ip_fallback()
+    # emergency raw-HTTPS call) is REMOVED from req(): the reference
+    # script, which the user confirms ALWAYS signs in on the same
+    # Termux phone, has no such path, and every extra retry layer is
+    # one more way for a mobile network blip to reorder/duplicate the
+    # challenge retry sequence. The helper functions (_raw_https,
+    # _emergency_doh_resolve, _req_ip_fallback) stay DEFINED (they are
+    # the no-system-DNS bootstrap for possible future use), they are
+    # simply no longer wired into req(). The only kept addition over
+    # the reference is _note_server_date() - a PASSIVE read of the
+    # Date header for the TOTP clock sync; it never alters requests.
     h = dict(BROWSER_HEADERS); h.update(headers or {})
     body = json.dumps(data).encode() if data is not None else None
     r = urllib.request.Request(url, data=body, method=method, headers=h)
@@ -3569,35 +3772,19 @@ def req(method: str, url: str, data=None, headers=None, timeout=30, _fastly_retr
         _note_server_date(e.headers)            # also from error responses
         raw = e.read()
         # Fastly NGWAF blocks non-browser clients with 406 and an empty body
-        # until a valid _fs_ch_cp_* cookie exists. Solve the challenge, retry once.
+        # until a valid _fs_ch_cp_* cookie exists. Solve the challenge,
+        # retry ONCE - the exact reference behavior.
         if (e.code == 406 and not raw and not _fastly_retry
                 and _is_firefox_host(url) and ensure_fastly_cookie()):
-            return req(method, url, data, headers, timeout, _fastly_retry=True)
+            return req(method, url, data, headers, timeout,
+                       _fastly_retry=True)
         try:    return e.code, (json.loads(raw) if raw else {})
         except Exception: return e.code, {}
-    except urllib.error.URLError as e:
-        # v5.12: a TRANSIENT network error (a gaierror blip, a momentary
-        # timeout - seen in the Termux/arm live runs) is retried ONCE
-        # after a short pause instead of bubbling up as a scary
-        # 'Unexpected error'. _fastly_retry doubles as the single-retry
-        # flag here (it only guards against a retry loop).
-        if _is_transient_net_error(e):
-            if not _fastly_retry:
-                time.sleep(1.5)
-                return req(method, url, data, headers, timeout, _fastly_retry=True)
-            # v5.13: the retry failed too -> the SYSTEM resolver is most
-            # likely broken (the PACKAGED-binary-on-Android case: gaierror
-            # (7) 'No address associated with hostname' in the binary while
-            # the plain script works - see the comment block above the
-            # _DOH_IP_BOOTSTRAP table). Bypass the system resolver
-            # entirely: emergency DoH straight to the resolver IPs + ONE
-            # raw HTTPS request to the resolved IP (Host + SNI kept).
-            try:
-                out = _req_ip_fallback(method, url, data, headers, timeout)
-                if out is not None:
-                    return out
-            except Exception:
-                pass
+    except urllib.error.URLError:
+        # v5.26 (REFERENCE PARITY): no silent retry - a URLError
+        # (timeout, gaierror, refused) bubbles up exactly like in the
+        # reference script; the watch loop classifies it for the log
+        # (_is_transient_net_error) and retries the whole cycle.
         raise
 
 # ---------------- session / credential caches ----------------
@@ -3990,12 +4177,57 @@ def print_jwt_decoded(token: str):
 
 def get_credentials_status(email: str):
     """Account stretching version: ("v1"|"v2", clientSalt|None).
-    Mirrors PyFxA Client.get_key_stretch_version(). On error - v1 fallback."""
+    Mirrors PyFxA Client.get_key_stretch_version().
+
+    v5.25: EXACTLY the reference mozvpn.py behavior again - on any error
+    the v1 fallback is used silently. The v5.24 experiment raised a hard
+    error instead, but the reference script (which ALWAYS works on
+    Termux) has the silent v1 fallback, and req() already solves the
+    Fastly 406 challenge + retries inside, so a failing status request
+    is a transient network outcome, not a reason to abort the sign-in.
+    (For a genuine v2 account a v1 fallback would compute a wrong
+    authPW and fail with errno 103 - but that was NEVER the observed
+    Termux symptom: the observed failure was the waf_406 retry form,
+    whose real root cause is fixed in req() this version.)"""
     status, d = req("POST", FXA_AUTH + "/account/credentials/status",
                     {"email": email})
     if status == 200 and d.get("currentVersion") in ("v1", "v2"):
         return d["currentVersion"], d.get("clientSalt")
     return "v1", None
+
+def _can_prompt() -> bool:
+    """v5.24 (Termux fix): whether an interactive input() prompt can
+    physically deliver a line. A real tty always can. A non-tty stdin
+    (a wrapper/launcher with redirected input on Android) raises EOFError
+    on every input() - the TOTP gate used to rely on the caller's
+    `interactive` FLAG alone and skipped the prompt whenever the flag was
+    False, sending the sign-in into the email-confirmation dead end
+    without ever asking for the 2FA code (variant 1 of the Termux bug)."""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+def prompt_line(prompt: str) -> str:
+    """v5.24 (Termux fix): an input() that fails with a CLEAR localized
+    error instead of the generic 'Unexpected error' retry loop when
+    stdin cannot deliver a line (EOFError/OSError - Termux wrappers,
+    packaged-binary runs with a redirected stdin)."""
+    try:
+        return input(prompt)
+    except (EOFError, OSError) as e:
+        raise MozVpnError(tr("prompt_read_error",
+                             err=str(e) or repr(e)))
+
+def prompt_secret(prompt: str) -> str:
+    """v5.24 (Termux fix): getpass with the same clear-error wrapper.
+    getpass reads /dev/tty FIRST and stdin second; on Android/Termux
+    wrappers both may fail -> a localized error, not a raw crash."""
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, OSError) as e:
+        raise MozVpnError(tr("prompt_read_error",
+                             err=str(e) or repr(e)))
 
 def fxa_login(email: str, password: str, totp_provider=None,
               interactive: bool = True, tp=None) -> str:
@@ -4051,7 +4283,6 @@ def fxa_login(email: str, password: str, totp_provider=None,
     if not verified:
         vm = d.get("verificationMethod") or ""
         vr = d.get("verificationReason") or ""
-        session_ok = False
 
         # VERIFIED against mozilla/fxa sources (main, 2026-09-18):
         #  1) POST /v1/session/verify/totp (lib/routes/totp.js) authenticates the
@@ -4066,25 +4297,36 @@ def fxa_login(email: str, password: str, totp_provider=None,
         #     blocked for TOTP accounts: the server throws insufficientAal() so a
         #     TOTP account cannot verify a session on AAL1 via an email code.
         #     Email confirmation is a dead end for 2FA accounts by design.
-        #  Conclusion: with a TOTP secret (or interactive code input) ALWAYS try
-        #     /session/verify/totp regardless of the server-announced method.
-        #     Exception: an unverified signup account (reason 'signup').
-        try_totp = (vr != "signup" and email_verified is not False
-                    and (totp_provider is not None or interactive))
-        if try_totp or vm in ("totp-2fa", "totp"):
-            if vm and vm not in ("totp-2fa", "totp"):
-                info(tr("server_wants_method", method=vm, reason=vr or "login"))
+        # v5.26 (REFERENCE PARITY): the CONTROL FLOW of the unverified
+        # branch is the reference mozvpn.py again - the TOTP route is
+        # entered ONLY when the SERVER announces verificationMethod
+        # 'totp-2fa'/'totp'. The v5.24 speculative try_totp attempt
+        # (a TOTP request even when the server announced 'email') is
+        # REMOVED: the reference script, which ALWAYS signs in on the
+        # same phone, never makes that extra request, so neither do
+        # we. What stays from v5.24 is only the PROMPT robustness:
+        # the code is read via prompt_line() and the prompt is allowed
+        # whenever the caller's flag is set OR stdin can physically
+        # deliver a line (_can_prompt()) - so a redirected stdin
+        # produces a CLEAR localized error instead of a raw EOFError.
+        if vm in ("totp-2fa", "totp"):
+            session_ok = False
             for attempt in range(3):
                 if totp_provider is not None:
                     raw = totp_provider()
-                elif interactive:
-                    raw = input(tr("totp_prompt")).strip()
+                elif interactive or _can_prompt():
+                    raw = prompt_line(tr("totp_prompt")).strip()
                 else:
                     raise MozVpnError(tr("totp_missing"))
                 code = re.sub(r"[\s\-]+", "", raw)   # "226 829" -> "226829"
                 if not code.isdigit():
                     warn(tr("totp_digits_only"))
                     continue
+                # v5.25: the v5.24 'same code sent twice -> fail fast'
+                # check is REMOVED - the reference mozvpn.py (which the
+                # user confirms ALWAYS logs in) retries the SAME fixed
+                # --totp code up to 3 times without any such check, so
+                # the retry semantics are back to the reference exactly.
                 url = FXA_AUTH + "/session/verify/totp"
                 body = json.dumps({"code": code}).encode()
                 s2, d2 = req("POST", url, {"code": code},
@@ -4121,11 +4363,19 @@ def fxa_login(email: str, password: str, totp_provider=None,
                                          code="relogin")
                 else:
                     raise MozVpnError(tr("totp_unknown_error", status=s2, data=d2))
-        if not session_ok:
-            if email_verified is False or vr == "signup":
-                raise MozVpnError(tr("email_unverified"), code="relogin")
-            if vm.startswith("email") or not vm:
-                raise MozVpnError(tr("email_confirm_required"), code="relogin")
+            if not session_ok:
+                # errno 155 broke out of the loop above (no TOTP on the
+                # server) or the code was never numeric 3 times - either
+                # way the session is NOT verified via TOTP.
+                raise MozVpnError(tr("totp_rejected_final"), code="relogin")
+        elif email_verified is False or vr == "signup":
+            raise MozVpnError(tr("email_unverified"), code="relogin")
+        elif vm.startswith("email") or not vm:
+            # The reference behavior: email confirmation cannot be done by
+            # the script itself -> the localized instructions (confirm the
+            # letter, or --session-token from a browser session).
+            raise MozVpnError(tr("email_confirm_required"), code="relogin")
+        else:
             raise MozVpnError(tr("session_unverified", method=vm or "unknown",
                                  reason=vr), code="relogin")
     return d["sessionToken"]
@@ -5917,13 +6167,17 @@ def ensure_session(args, creds, totp_provider, interactive=True,
             pass
 
     # Re-login
-    email = email or (input(tr("enter_email")).strip() if interactive else None)
+    # v5.24 (Termux fix): every interactive prompt goes through the
+    # robust wrappers (prompt_line / prompt_secret) - a broken stdin on
+    # Android/Termux wrappers now fails with a CLEAR localized message
+    # instead of the generic 'Unexpected error' retry loop.
+    email = email or (prompt_line(tr("enter_email")).strip() if interactive else None)
     if not email:
         raise MozVpnError(tr("email_missing"))
     pw = args.password or creds.get("password")
     if not pw:
         if interactive:
-            pw = getpass.getpass(tr("enter_password"))
+            pw = prompt_secret(tr("enter_password"))
         else:
             raise MozVpnError(tr("password_missing"))
     info(tr("signing_in"))
@@ -6169,6 +6423,21 @@ def run_manager(args, creds, totp_provider):
     atexit.register(cleanup)
 
     while not _STOP:
+        # v5.26 (POSIX terminal safety): make ABSOLUTELY sure the terminal is
+        # in the NORMAL (cooked) mode before any sign-in prompt can run.
+        # If the previous loop iteration died with an exception AFTER the
+        # hotkey phase had switched the tty to CBREAK (e.g. a proxyPass
+        # refresh failure during the sleep/hotkey window), the except
+        # handlers below never restored the cooked mode: the NEXT
+        # iteration's ensure_session() -> input()/getpass() then read a
+        # raw-cbreak tty - broken line editing, Enter not submitting the
+        # line, stray hotkey-phase keystrokes leaking into the prompts -
+        # so the email/password/TOTP entry was corrupted and the attempt
+        # failed, again and again. _hotkey_mode(False) is IDEMPOTENT and
+        # a NO-OP on Windows (which is why Windows 11 never showed it);
+        # calling it here is a belt-and-suspenders guard on top of the
+        # except handlers below.
+        _hotkey_mode(False)
         try:
             # (Re)create the engine after a hotkey engine switch ('e')
             if args.local_proxy and engine is None:
@@ -6879,6 +7148,13 @@ def run_manager(args, creds, totp_provider):
                 break
 
         except MozVpnError as e:
+            # v5.26 (POSIX terminal safety): the exception may have fired
+            # INSIDE the hotkey/cbreak phase (e.g. a failed proxyPass
+            # refresh during the sleep window) - restore the cooked tty
+            # BEFORE the countdown and the next prompt round, otherwise
+            # the next input()/getpass() reads a raw-cbreak terminal
+            # (Windows is unaffected: _hotkey_mode is a no-op there).
+            _hotkey_mode(False)
             err(str(e))
             # Language-independent classification via MozVpnError.code
             code = getattr(e, "code", "")
@@ -6905,8 +7181,10 @@ def run_manager(args, creds, totp_provider):
                 info(tr("retry_after", sec=retry_s))
                 _sleep_with_countdown(retry_s)
         except KeyboardInterrupt:
+            _hotkey_mode(False)     # v5.26: never leave the tty in cbreak
             break
         except Exception as e:
+            _hotkey_mode(False)     # v5.26: same guard for unexpected errors
             # v5.12: a TRANSIENT network error (a DNS blip like
             # gaierror(7), a momentary timeout) gets a FRIENDLY short
             # localized reason instead of the raw exception repr; the
@@ -6928,18 +7206,40 @@ def _hotkey_mode(on: bool):
     """Switch the terminal to/from single-keypress mode. Windows needs
     nothing (msvcrt polls the console); POSIX gets cbreak so keys are
     delivered without Enter. Interactive input() (TOTP prompts) happens
-    OUTSIDE hotkey mode, so line editing is unaffected."""
+    OUTSIDE hotkey mode, so line editing is unaffected.
+
+    v5.24 (Termux fix): two POSIX-only hardening measures.
+    1) A DOUBLE _hotkey_mode(True) no longer overwrites the saved
+       'old' attributes with the ALREADY-CBREAK state - previously a
+       second True (nested handler pairs call False->True again)
+       could leave 'old' = cbreak, so a later False restored CBREAK
+       instead of the cooked mode: the following input()/getpass()
+       prompts misbehaved (no line editing, Enter passed through, the
+       TOTP prompt looked 'skipped' and the sign-in failed) - only on
+       Android/Termux and desktop POSIX, never on Windows (no-op).
+    2) Leaving hotkey mode FLUSHES the pending input queue
+       (termios.tcflush TCIFLUSH) and clears _KEY_BUF, so stray
+       cbreak-mode keystrokes (typed during the countdown/hotkey
+       phase) can no longer leak into the next interactive prompt and
+       corrupt the email/password/TOTP entry."""
     if os.name == "nt":
         return
+    global _KEY_BUF
     try:
         import termios, tty
         fd = sys.stdin.fileno()
         if on:
-            _hotkey_mode.old = termios.tcgetattr(fd)
+            if not getattr(_hotkey_mode, "old", None):
+                _hotkey_mode.old = termios.tcgetattr(fd)
             tty.setcbreak(fd)
         elif getattr(_hotkey_mode, "old", None):
             termios.tcsetattr(fd, termios.TCSADRAIN, _hotkey_mode.old)
             _hotkey_mode.old = None
+            try:
+                termios.tcflush(fd, termios.TCIFLUSH)
+            except Exception:
+                pass
+            _KEY_BUF = b""
     except Exception:
         pass
 
