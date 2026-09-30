@@ -4,6 +4,271 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-09-30 (v5.34) - EVERY CONFIG FILE HAS A WORKING HOTKEY AGAIN
+  (user request; completes the v5.32/v5.33 fix):
+
+  v5.32 added the settings files to the config file lists and v5.33 made
+  them exist from the first run - but the DIGIT handler still assumed
+  "at most 9 files": whenever the list grew past 9 entries (which the
+  settings files made the normal case), pressing 1-9 switched into the
+  multi-char token sub-mode instead of opening the file directly. The
+  files were LISTED but digits did not OPEN them - exactly the reported
+  bug. v5.34 fixes it:
+
+  - digits 1-9 now ALWAYS open files 1-9 DIRECTLY (no sub-mode): the
+    token scheme is unambiguous because files 1-9 always have the
+    single-character tokens "1".."9" (selection_token());
+  - NEW hotkey 'z': the FULL config-file selection menu - it numbers
+    EVERY file (tokens 1-9, then a, b, ... z, aa, ...) and therefore
+    gives a hotkey even to files past the ninth; type the token and
+    press Enter (Backspace deletes a character, any other non-matching
+    key cancels). The menu exits automatically after opening the file
+    (the v5.30 auto-exit rule); it never blocks the main loop.
+  - new tr keys: files_menu_hint (en+ru); hotkeys_hint updated in both
+    languages (mentions the settings files 1-9 and the new 'z' menu).
+
+VERSION 2026-09-30 (v5.33) - THE SETTINGS FILES NOW EXIST FROM THE FIRST
+  RUN (user request; completes the v5.32 fix):
+
+  v5.32 added the four settings files to the config file lists, but
+  the lists are EXISTENCE-based - and countries.json / doh.json /
+  lang.json only appeared AFTER the user saved the matching menu choice,
+  so on a fresh install (or before using the 'h'/'y' menus) the lists
+  STILL looked incomplete. v5.33 makes the script PERSIST the settings
+  at startup, mirroring the CURRENT EFFECTIVE state, so the files (and
+  therefore both lists - '1-9 open' and 'c' removes) are complete from
+  the very first run:
+    - doh.json: the effective resolver (skipped while a custom
+      --doh-url endpoint is active - its URL may be secret);
+    - lang.json: the effective language;
+    - accounts.json: an empty {} cache when no account is cached yet
+      (an empty cache still reads as 'no cached accounts');
+    - countries.json: NOT created when no filter is active - the
+      'all proxies' default has NO file BY DESIGN (hotkey '0' and the
+      clear entry REMOVE the file; recreating an empty one at every
+      startup would fight that contract). It appears in the lists as
+      soon as a filter is actually saved.
+
+VERSION 2026-09-30 (v5.32) - THE CONFIG FILE LISTS ARE NOW COMPLETE (user
+  request):
+
+  The '1-9 open a config file' list and the "what 'c' will remove"
+  list missed the PERSISTED SETTINGS files even though the settings
+  were cached in the config directory all along. Both lists now show
+  EVERY file the script persists, when it exists:
+    - accounts.json  - the cached Mozilla accounts (hotkey 'a')
+    - countries.json - the local-proxy selection (hotkey 'w')
+    - doh.json       - the DNS resolver choice (hotkey 'h', v5.31)
+    - lang.json      - the language choice (hotkey 'y', v5.30)
+  config_open_files(): the four settings files are appended after the
+  session/credentials/cookie trio (before the sing-box configs), so the
+  number hotkeys / the token sub-mode can open them like any other
+  file; print_clear_targets(): the same four are listed among the
+  removal targets (they live inside the config directory, which 'c'
+  removes entirely). The listing is EXISTENCE-based as before: a file
+  that was never created is not shown.
+
+VERSION 2026-09-30 (v5.31) - THREE HOTKEY/PERSISTENCE FIXES (user request):
+
+  1) THE 'y' HOTKEY LINE WAS MISALIGNED in the hotkeys hint: the v5.30
+     emoji U+1F5FA (world map) has DEFAULT=TEXT presentation, so many
+     terminals render it as a NARROW single-cell text glyph and the
+     whole 'y' line shifted one column against the other entries (all
+     of which use wide DEFAULT=EMOJI presentation symbols). Replaced
+     with U+1F4AC (speech balloon, always wide) in both the en/ru
+     hints and the _EMOJI map entries (lang_menu_hint / lang_set /
+     lang_reset) - the column aligns with every other hotkey again.
+
+  2) THE DNS RESOLVER CHOICE (hotkey 'h' menu) IS NOW PERSISTED to
+     doh.json in the user config directory (chmod 600, the same place
+     as session.json / countries.json / lang.json) and survives
+     restarts, like the other script settings. Startup precedence:
+     an explicit --doh / --doh-url argument > the SAVED hotkey-'h'
+     choice > the MOZVPN_DOH environment variable > the built-in
+     default 'cloudflare' (--doh default changed to None accordingly;
+     a custom --doh-url endpoint is NOT persisted - its URL may be
+     secret). The 'h' menu now also MARKS THE CURRENT resolver with
+     the same [x] marker as the 'w'/'y' menus (the active DoH preset
+     or the system-DNS entry).
+
+  3) EVERY option menu that HAS a default value now offers it as
+     option '0' (per request: only where a default exists):
+     - 'h' DNS resolver menu: NEW '0' = the DEFAULT resolver
+       (cloudflare); applied + persisted like a manual choice
+       (new localized lines doh_default_desc / doh_default_applied,
+       en + ru);
+     - 'y' language menu: '0' = the DEFAULT language (was added in
+       v5.30);
+     - 'w' local-proxy menu: '0' = ALL proxies (the default state,
+       clears the saved filter - as before);
+     - the v/b copy lists, the 1-9 config files and the 'a' account
+       switch have NO default value (a copy target / file / account
+       is not a setting with a default), so no '0' entry was added
+       there, exactly per the 'if a default exists' rule.
+
+VERSION 2026-09-30 (v5.30) - TWO HOTKEY UX FEATURES (user request):
+
+  1) AUTOMATIC MENU EXIT ON ENTER. In EVERY hotkey selection menu
+     (the 'w' local-proxy multi-selection, the v/b copy lists, the
+     'h' DoH resolver menu, the 1-9 config files, the 'a' account
+     switch and the NEW 'y' language menu) pressing Enter now APPLIES
+     the chosen option and EXITS the menu AUTOMATICALLY: the sleep/
+     countdown phase restarts immediately and the normal watch display
+     reappears - the menu no longer stays open for the rest of the
+     sleep window after an option was applied (previously only the
+     'w' menu restarted the engine; the generic token menus kept
+     waiting for more keystrokes with the menu text still on screen).
+
+  2) NEW HOTKEY 'y': THE INTERFACE LANGUAGE MENU (en/ru), in the same
+     token + Enter style as the other menus:
+       0 - reset to the DEFAULT language (English) and CLEAR the saved
+           choice (later runs fall back to env/default again),
+       1 - English, 2 - Russian; the current language is marked [x].
+     The choice is PERSISTED in lang.json in the user config directory
+     (~/.config/mozvpn, the same directory as session.json /
+     countries.json, chmod 600) and survives restarts. Startup
+     precedence: an explicit --lang argument > the saved hotkey-'y'
+     choice > the MOZVPN_LANG environment variable > the built-in
+     default 'en' (--lang default changed accordingly; a read-only
+     config dir cannot crash the run - the cache write is best-effort).
+     New localized lines (lang_menu_hint / lang_menu_entry /
+     lang_default_desc / lang_set / lang_reset, en + ru) and the 'y'
+     entry in the hotkeys hint of both languages; the [x] marker and
+     the emoji decoration keep the console styling intact.
+
+VERSION 2026-09-30 (v5.29) - SECURITY: STRICT DoH - NO automatic fallback
+  from DoH to a NON-DoH resolver (user request):
+
+  The v5.1-v5.28 resolve chain ended with an automatic 'last resort'
+  step: when the WHOLE DoH chain failed, the hostname was silently
+  resolved with the SYSTEM resolver - which may be plaintext,
+  observed or filtered DNS, the exact risk the DoH mode exists to
+  avoid. v5.29 removes that automatic DoH -> non-DoH step, mirroring
+  Firefox TRR mode 3 ('TRR-only' / strict resolution: only DoH is
+  employed, with NO fall back mechanism - verified online 2026-09-30
+  in the Firefox Source Docs 'DNS over HTTPS (Trusted Recursive
+  Resolver)' and the Internet Society TRR write-up):
+  - resolve_host(): a full DoH-chain failure now returns None (the
+    caller fails loudly) instead of quietly asking the system
+    resolver; _connect_resolved()/_connect_resolved_ips() and the
+    QUIC (aioquic) path RAISE a clear 'strict DoH' error rather than
+    handing the hostname to a non-DoH resolver.
+  - EXPLICIT opt-ins are kept (nothing is impossible anymore):
+    * --doh off / hotkey 'h' -> 'off' - the whole run on the system
+      resolver, exactly as before (DoH was never on in that mode);
+    * NEW --system-dns-fallback / --no-system-dns-fallback (env
+      MOZVPN_SYSTEM_DNS_FALLBACK, default OFF) - re-enables the old
+      last-resort behavior for the current run; the startup log
+      prints the chosen state (new localized lines doh_strict_mode /
+      system_dns_fallback_on, en+ru, emoji-decorated).
+  - ALL the other fallbacks are UNTOUCHED: provider -> provider
+    within the DoH chain, the v5.12 PARALLEL chain race, the DoH
+    cache/memo, the in-flight dedup, and the v5.28 emergency
+    direct-IP DoH route for the broken-packaged-resolver (Termux
+    binary) case - that route speaks DoH ONLY (the well-known
+    resolver IPs), so it is strict-mode compatible.
+  - The strict gate applies ONLY when a DoH provider is selected
+    (_doh_provider non-empty); with DoH off nothing changes at all.
+
+VERSION 2026-09-30 (v5.28) - THE PACKAGED-BINARY (Termux/Android) DNS FAILURE
+  FIXED - the root cause of the endless "Network error: temporary DNS
+  failure (no address associated with hostname)" loop:
+
+  ROOT CAUSE (verified online 2026-09-30): the Termux build runs as a
+  Nuitka-PACKAGED BINARY, and inside a packaged Python runtime on
+  Android socket.getaddrinfo is a known long-standing broken path
+  (persistent gaierror / EAI_NODATA - the classic issue tracked in
+  python-for-android #1447 and kivy #7087; the same packaged program
+  re-run as a PLAIN script resolves fine, and nslookup / the browser
+  work too). That is EXACTLY the observed split:
+    - mozvpn.py (always a plain script) works on the SAME phone;
+    - the Windows 11 binary works (its packaged resolver is healthy);
+    - only the ANDROID PACKAGED binary loops on gaierror.
+  Why DoH settings could not help: the v5.26 "reference parity" change
+  REMOVED the _req_ip_fallback() emergency route from req() (it was
+  built for exactly this case in v5.13), so every OAuth/Guardian call
+  went back to plain urlopen -> getaddrinfo -> gaierror; and the DoH
+  queries themselves also resolve the provider HOSTNAME
+  (cloudflare-dns.com etc.) with getaddrinfo, so changing/turning off
+  DoH could not fix anything.
+
+  THE FIX (the sign-in algorithm itself is UNTOUCHED - the v5.26
+  reference-parity auth path, scopes, grants, stretching and the Fastly
+  406-challenge solver are preserved verbatim):
+  1) A two-strike detector: the FIRST gaierror is still treated as a
+     transient blip (one retry after 1.5 s, like the reference
+     mozvpn.py); a SECOND one flags the system resolver as BROKEN for
+     the rest of the process (a successful resolution resets the
+     counter, so a healthy resolver is never bypassed).
+  2) In the broken state req() switches to _req_ip_fallback() (the
+     v5.13 emergency route, restored): the hostname is resolved by the
+     emergency DoH straight to the well-known resolver IPs (a hardcoded
+     bootstrap table - NO name resolution anywhere), then ONE raw
+     HTTPS request goes to the resolved IP with the SNI/Host kept;
+     its own 406-challenge handling from v5.25 is kept.
+  3) _doh_query() in the broken state also goes straight to the
+     well-known DoH resolver IPs (the TCP connect goes to the IP
+     literal, the SNI/Host stay the provider hostname), so the normal
+     DoH chain keeps working even though the provider hostnames can
+     no longer be resolved by the system.
+  4) The transient retry and the Fastly 406 retry now use SEPARATE
+     flags (the v5.25 shared-flag bug stays fixed; the reference-parity
+     406-challenge path of mozvpn.py is kept as-is).
+  5) Two new localized log lines (en/ru, emoji-decorated like the rest
+     of the log): a one-time blip note (retry) and the broken-resolver
+     note (emergency direct-IP route).
+
+VERSION 2026-09-29 (v5.27) - THREE NEW FEATURES (no sign-in algorithm
+  changes; the v5.26 reference-parity auth path is untouched):
+
+  FIX 1) PROBES FOLLOW THE LOCAL-PROXY SELECTION. When the user chose
+     specific local proxies (--countries or the hotkey 'w' filter in
+     countries.json), the startup probes used to run for EVERY upstream
+     of the server list anyway. Now _filter_probe_entries() applies the
+     SAME filter as apply_countries_filter() (--countries of this run
+     wins, then the saved per-proxy keys, then the country tokens)
+     BEFORE the probe phase: only the upstreams behind the selected
+     local proxies are probed (one info line says so); the rest get
+     probe_ok=None ('not probed', the same state as with --probe-count)
+     and stay available when the filter is cleared. When the filter
+     matches nothing, ALL upstreams are probed (the same fallback as
+     the serving filter - never zero usable proxies).
+
+  FIX 2) MULTI-ACCOUNT CACHE (accounts.json). Every SUCCESSFUL sign-in
+     (watch mode and one-shot mode) is cached as a separate account
+     entry: login, password, TOTP secret + digits/period/algorithm and
+     the sessionToken. New parameters:
+       --list-accounts  - the cached accounts, masked (password: yes/no,
+                          TOTP: yes/no, session: yes/no, saved date);
+       --show-accounts  - the SAME list with the logins, passwords and
+                          the CURRENT TOTP code of every account in
+                          PLAIN TEXT;
+       --qr-dir DIR     - where the cached QR images of the 2FA secrets
+                          are stored (default: the directory of this
+                          script; the info line always shows the path);
+       --accounts-json FILE - export ALL accounts into ONE json file:
+                          logins, passwords, current TOTP codes, QR
+                          images as base64.
+     The QR image given via --qr is copied into the QR cache dir on
+     every successful sign-in (account_qr_path: <sanitized-email>.png).
+     accounts.json SURVIVES every wipe ('r', 'c', --clear-cache,
+     --relogin): wiping one account's session must not delete the
+     saved logins of all the others (wipe_all_saved_data backs it up
+     and restores it). ensure_session() now reuses the cached session
+     ONLY when it belongs to the SAME account (email match, the
+     permissive behavior for old caches without an email is kept).
+
+  FIX 3) HOTKEY 'a' - SWITCH THE MOZILLA ACCOUNT. Opens the selection
+     menu of the cached accounts (the same token style as the other
+     menus: 1-9, a-z, aa, ab, ... + Enter; the prompt runs in the
+     cooked terminal mode, empty input cancels). The switch sets
+     args.email/password/session_token/totp_secret, the creds dict and
+     the TOTP provider, syncs session.json and leaves the sleep phase -
+     the next watch-loop iteration signs the chosen account in (the
+     cached sessionToken first, on a Guardian failure the normal
+     relogin path uses the cached login/password/TOTP). Added to the
+     hotkeys hint in both languages.
+
 VERSION 2026-09-29 (v5.26) - REFERENCE PARITY of the whole sign-in path +
   an honest RETRACTION of the v5.25 theory:
 
@@ -1545,6 +1810,39 @@ def doh_provider() -> str:
     """The current DoH provider name ('' = DoH off / system resolver)."""
     return _doh_provider
 
+# v5.31 (user request): the DNS resolver chosen in the hotkey 'h' menu is
+# PERSISTED in the user config directory (doh.json, the same place as
+# session.json / countries.json / lang.json) and survives restarts, like
+# the other settings of this script. Startup precedence: an explicit
+# --doh / --doh-url argument > the SAVED hotkey-'h' choice > the
+# MOZVPN_DOH environment variable > the built-in default 'cloudflare'.
+# The saved value is a preset name (''/'off' = the system resolver);
+# a custom --doh-url endpoint is NOT persisted (its URL may be secret).
+DOH_PROVIDER_CACHE = os.path.join(CONF_DIR, "doh.json")
+
+def save_doh_provider_cache(name: str):
+    """v5.31: persist the resolver choice (hotkey 'h') to doh.json."""
+    try:
+        os.makedirs(os.path.dirname(DOH_PROVIDER_CACHE), exist_ok=True)
+        with open(DOH_PROVIDER_CACHE, "w") as f:
+            json.dump({"provider": (name or "").strip().lower()}, f)
+        _chmod600(DOH_PROVIDER_CACHE)
+    except Exception:
+        pass                    # a read-only config dir must not crash the run
+
+def load_doh_provider_cache() -> "str | None":
+    """v5.31: the persisted resolver choice: '' = system DNS (off),
+    a preset name, or None when nothing was saved yet."""
+    try:
+        with open(DOH_PROVIDER_CACHE) as f:
+            data = json.load(f)
+        name = (data.get("provider") or "").strip().lower()
+        if name in ("", "off"):
+            return ""
+        return name if name in DOH_PRESETS else None
+    except Exception:
+        return None
+
 def set_doh_cache(enabled: bool):
     """v5.1: enable/disable the DoH answer cache (default: disabled)."""
     global _doh_cache_enabled
@@ -1557,12 +1855,99 @@ def doh_cache_enabled() -> bool:
     """Whether DoH answers are cached (opt-in via --doh-cache / hotkey 'k')."""
     return _doh_cache_enabled
 
+# v5.29 (security, user request): STRICT DoH mode. When a DoH provider is
+# selected, an automatic fallback from the DoH chain to the SYSTEM (or any
+# other non-DoH) resolver is now FORBIDDEN by default: if every DoH
+# endpoint of the chain fails, the lookup FAILS loudly instead of
+# silently leaking the query (and the reply) to the plaintext system
+# DNS. This mirrors Firefox TRR mode 3 ('TRR-only' / strict resolution:
+# only DoH is employed, with NO fall back mechanism - verified online
+# 2026-09-30: Firefox Source Docs 'DNS over HTTPS (Trusted Recursive
+# Resolver)' documents TRR-only (3) vs TRR-first (2) where TRR-first
+# falls back to Do53 on failure; the Internet Society write-up confirms
+# network.trr.mode=3 is 'strict resolution - only DoH, no fall back
+# mechanism'). The system DNS remains available EXPLICITLY: --doh off
+# (the whole run on the system resolver), or the OPT-IN
+# --system-dns-fallback / env MOZVPN_SYSTEM_DNS_FALLBACK=1 flag that
+# re-enables the old last-resort behavior for the current run. All the
+# OTHER fallbacks (provider->provider inside the DoH chain, the
+# parallel-chain race, the DoH cache/memo, the v5.28 emergency direct-IP
+# DoH route for the broken-packaged-resolver case) are UNTOUCHED - the
+# strictness only removes the automatic DoH -> NON-DoH step.
+_system_dns_fallback = False     # default: STRICT (no non-DoH fallback)
+
+def set_system_dns_fallback(enabled: bool):
+    """v5.29: opt-in re-enable of the system-resolver last resort."""
+    global _system_dns_fallback
+    _system_dns_fallback = bool(enabled)
+
+def system_dns_fallback() -> bool:
+    """v5.29: whether the DoH->system-DNS last resort is allowed."""
+    return _system_dns_fallback
+
+# v5.28: the SYSTEM-RESOLVER-BROKEN detector. In the PACKAGED binary on
+# Android (Nuitka/PyInstaller on arm, e.g. mozvpn_beta-termux-armv9)
+# socket.getaddrinfo can be PERSISTENTLY broken - every name fails with
+# gaierror 'No address associated with hostname' (EAI_NODATA) while
+# nslookup/the browser/the PLAIN python script work fine on the same
+# phone (the classic packaged-Python-on-Android problem: kivy/
+# python-for-android issue #1447 'socket.getaddrinfo appears to be
+# completely broken, all name resolutions fail' - the same symptom
+# while 'nslookup google.com in termux or just browsing google.com in
+# the web browser works fine'; also python-for-android #1447 /
+# kivy #7087 / PyInstaller #3721 are the long-standing tracker entries
+# for getaddrinfo being broken inside the packaged runtime).
+# The SAME script as a PLAIN python script has a normal resolver -
+# which is exactly why the reference mozvpn.py (always run as a
+# script) never failed on the same phone and why Windows 11 (where the
+# packaged binary's resolver works) never failed either.
+# A single gaierror is still treated as a TRANSIENT blip (one retry);
+# only a SECOND one flags the resolver as broken for the REST of the
+# process, after which every DNS-dependent path bypasses the system
+# resolver entirely (req() -> _req_ip_fallback(), DoH -> the
+# well-known resolver IPs directly). A successful resolution RESETS
+# the counter, so a genuinely healthy resolver is never bypassed.
+_RESOLVER_STRIKES = {"n": 0}
+
+def _resolver_broken() -> bool:
+    """v5.28: True after 2+ persistent gaierror strikes - the packaged-
+    binary-on-Android broken-resolver state. Everything that needs a
+    hostname must then avoid socket.getaddrinfo completely."""
+    return _RESOLVER_STRIKES["n"] >= 2
+
 def _doh_query(provider_url: str, host: str) -> "list[str]":
     """One DoH JSON query (RFC 8484 'application/dns-json'):
     GET <endpoint>?name=<host>&type=A -> the Answer.data IPs."""
     url = (provider_url.split("?")[0]
            + ("&" if "?" in provider_url else "?")
            + "name=" + urllib.parse.quote(host) + "&type=A")
+    # v5.28 (Termux binary fix): when the SYSTEM resolver is flagged BROKEN
+    # (a persistent gaierror - the packaged-binary-on-Android case, see
+    # req()), a plain urlopen fails for the DoH provider HOSTNAME too
+    # (cloudflare-dns.com etc. are also resolved with getaddrinfo), so DoH
+    # 'changing the provider' or 'turning it off' could not help at all -
+    # exactly the reported live symptom. In that state the query goes to
+    # the well-known DoH resolver IPs DIRECTLY (the _DOH_IP_BOOTSTRAP
+    # table, no name resolution anywhere: the TCP connect goes to the IP
+    # literal, the SNI/Host stay the provider hostname).
+    if _resolver_broken():
+        u = urlparse(url)
+        for ip, sni, rport, _boot in _DOH_IP_BOOTSTRAP:
+            if sni == u.hostname:
+                try:
+                    code, _h, resp = _raw_https(
+                        ip, sni, u.port or rport, "GET",
+                        (u.path or "/") + (("?" + u.query) if u.query else ""),
+                        {"Accept": "application/dns-json",
+                         "User-Agent": "mozvpn/5.28"})
+                    if code == 200 and resp:
+                        data = json.loads(resp.decode("utf-8", "replace"))
+                        return [str(a.get("data"))
+                                for a in data.get("Answer") or []
+                                if a.get("type") in (1, 28) and a.get("data")]
+                except Exception:
+                    continue
+        return []
     r = urllib.request.Request(url, headers={
         "Accept": "application/dns-json",
         "User-Agent": "mozvpn/5.1"})
@@ -1687,16 +2072,25 @@ def resolve_host(host: str) -> "list[str] | None":
     try:
         ips = _doh_query_parallel(host)
         if not ips:
-            # Every DoH endpoint failed -> the SYSTEM resolver (last resort).
-            # v5.2 (req. 5): SILENT - the DoH setup is reported once at
-            # startup (doh_selected + doh_chain); individual lookups must
-            # NOT write "queried DoH / dns" lines into the log afterwards.
-            try:
-                ips = sorted({ai[4][0] for ai in
-                              socket.getaddrinfo(host, None,
-                                                 proto=socket.IPPROTO_TCP)}) or None
-            except Exception:
-                ips = None
+            # v5.29 (security): every DoH endpoint failed. The OLD code
+            # silently fell back to the SYSTEM resolver here - exactly
+            # the automatic DoH -> non-DoH fallback that must NOT happen
+            # (the system resolver may be plaintext DNS, observed and
+            # filtered). It now runs ONLY when the user EXPLICITLY
+            # opted in (--system-dns-fallback / env
+            # MOZVPN_SYSTEM_DNS_FALLBACK=1); by default the strict
+            # mode returns None and the caller FAILS the lookup loudly
+            # instead of leaking it. DoH-off ('' provider) never reaches
+            # this branch (the function returns None at the top).
+            if system_dns_fallback():
+                try:
+                    ips = sorted({ai[4][0] for ai in
+                                  socket.getaddrinfo(host, None,
+                                                     proto=socket.IPPROTO_TCP)}) or None
+                except Exception:
+                    ips = None
+            else:
+                ips = None       # STRICT: no non-DoH resolution, ever
         if ips:
             if _doh_cache_enabled:
                 with _doh_lock:
@@ -1715,9 +2109,16 @@ def _connect_resolved(host: str, port: int, timeout: int) -> "socket.socket":
     """TCP connection to the egress. With DoH ON the DoH-resolved IPs are
     tried in order (connect to the IP; the TLS SNI stays the hostname, set
     by the caller's wrap_socket(server_hostname=host)); with DoH OFF (or a
-    failed DoH) the normal system resolution is used."""
+    failed DoH under the v5.29 opt-in fallback flag) the normal system
+    resolution is used. v5.29 STRICT mode: with DoH ON, a failed DoH chain
+    and NO opt-in fallback now RAISES instead of quietly resolving the
+    hostname with the system (non-DoH) resolver."""
     ips = resolve_host(host)
     if not ips:
+        if _doh_provider and not system_dns_fallback():
+            raise OSError(f"strict DoH: {host} did not resolve over the "
+                          f"DoH chain and the system DNS fallback is "
+                          f"disabled (--system-dns-fallback enables it)")
         return socket.create_connection((host, port), timeout=timeout)
     last = None
     for ip in ips:
@@ -1740,8 +2141,16 @@ def _connect_resolved_ips(ips: "list[str] | None", host: str, port: int,
     paid the FULL connect timeout PER address, so a blackholed first A
     record plus three more records burned four timeouts inside ONE
     probe. The ordered preference is preserved: the first address is
-    still tried alone, the race only replaces the serial tail."""
+    still tried alone, the race only replaces the serial tail.
+    v5.29 STRICT mode: with DoH ON, ips=None (the whole DoH chain
+    failed) only reaches the system resolution when the user opted in
+    via --system-dns-fallback; otherwise the connection FAILS - no
+    automatic DoH -> non-DoH fallback."""
     if not ips:
+        if _doh_provider and not system_dns_fallback():
+            raise OSError(f"strict DoH: {host} did not resolve over the "
+                          f"DoH chain and the system DNS fallback is "
+                          f"disabled (--system-dns-fallback enables it)")
         return socket.create_connection((host, port), timeout=timeout)
     # 1) the preferred (first) address, alone - the ordered preference
     try:
@@ -1992,10 +2401,12 @@ STR = {
   "proxy_check_connect_ok": "Probe: {hp} - CONNECT tunnel carried data (external IP {ip})",
   "proxy_check_connect_fail": "Probe: {hp} - data check not passed ({reason}); the upstream is served anyway",
   "proxy_check_disabled": "Proxy pre-check disabled (--no-proxy-check): using all server-list upstreams as-is.",
-  "doh_selected": "DNS resolver {_e}: {provider} ({url}) \u2014 the Fastly egress hostnames are resolved over DoH ONLY (like Firefox TRR); if this provider fails, the chain falls back to the other DoH providers, the system resolver is the LAST resort.",
+  "doh_selected": "DNS resolver {_e}: {provider} ({url}) \u2014 the Fastly egress hostnames are resolved over DoH ONLY (like Firefox TRR); if this provider fails, the chain falls back to the other DoH providers. v5.29 STRICT default: if the WHOLE chain fails, the lookup fails - the system resolver is used only with the explicit --system-dns-fallback opt-in (or --doh off).",
   "doh_system": "DoH disabled {_e} \u2014 the egress hostnames are resolved by the SYSTEM DNS (a poisoned/geo-wrong answer can route you to a wrong Fastly PoP, usually a US one). Use --doh <provider> or hotkey 'h'.",
   "doh_system_short": "system DNS (DoH off)",
-  "doh_chain": "DoH fallback chain (checked left to right): {chain} \u2014 the system resolver is the LAST resort. This is logged once at startup; individual DNS lookups during the run are silent.",
+  "doh_strict_mode": "STRICT DoH {_e}: if the WHOLE DoH chain fails, the lookup FAILS - no automatic fallback to the system (non-DoH) resolver, the query never leaks to plaintext DNS (like Firefox TRR mode 3). You can opt in explicitly: --system-dns-fallback, or switch to the system resolver with --doh off.",
+  "system_dns_fallback_on": "System-DNS last resort {_e}: ENABLED (--system-dns-fallback) - when the whole DoH chain fails, the system (non-DoH) resolver is used as before. Disable with --no-system-dns-fallback.",
+  "doh_chain": "DoH fallback chain (checked left to right, all endpoints speak DoH ONLY): {chain}. The system (non-DoH) resolver is NEVER reached automatically (v5.29 strict default; --system-dns-fallback opts in). This is logged once at startup; individual DNS lookups during the run are silent.",
   "geo_echo_no_geo": "Geo check skipped: the echo service '{service}' returns only the IP. Use the default --ip-echo-service ipinfo (ipinfo.io/json) - its single answer carries the IP AND the exit country/city.",
   "foxyproxy_no_proxies": "FoxyProxy export skipped: no local proxies are currently running.",
   "foxyproxy_export_cancel": "FoxyProxy export cancelled - no save path chosen.",
@@ -2010,7 +2421,14 @@ STR = {
   "doh_geo_mismatch": "Geo check: {hp} exits in {geo} ({city}), but the location is {cc} ({cname}). The egress PoP is reached via a wrong route (usually a geo-wrong DNS answer); the IPv6 route may still show the right country.",
   "doh_geo_ok": "Geo check: {hp} exits in {geo} ({city}) \u2014 matches the location {cc}.",
   "doh_menu_hint": "Choose the DNS resolver {_e} \u2014 type its number/letter and press Enter (Backspace deletes, any other key cancels):",
+  "lang_menu_hint": "Choose the interface language {_e} \u2014 type its number and press Enter (current: {cur}). Option 0 resets to the DEFAULT language and clears the saved choice. The choice is cached in lang.json in the config directory and survives restarts (Backspace deletes, any other key cancels; the menu exits automatically after applying).",
+  "lang_menu_entry": "  {n} - {desc}",
+  "lang_default_desc": "DEFAULT language (English) - resets the saved choice",
+  "lang_set": "Interface language {_e}: {lang} \u2014 saved to the config directory (lang.json), survives restarts.",
+  "lang_reset": "Interface language {_e}: reset to the DEFAULT ({lang}) \u2014 the saved choice is cleared.",
   "doh_menu_entry": "  {n} - {name}{url}",
+  "doh_default_desc": "DEFAULT",
+  "doh_default_applied": "DNS resolver {_e}: switched to the DEFAULT provider ({provider}). The choice is saved to the config directory (doh.json) and survives restarts.",
   "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} \u2014 new upstream connections use it immediately (the sing-box engine resolves on its own).",
   "hotkey_doh_cache": "Hotkey 'k': DoH cache {state} (mirrors --doh-cache).",
   "select_hint": "Type the number/letter of an item, then press Enter. Backspace deletes the last character, any other key cancels.",
@@ -2024,6 +2442,25 @@ STR = {
   "filter_all_desc": "ALL local proxies (clears the filter)",
   "countries_filter_applied": "Proxy filter {_e}: {n} of {m} upstreams will be served ({list}). The choice is saved and survives restarts (hotkey 'w' or --countries).",
   "filter_all_applied": "Proxy filter {_e}: ALL local proxies will run (the filter is cleared).",
+  "resolver_blip_note": "Network error {_e}: a TRANSIENT DNS failure (a single blip) - retrying the request once after a short pause (a healthy resolver usually recovers on the next attempt).",
+  "resolver_broken_note": "Network error {_e}: the SYSTEM resolver is broken (persistent DNS failure - the known packaged-binary-on-Android issue, python-for-android #1447) - switching to the emergency direct-IP route: the emergency DoH goes straight to the well-known resolver IPs, and every request connects to the resolved IP (SNI/Host kept), so the system resolver is not used anywhere anymore.",
+  "probe_filter_applied": "Probe filter {_e}: probing ONLY {n} of {m} upstreams - the local-proxy selection (--countries / hotkey 'w') is active, so the upstream probes run only for the local proxies you selected.",
+  "accounts_none": "No cached Mozilla accounts yet. An account is cached automatically after every SUCCESSFUL sign-in (accounts.json).",
+  "accounts_list_header": "Cached Mozilla accounts ({n}) - accounts.json:",
+  "account_list_entry": "  {n} - {email}  (password: {pw}, TOTP: {totp}, session: {session}, saved: {saved})",
+  "account_reveal_entry": "  {n} - login: {email}  password: {password}  current TOTP: {code}",
+  "accounts_qr_dir": "Cached QR images are stored in: {dir}",
+  "accounts_menu_hint": "Switch to another cached Mozilla account {_e} - type its number/letter and press Enter (empty input cancels):",
+  "account_menu_entry": "  {n} - {email}",
+  "accounts_choice_prompt": "Account number/letter (Enter = cancel): ",
+  "accounts_bad_token": "There is no account with that token - cancelled.",
+  "account_switched": "Switched to the account {_e}: {email} ({session}).",
+  "account_session_used": "the cached sessionToken will be tried first, then a fresh sign-in",
+  "account_session_fresh": "a fresh sign-in with the cached login/password",
+  "account_cached": "Account cached {_e}: {email} (accounts.json).",
+  "account_qr_saved": "The QR image of the 2FA secret was cached: {path}",
+  "accounts_json_saved": "All cached accounts ({n}) exported to: {path}",
+  "accounts_survived_wipe": "The multi-account store (accounts.json) survives this wipe: {path}",
   "filter_empty_fallback": "The saved proxy filter matched no upstream - serving ALL of them (clear the filter: hotkey 'w' -> 0).",
   "hotkey_countries": "Hotkey 'w': the local proxies will restart with the new selection.",
   "net_error_retry": "Network error {_e}: {err} - retrying in 30s (a transient failure - a DNS or connection blip; the next attempt usually succeeds).",
@@ -2053,7 +2490,7 @@ STR = {
   "unexpected_error": "Unexpected error: {err!r} - retrying in 30s.",
   "next_refresh": "Next refresh {_e} in {sec}s ({at} UTC).",
   "confirm_exit_hint": "Press Ctrl+C to stop.",
-  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \u267b\ufe0f r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache)\n  \U0001f4c2 o - open the sing-box config directory (or the main config directory)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f5bc\ufe0f g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \u2934\ufe0f s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme)\n  \U0001f308 n - toggle the colored log output on/off (--no-color)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4c4 1-9 - open a config file in the system default editor\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \u23f9\ufe0f q - stop.",
+  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \u267b\ufe0f r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache)\n  \U0001f4c2 o - open the sing-box config directory (or the main config directory)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f5bc\ufe0f g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - switch to another CACHED Mozilla account (accounts.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \u2934\ufe0f s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme)\n  \U0001f308 n - toggle the colored log output on/off (--no-color)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1-9 - open a config file (session/credentials/cookie and the settings files) in the system default editor\n  \U0001f4c6 z - the FULL config-file menu with a hotkey for EVERY file (letters for the files past the ninth)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \u23f9\ufe0f q - stop.",
   "hotkey_relogin": "Hotkey 'r' \u267b\ufe0f: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
   "hotkey_clear": "Hotkey 'c' \U0001f9f9: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
   "hotkey_engine": "Hotkey 'e': switching the engine to {engine} - local proxies will restart with it.",
@@ -2067,6 +2504,7 @@ STR = {
   "hotkey_open_dir_fallback": "Hotkey 'o' \U0001f4c2: the sing-box config directory does not exist yet (it is created when the singbox engine runs) - opened the main config directory instead {_e}: {path}",
   "hotkey_files_hint": "Config files: press the number to open the file in the system default editor.",
   "hotkey_file_entry": "  {n} - {path}",
+  "files_menu_hint": "Config files ({n}) {_e} \u2014 EVERY file has a hotkey: 1-9 open the first nine DIRECTLY; for the rest press the letter token (a, b, ...) and Enter. Backspace deletes, any other key cancels; the menu exits automatically after opening the file.",
   "hotkey_open": "Opened in the system default editor {_e}: {path}",
   "hotkey_open_dir": "Opened the config directory in the system file manager {_e}: {path}",
   "hotkey_open_fail": "Could not open {path}: {err}",
@@ -2269,10 +2707,12 @@ STR = {
   "proxy_check_connect_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {hp} \u2014 \u0442\u0443\u043d\u043d\u0435\u043b\u044c CONNECT \u043f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u043b \u0434\u0430\u043d\u043d\u044b\u0435 (\u0432\u043d\u0435\u0448\u043d\u0438\u0439 IP {ip})",
   "proxy_check_connect_fail": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430: {hp} \u2014 \u0434\u0430\u043d\u043d\u044b\u0435 \u0447\u0435\u0440\u0435\u0437 \u0442\u0443\u043d\u043d\u0435\u043b\u044c \u043d\u0435 \u043f\u0440\u043e\u0448\u043b\u0438 ({reason}); \u0430\u043f\u0441\u0442\u0440\u0438\u043c \u0432\u0441\u0451 \u0440\u0430\u0432\u043d\u043e \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u0442\u0441\u044f",
   "proxy_check_disabled": "\u041f\u0440\u0435\u0434\u0432\u0430\u0440\u0438\u0442\u0435\u043b\u044c\u043d\u0430\u044f \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043f\u0440\u043e\u043a\u0441\u0438 \u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d\u0430 (--no-proxy-check): \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e \u0432\u0441\u0435 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b \u0438\u0437 \u0441\u043f\u0438\u0441\u043a\u0430 \u043a\u0430\u043a \u0435\u0441\u0442\u044c.",
-  "doh_selected": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: {provider} ({url}) \u2014 \u0445\u043e\u0441\u0442\u044b \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 Fastly \u0440\u0435\u0437\u043e\u043b\u0432\u044f\u0442\u0441\u044f \u0422\u041e\u041b\u042c\u041a\u041e \u0447\u0435\u0440\u0435\u0437 DoH (\u043a\u0430\u043a TRR \u0432 Firefox); \u0435\u0441\u043b\u0438 \u044d\u0442\u043e\u0442 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d, \u0446\u0435\u043f\u043e\u0447\u043a\u0430 \u043e\u0442\u043a\u0430\u0442\u044b\u0432\u0430\u0435\u0442\u0441\u044f \u043a \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u043c DoH-\u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0430\u043c, \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u2014 \u041f\u041e\u0421\u041b\u0415\u0414\u041d\u0415\u0415 \u0441\u0440\u0435\u0434\u0441\u0442\u0432\u043e.",
+  "doh_selected": "DNS-\u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 {_e}: {provider} ({url}) \u2014 \u0445\u043E\u0441\u0442\u044B \u0430\u043F\u0441\u0442\u0440\u0438\u043C\u043E\u0432 Fastly \u0440\u0435\u0437\u043E\u043B\u0432\u044F\u0442\u0441\u044F \u0422\u041E\u041B\u042C\u041A\u041E \u0447\u0435\u0440\u0435\u0437 DoH (\u043A\u0430\u043A TRR \u0432 Firefox); \u0435\u0441\u043B\u0438 \u044D\u0442\u043E\u0442 \u043F\u0440\u043E\u0432\u0430\u0439\u0434\u0435\u0440 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D, \u0446\u0435\u043F\u043E\u0447\u043A\u0430 \u043E\u0442\u043A\u0430\u0442\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u043A \u043E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u043C DoH-\u043F\u0440\u043E\u0432\u0430\u0439\u0434\u0435\u0440\u0430\u043C. v5.29 \u0441\u0442\u0440\u043E\u0433\u0438\u0439 \u0440\u0435\u0436\u0438\u043C \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E: \u0435\u0441\u043B\u0438 \u0412\u0421\u042F \u0446\u0435\u043F\u043E\u0447\u043A\u0430 \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B\u0430, \u0437\u0430\u043F\u0440\u043E\u0441 \u043F\u0430\u0434\u0430\u0435\u0442 \u2014 \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u043F\u0440\u0438 \u044F\u0432\u043D\u043E\u043C \u0432\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0438 --system-dns-fallback (\u0438\u043B\u0438 --doh off).",
+  "doh_strict_mode": "\u0421\u0422\u0420\u041E\u0413\u0418\u0419 DoH {_e}: \u0435\u0441\u043B\u0438 \u0412\u0421\u042F DoH-\u0446\u0435\u043F\u043E\u0447\u043A\u0430 \u043D\u0435 \u043E\u0442\u0432\u0435\u0442\u0438\u043B\u0430, \u0437\u0430\u043F\u0440\u043E\u0441 \u041F\u0410\u0414\u0410\u0415\u0422 \u2014 \u043D\u0438\u043A\u0430\u043A\u043E\u0433\u043E \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u043E\u0433\u043E \u0444\u043E\u043B\u0431\u044D\u043A\u0430 \u043D\u0430 \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 (\u043D\u0435-DoH) \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440, \u0437\u0430\u043F\u0440\u043E\u0441 \u043D\u0435 \u0443\u0442\u0435\u043A\u0430\u0435\u0442 \u0432 \u043E\u0442\u043A\u0440\u044B\u0442\u044B\u0439 DNS (\u043A\u0430\u043A \u0440\u0435\u0436\u0438\u043C TRR mode 3 \u0432 Firefox). \u0412\u043A\u043B\u044E\u0447\u0438\u0442\u044C \u0444\u043E\u043B\u0431\u044D\u043A \u044F\u0432\u043D\u043E: --system-dns-fallback, \u043B\u0438\u0431\u043E \u043F\u0435\u0440\u0435\u0439\u0442\u0438 \u043D\u0430 \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 \u0447\u0435\u0440\u0435\u0437 --doh off.",
+  "system_dns_fallback_on": "\u0424\u043E\u043B\u0431\u044D\u043A \u043D\u0430 \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 DNS {_e}: \u0412\u041A\u041B\u042E\u0427\u0415\u041D (--system-dns-fallback) \u2014 \u043F\u0440\u0438 \u043E\u0442\u043A\u0430\u0437\u0435 \u0432\u0441\u0435\u0439 DoH-\u0446\u0435\u043F\u043E\u0447\u043A\u0438, \u043A\u0430\u043A \u0440\u0430\u043D\u044C\u0448\u0435, \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 (\u043D\u0435-DoH) \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440. \u041E\u0442\u043A\u043B\u044E\u0447\u0438\u0442\u044C: --no-system-dns-fallback.",
+  "doh_chain": "\u0426\u0435\u043F\u043E\u0447\u043A\u0430 DoH (\u043F\u0440\u043E\u0432\u0435\u0440\u044F\u0435\u0442\u0441\u044F \u0441\u043B\u0435\u0432\u0430 \u043D\u0430\u043F\u0440\u0430\u0432\u043E, \u0432\u0441\u0435 \u044D\u043D\u0434\u043F\u043E\u0438\u043D\u0442\u044B \u0433\u043E\u0432\u043E\u0440\u044F\u0442 \u0422\u041E\u041B\u042C\u041A\u041E \u043F\u043E DoH): {chain}. \u0421\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 (\u043D\u0435-DoH) \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438 \u041D\u0415 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F \u041D\u0418\u041A\u041E\u0413\u0414\u0410 (\u0441\u0442\u0440\u043E\u0433\u0438\u0439 \u0440\u0435\u0436\u0438\u043C v5.29; --system-dns-fallback \u0432\u043A\u043B\u044E\u0447\u0430\u0435\u0442 \u0441\u0442\u0430\u0440\u043E\u0435 \u043F\u043E\u0432\u0435\u0434\u0435\u043D\u0438\u0435 \u044F\u0432\u043D\u043E). \u0421\u0442\u0440\u043E\u043A\u0430 \u0432\u044B\u0432\u043E\u0434\u0438\u0442\u0441\u044F \u043E\u0434\u0438\u043D \u0440\u0430\u0437 \u043F\u0440\u0438 \u0441\u0442\u0430\u0440\u0442\u0435; \u043E\u0442\u0434\u0435\u043B\u044C\u043D\u044B\u0435 DNS-\u0437\u0430\u043F\u0440\u043E\u0441\u044B \u0432\u043E \u0432\u0440\u0435\u043C\u044F \u0440\u0430\u0431\u043E\u0442\u044B \u0432 \u043B\u043E\u0433 \u043D\u0435 \u043F\u0438\u0448\u0443\u0442\u0441\u044F.",
   "doh_system": "DoH \u043e\u0442\u043a\u043b\u044e\u0447\u0451\u043d {_e} \u2014 \u0445\u043e\u0441\u0442\u044b \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0421\u0418\u0421\u0422\u0415\u041c\u041d\u042b\u0419 DNS (\u043e\u0442\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u0439/\u0433\u0435\u043e-\u043d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442 \u043c\u043e\u0436\u0435\u0442 \u0443\u0432\u0435\u0441\u0442\u0438 \u043d\u0430 \u0447\u0443\u0436\u043e\u0439 PoP Fastly, \u043e\u0431\u044b\u0447\u043d\u043e \u0430\u043c\u0435\u0440\u0438\u043a\u0430\u043d\u0441\u043a\u0438\u0439). \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --doh <\u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440> \u0438\u043b\u0438 \u043a\u043b\u0430\u0432\u0438\u0448\u0443 'h'.",
   "doh_system_short": "\u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (DoH \u0432\u044b\u043a\u043b\u044e\u0447\u0435\u043d)",
-  "doh_chain": "\u0426\u0435\u043f\u043e\u0447\u043a\u0430 DoH (\u043f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u0442\u0441\u044f \u0441\u043b\u0435\u0432\u0430 \u043d\u0430\u043f\u0440\u0430\u0432\u043e): {chain} \u2014 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u041f\u041e\u0421\u041b\u0415\u0414\u041d\u0415\u0415 \u0441\u0440\u0435\u0434\u0441\u0442\u0432\u043e. \u0421\u0442\u0440\u043e\u043a\u0430 \u0432\u044b\u0432\u043e\u0434\u0438\u0442\u0441\u044f \u043e\u0434\u0438\u043d \u0440\u0430\u0437 \u043f\u0440\u0438 \u0441\u0442\u0430\u0440\u0442\u0435; \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u044b\u0435 DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0432\u043e \u0432\u0440\u0435\u043c\u044f \u0440\u0430\u0431\u043e\u0442\u044b \u0432 \u043b\u043e\u0433 \u043d\u0435 \u043f\u0438\u0448\u0443\u0442\u0441\u044f.",
   "geo_echo_no_geo": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d\u0430: echo-\u0441\u0435\u0440\u0432\u0438\u0441 \u00ab{service}\u00bb \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0442\u043e\u043b\u044c\u043a\u043e IP. \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --ip-echo-service ipinfo \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (ipinfo.io/json) \u2014 \u0435\u0433\u043e \u0435\u0434\u0438\u043d\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u043e\u0442\u0432\u0435\u0442 \u0441\u043e\u0434\u0435\u0440\u0436\u0438\u0442 \u0438 IP, \u0438 \u0441\u0442\u0440\u0430\u043d\u0443/\u0433\u043e\u0440\u043e\u0434 \u0432\u044b\u0445\u043e\u0434\u0430.",
   "foxyproxy_no_proxies": "\u042d\u043a\u0441\u043f\u043e\u0440\u0442 FoxyProxy \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d: \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0441\u0435\u0439\u0447\u0430\u0441 \u043d\u0435 \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u044b.",
   "foxyproxy_export_cancel": "\u042d\u043a\u0441\u043f\u043e\u0440\u0442 FoxyProxy \u043e\u0442\u043c\u0435\u043d\u0451\u043d \u2014 \u043f\u0443\u0442\u044c \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u044f \u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d.",
@@ -2287,7 +2727,14 @@ STR = {
   "doh_geo_mismatch": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}), \u0430 \u043b\u043e\u043a\u0430\u0446\u0438\u044f \u2014 {cc} ({cname}). \u0410\u043f\u0441\u0442\u0440\u0438\u043c \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442\u0441\u044f \u043f\u043e \u043d\u0435\u0432\u0435\u0440\u043d\u043e\u043c\u0443 \u043c\u0430\u0440\u0448\u0440\u0443\u0442\u0443 (\u043e\u0431\u044b\u0447\u043d\u043e \u0438\u0437-\u0437\u0430 \u0433\u0435\u043e-\u043d\u0435\u0432\u0435\u0440\u043d\u043e\u0433\u043e DNS-\u043e\u0442\u0432\u0435\u0442\u0430); \u043c\u0430\u0440\u0448\u0440\u0443\u0442 \u043f\u043e IPv6 \u043c\u043e\u0436\u0435\u0442 \u043f\u0440\u0438 \u044d\u0442\u043e\u043c \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u0443\u044e \u0441\u0442\u0440\u0430\u043d\u0443.",
   "doh_geo_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}) \u2014 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u0441 \u043b\u043e\u043a\u0430\u0446\u0438\u0435\u0439 {cc}.",
   "doh_menu_hint": "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442):",
+  "lang_menu_hint": "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u044F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043E \u043D\u043E\u043C\u0435\u0440 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 Enter (\u0442\u0435\u043A\u0443\u0449\u0438\u0439: {cur}). \u041E\u043F\u0446\u0438\u044F 0 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u043D\u0430 \u044F\u0437\u044B\u043A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E \u0438 \u043E\u0447\u0438\u0449\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440. \u0412\u044B\u0431\u043E\u0440 \u043A\u044D\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044F \u0432 lang.json \u0432 \u043A\u0430\u0442\u0430\u043B\u043E\u0433\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043A \u0438 \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u0435\u0442\u0441\u044F \u043F\u0440\u0438 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u0430\u0445 (Backspace \u0443\u0434\u0430\u043B\u044F\u0435\u0442, \u043B\u044E\u0431\u0430\u044F \u0434\u0440\u0443\u0433\u0430\u044F \u043A\u043B\u0430\u0432\u0438\u0448\u0430 \u043E\u0442\u043C\u0435\u043D\u044F\u0435\u0442; \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u0438\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u043C\u0435\u043D\u044E \u0437\u0430\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438).",
+  "lang_menu_entry": "  {n} - {desc}",
+  "lang_default_desc": "\u042F\u0417\u042B\u041A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E (\u0430\u043D\u0433\u043B\u0438\u0439\u0441\u043A\u0438\u0439) \u2014 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440",
+  "lang_set": "\u042F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e}: {lang} \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u0432 \u043A\u0430\u0442\u0430\u043B\u043E\u0433\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0435\u043A (lang.json), \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u043E\u0432.",
+  "lang_reset": "\u042F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e}: \u0441\u0431\u0440\u043E\u0448\u0435\u043D \u043D\u0430 \u044F\u0437\u044B\u043A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E ({lang}) \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440 \u043E\u0447\u0438\u0449\u0435\u043D.",
   "doh_menu_entry": "  {n} - {name}{url}",
+  "doh_default_desc": "\u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e",
+  "doh_default_applied": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e ({provider}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 \u043a\u0430\u0442\u0430\u043b\u043e\u0433\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a (doh.json) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u043e\u0432.",
   "hotkey_doh": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'h': DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 {provider} \u2014 \u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u043c \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e \u0441\u0440\u0430\u0437\u0443 (\u0434\u0432\u0438\u0436\u043e\u043a sing-box \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0441\u0430\u043c).",
   "hotkey_doh_cache": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'k': \u043a\u044d\u0448 DoH {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --doh-cache).",
   "select_hint": "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u043f\u0443\u043d\u043a\u0442\u0430 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 \u0432\u044b\u0431\u043e\u0440.",
@@ -2301,6 +2748,25 @@ STR = {
   "filter_all_desc": "\u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0441\u043d\u0438\u043c\u0430\u0435\u0442 \u0444\u0438\u043b\u044c\u0442\u0440)",
   "countries_filter_applied": "\u0424\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 {_e}: \u0431\u0443\u0434\u0443\u0442 \u043e\u0431\u0441\u043b\u0443\u0436\u0435\u043d\u044b {n} \u0438\u0437 {m} \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 ({list}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u0438 \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0435\u0442 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0438 (\u043a\u043b\u0430\u0432\u0438\u0448\u0430 'w' \u0438\u043b\u0438 --countries).",
   "filter_all_applied": "\u0424\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 {_e}: \u0431\u0443\u0434\u0443\u0442 \u0437\u0430\u043f\u0443\u0449\u0435\u043d\u044b \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0444\u0438\u043b\u044c\u0442\u0440 \u0441\u043d\u044f\u0442).",
+  "resolver_blip_note": "\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u0435\u0442\u0438 {_e}: \u0432\u0440\u0435\u043C\u0435\u043D\u043D\u044B\u0439 \u0441\u0431\u043E\u0439 DNS (\u0435\u0434\u0438\u043D\u0438\u0447\u043D\u044B\u0439) \u2014 \u043F\u043E\u0432\u0442\u043E\u0440\u044F\u044E \u0437\u0430\u043F\u0440\u043E\u0441 \u043E\u0434\u0438\u043D \u0440\u0430\u0437 \u043F\u043E\u0441\u043B\u0435 \u043A\u043E\u0440\u043E\u0442\u043A\u043E\u0439 \u043F\u0430\u0443\u0437\u044B (\u0437\u0434\u043E\u0440\u043E\u0432\u044B\u0439 \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 \u043E\u0431\u044B\u0447\u043D\u043E \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u0430\u0432\u043B\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u0441\u043E \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0435\u0439 \u043F\u043E\u043F\u044B\u0442\u043A\u0438).",
+  "resolver_broken_note": "\u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u0435\u0442\u0438 {_e}: \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 \u0421\u041B\u041E\u041C\u0410\u041D (\u0443\u0441\u0442\u043E\u0439\u0447\u0438\u0432\u044B\u0439 \u0441\u0431\u043E\u0439 DNS \u2014 \u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043F\u0440\u043E\u0431\u043B\u0435\u043C\u0430 \u0443\u043F\u0430\u043A\u043E\u0432\u0430\u043D\u043D\u043E\u0433\u043E \u0431\u0438\u043D\u0430\u0440\u043D\u0438\u043A\u0430 \u043D\u0430 Android, python-for-android #1447) \u2014 \u043F\u0435\u0440\u0435\u0445\u043E\u0436\u0443 \u043D\u0430 \u0430\u0432\u0430\u0440\u0438\u0439\u043D\u044B\u0439 \u043C\u0430\u0440\u0448\u0440\u0443\u0442 \u0447\u0435\u0440\u0435\u0437 \u043F\u0440\u044F\u043C\u044B\u0435 IP: \u0430\u0432\u0430\u0440\u0438\u0439\u043D\u044B\u0439 DoH \u0438\u0434\u0451\u0442 \u043F\u0440\u044F\u043C\u043E \u043D\u0430 \u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0435 IP \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440\u043E\u0432, \u043A\u0430\u0436\u0434\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u0441\u043E\u0435\u0434\u0438\u043D\u044F\u0435\u0442\u0441\u044F \u0441 \u0443\u0436\u0435 \u0440\u0430\u0437\u0440\u0435\u0448\u0451\u043D\u043D\u044B\u043C IP (SNI/Host \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u044E\u0442\u0441\u044F), \u0441\u0438\u0441\u0442\u0435\u043C\u043D\u044B\u0439 \u0440\u0435\u0437\u043E\u043B\u0432\u0435\u0440 \u0431\u043E\u043B\u044C\u0448\u0435 \u043D\u0438\u0433\u0434\u0435 \u043D\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u0442\u0441\u044F.",
+  "probe_filter_applied": "\u0424\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u0431 {_e}: \u043f\u0440\u043e\u0431\u0438\u0440\u0443\u044e\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e {n} \u0438\u0437 {m} \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u043e\u0432 - \u0432\u043a\u043b\u044e\u0447\u0451\u043d \u0432\u044b\u0431\u043e\u0440 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 (--countries / \u043a\u043b\u0430\u0432\u0438\u0448\u0430 'w'), \u043f\u043e\u044d\u0442\u043e\u043c\u0443 \u043f\u0440\u043e\u0431\u044b \u0438\u0434\u0443\u0442 \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0445 \u0432\u0430\u043c\u0438 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438.",
+  "accounts_none": "\u041a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0445 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432 Mozilla \u043f\u043e\u043a\u0430 \u043d\u0435\u0442. \u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u043f\u043e\u0441\u043b\u0435 \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0443\u0441\u043f\u0435\u0448\u043d\u043e\u0433\u043e \u0432\u0445\u043e\u0434\u0430 (accounts.json).",
+  "accounts_list_header": "\u041a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0435 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u044b Mozilla ({n}) - accounts.json:",
+  "account_list_entry": "  {n} - {email}  (\u043f\u0430\u0440\u043e\u043b\u044c: {pw}, TOTP: {totp}, \u0441\u0435\u0441\u0441\u0438\u044f: {session}, \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d: {saved})",
+  "account_reveal_entry": "  {n} - \u043b\u043e\u0433\u0438\u043d: {email}  \u043f\u0430\u0440\u043e\u043b\u044c: {password}  \u0442\u0435\u043a\u0443\u0449\u0438\u0439 TOTP: {code}",
+  "accounts_qr_dir": "\u041a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0435 QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0438 \u0445\u0440\u0430\u043d\u044f\u0442\u0441\u044f \u0432: {dir}",
+  "accounts_menu_hint": "\u041f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 Mozilla {_e} - \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (\u043f\u0443\u0441\u0442\u043e\u0439 \u0432\u0432\u043e\u0434 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442):",
+  "account_menu_entry": "  {n} - {email}",
+  "accounts_choice_prompt": "\u041d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0430 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 (Enter = \u043e\u0442\u043c\u0435\u043d\u0430): ",
+  "accounts_bad_token": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u0441 \u0442\u0430\u043a\u0438\u043c \u0442\u043e\u043a\u0435\u043d\u043e\u043c \u043d\u0435\u0442 - \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.",
+  "account_switched": "\u041f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 \u043d\u0430 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 {_e}: {email} ({session}).",
+  "account_session_used": "\u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u0440\u043e\u0431\u0443\u0435\u0442\u0441\u044f \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 sessionToken, \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434",
+  "account_session_fresh": "\u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434 \u0441 \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u043c \u043b\u043e\u0433\u0438\u043d\u043e\u043c/\u043f\u0430\u0440\u043e\u043b\u0435\u043c",
+  "account_cached": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u0437\u0430\u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d {_e}: {email} (accounts.json).",
+  "account_qr_saved": "QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0430 \u0441\u0435\u043a\u0440\u0435\u0442\u0430 2FA \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0430 \u0432 \u043a\u044d\u0448: {path}",
+  "accounts_json_saved": "\u0412\u0441\u0435 \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0435 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u044b ({n}) \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u044b \u0432: {path}",
+  "accounts_survived_wipe": "\u0425\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0435 \u043c\u043d\u043e\u0433\u043e\u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043d\u043e\u0441\u0442\u0438 (accounts.json) \u043f\u0435\u0440\u0435\u0436\u0438\u0432\u0430\u0435\u0442 \u044d\u0442\u0443 \u043e\u0447\u0438\u0441\u0442\u043a\u0443: {path}",
   "filter_empty_fallback": "\u0421\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0439 \u0444\u0438\u043b\u044c\u0442\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435 \u043d\u0430\u0448\u0451\u043b \u043d\u0438 \u043e\u0434\u043d\u043e\u0433\u043e \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430 \u2014 \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u044e\u0442\u0441\u044f \u0412\u0421\u0415 (\u0441\u043d\u0438\u043c\u0438\u0442\u0435 \u0444\u0438\u043b\u044c\u0442\u0440: \u043a\u043b\u0430\u0432\u0438\u0448\u0430 'w' -> 0).",
   "hotkey_countries": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'w': \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u043e\u0432\u044b\u043c \u0432\u044b\u0431\u043e\u0440\u043e\u043c.",
   "net_error_retry": "\u0421\u0435\u0442\u0435\u0432\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430 {_e}: {err} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440 \u0447\u0435\u0440\u0435\u0437 30 \u0441 (\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u044b\u0439 \u0441\u0431\u043e\u0439 \u2014 DNS \u0438\u043b\u0438 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u0435; \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u043f\u043e\u043f\u044b\u0442\u043a\u0430 \u043e\u0431\u044b\u0447\u043d\u043e \u0443\u0441\u043f\u0435\u0448\u043d\u0430).",
@@ -2330,7 +2796,7 @@ STR = {
   "unexpected_error": "\u041d\u0435\u043f\u0440\u0435\u0434\u0432\u0438\u0434\u0435\u043d\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {err!r} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u044e \u0447\u0435\u0440\u0435\u0437 30 \u0441.",
   "next_refresh": "\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 {_e} \u0447\u0435\u0440\u0435\u0437 {sec} \u0441 ({at} UTC).",
   "confirm_exit_hint": "Ctrl+C \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438.",
-  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \u267b\ufe0f r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 sing-box (\u0438\u043b\u0438 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f5bc\ufe0f g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \u2934\ufe0f s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4c4 1-9 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u043a\u043e\u043d\u0444\u0438\u0433\u0430 \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \u23f9\ufe0f q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
+  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \u267b\ufe0f r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 sing-box (\u0438\u043b\u0438 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f5bc\ufe0f g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 (accounts.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \u2934\ufe0f s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1-9 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u043a\u043e\u043d\u0444\u0438\u0433\u0430 (session/credentials/cookie \u0438 \u0444\u0430\u0439\u043b\u044b \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u041f\u041e\u041b\u041d\u041e\u0415 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0430\u0446\u0438\u0438: \u0433\u043e\u0440\u044f\u0447\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u0434\u043b\u044f \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0444\u0430\u0439\u043b\u0430 (\u0431\u0443\u043a\u0432\u044b \u0434\u043b\u044f \u0444\u0430\u0439\u043b\u043e\u0432 \u0434\u0430\u043b\u044c\u0448\u0435 \u0434\u0435\u0432\u044f\u0442\u043e\u0433\u043e)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \u23f9\ufe0f q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
   "hotkey_relogin": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'r' \u267b\ufe0f: \u041f\u041e\u041b\u041d\u041e\u0415 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435 \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 \u2014 \u043a\u044d\u0448\u0435\u0439, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u043e\u0432, \u043a\u043e\u043d\u0444\u0438\u0433\u043e\u0432 sing-box \u2014 \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434.",
   "hotkey_clear": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'c' \U0001f9f9: \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0443\u0434\u0430\u043b\u0435\u043d\u044b (\u043a\u044d\u0448\u0438, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u044b, \u043a\u043e\u043d\u0444\u0438\u0433\u0438 sing-box) \u2014 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u044e\u0441\u044c \u0441 \u0447\u0438\u0441\u0442\u043e\u0433\u043e \u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u044f.",
   "hotkey_engine": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'e': \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u044e \u0434\u0432\u0438\u0436\u043e\u043a \u043d\u0430 {engine} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
@@ -2344,6 +2810,7 @@ STR = {
   "hotkey_open_dir_fallback": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'o' \U0001f4c2: \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 sing-box \u0435\u0449\u0451 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442 (\u043e\u043d \u0441\u043e\u0437\u0434\u0430\u0451\u0442\u0441\u044f \u043f\u0440\u0438 \u0440\u0430\u0431\u043e\u0442\u0435 \u0434\u0432\u0438\u0436\u043a\u0430 singbox) \u2014 \u0432\u043c\u0435\u0441\u0442\u043e \u043d\u0435\u0433\u043e \u043e\u0442\u043a\u0440\u044b\u0442 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 {_e}: {path}",
   "hotkey_files_hint": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438: \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440, \u0447\u0442\u043e\u0431\u044b \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e.",
   "hotkey_file_entry": "  {n} - {path}",
+  "files_menu_hint": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 ({n}) {_e} \u2014 \u0433\u043e\u0440\u044f\u0447\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u0435\u0441\u0442\u044c \u0443 \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0444\u0430\u0439\u043b\u0430: 1-9 \u043e\u0442\u043a\u0440\u044b\u0432\u0430\u044e\u0442 \u043f\u0435\u0440\u0432\u044b\u0435 \u0434\u0435\u0432\u044f\u0442\u044c \u041d\u0410\u041f\u0420\u042f\u041c\u0423\u042e; \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0445 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0431\u0443\u043a\u0432\u0435\u043d\u043d\u044b\u0439 \u0442\u043e\u043a\u0435\u043d (a, b, ...) \u0438 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442; \u043c\u0435\u043d\u044e \u0437\u0430\u043a\u0440\u044b\u0432\u0430\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u043f\u043e\u0441\u043b\u0435 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f \u0444\u0430\u0439\u043b\u0430.",
   "hotkey_open": "\u041e\u0442\u043a\u0440\u044b\u043b \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e {_e}: {path}",
   "hotkey_open_dir": "\u041e\u0442\u043a\u0440\u044b\u043b \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0444\u0430\u0439\u043b\u043e\u0432\u043e\u043c \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0435 {_e}: {path}",
   "hotkey_open_fail": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043a\u0440\u044b\u0442\u044c {path}: {err}",
@@ -2447,6 +2914,44 @@ def set_language(lang: str):
     global _LANG
     _LANG = lang if lang in ("en", "ru") else "en"
 
+# v5.30 (user request): the language choice made with the hotkey 'y' menu
+# is PERSISTED in the user config directory (lang.json, the same directory
+# as session.json / countries.json) and survives restarts. Precedence at
+# startup: an explicit --lang argument > the cached hotkey-'y' choice >
+# the MOZVPN_LANG environment variable > the built-in default 'en'.
+# Option '0' of the menu resets the language to the DEFAULT and REMOVES
+# the cache file, so later runs fall back to env/default again.
+LANG_CACHE = os.path.join(CONF_DIR, "lang.json")
+
+def save_lang_cache(lang: str):
+    """v5.30: persist the language choice (hotkey 'y') to lang.json."""
+    try:
+        os.makedirs(os.path.dirname(LANG_CACHE), exist_ok=True)
+        with open(LANG_CACHE, "w") as f:
+            json.dump({"lang": lang if lang in ("en", "ru") else "en"}, f)
+        _chmod600(LANG_CACHE)
+    except Exception:
+        pass                    # a read-only config dir must not crash the run
+
+def load_lang_cache() -> "str | None":
+    """v5.30: the persisted language choice, or None when not saved yet."""
+    try:
+        with open(LANG_CACHE) as f:
+            data = json.load(f)
+        lang = (data.get("lang") or "").strip().lower()
+        return lang if lang in ("en", "ru") else None
+    except Exception:
+        return None
+
+def clear_lang_cache():
+    """v5.30: drop the persisted language choice (menu option '0')."""
+    try:
+        if os.path.exists(LANG_CACHE):
+            os.remove(LANG_CACHE)
+    except Exception:
+        pass
+
+
 # Original message decorations (v2 script used emoji prefixes on most log
 # lines). They are preserved here as a single key -> emoji map applied by
 # tr(), so both languages carry the same visual markers as before.
@@ -2491,6 +2996,11 @@ _EMOJI = {
     "doh_selected": "\U0001F310 ",       # globe (DNS resolver)
     "doh_system": "\U0001F310 ",
     "doh_chain": "\U0001F517 ",           # link (fallback chain)
+    "doh_strict_mode": "\U0001F512 ",     # lock (strict DoH, no leak)
+    "system_dns_fallback_on": "\U0001F513 ",  # open lock (opt-in fallback)
+    "lang_menu_hint": "\U0001F4AC ",     # speech balloon (language menu)
+    "lang_set": "\U0001F4AC ",
+    "lang_reset": "\U0001F4AC ",
     "doh_geo_mismatch": "\U0001F5FA ",   # world map (geo check)
     "doh_geo_ok": "\U0001F5FA ",
     "hotkey_doh": "\U0001F310 ",
@@ -2504,6 +3014,7 @@ _EMOJI = {
     "doh_cache_state_off": "\U0001F4BE ",
     "doh_menu_hint": "\U0001F310 ",
     "doh_menu_entry": "\U0001F310 ",
+    "doh_default_applied": "\U0001F310 ",
     "hotkey_doh_cache": "\U0001F4BE ",
     "select_hint": "\u2328 ",
     "select_buffer": "\u2328 ",
@@ -2518,6 +3029,8 @@ _EMOJI = {
     "filter_empty_fallback": "\u26A0\uFE0F  ",
     "hotkey_countries": "\U0001F504 ",
     "net_error_retry": "\U0001F4E1 ",
+    "resolver_blip_note": "\U0001F4E1 ",
+    "resolver_broken_note": "\U0001F4E1 ",
     "upstream_override": "\U0001F9ED ",      # compass (route override)
     "next_refresh": "\u23F3 ",              # hourglass
     "confirm_exit_prompt": "\u2753 ",
@@ -2535,6 +3048,7 @@ _EMOJI = {
     "hotkey_totp_none": "\u2139\ufe0f ",
     "hotkey_files_hint": "\U0001F4C2 ",      # open file folder
     "hotkey_file_entry": "\U0001F4C4 ",      # page facing up
+    "files_menu_hint": "\U0001F4C6 ",        # card index dividers (full file menu)
     "hotkey_open": "\U0001F4DD ",           # memo (editor)
     "hotkey_open_dir": "\U0001F4C2 ",       # open file folder
     "hotkey_open_dir_fallback": "\U0001F4C2 ",  # open file folder (fallback)
@@ -2598,6 +3112,16 @@ _EMOJI = {
     "hotkey_qr_prompt": "\U0001F5BC\uFE0F ",
     "hotkey_qr_loaded": "\u2705 ",
     "hotkey_qr_fail": "\u274C ",
+    "probe_filter_applied": "\u279C ",
+    "accounts_none": "\u2139 ",
+    "accounts_list_header": "\U0001F465 ",
+    "accounts_qr_dir": "\U0001F5BC\uFE0F ",
+    "accounts_menu_hint": "\U0001F465 ",
+    "account_switched": "\U0001F465 ",
+    "account_cached": "\U0001F465 ",
+    "account_qr_saved": "\U0001F5BC\uFE0F ",
+    "accounts_json_saved": "\U0001F4BE ",
+    "accounts_survived_wipe": "\U0001F465 ",
     "hotkey_login": "\U0001F464 ",
     "hotkey_login_none": "\u2139\ufe0f ",
     "hotkey_password": "\U0001F511 ",
@@ -3745,21 +4269,24 @@ def _req_ip_fallback(method: str, url: str, data, headers,
             return code, {}
 
 def req(method: str, url: str, data=None, headers=None, timeout=30,
-        _fastly_retry=False):
-    # v5.26 (REFERENCE PARITY): the request algorithm is EXACTLY the
-    # reference mozvpn.py req() again - ONE retry flag (_fastly_retry)
-    # for the Fastly 406 challenge and NOTHING else. The v5.12-v5.25
-    # transient-network retry (_net_retry + the _req_ip_fallback()
-    # emergency raw-HTTPS call) is REMOVED from req(): the reference
-    # script, which the user confirms ALWAYS signs in on the same
-    # Termux phone, has no such path, and every extra retry layer is
-    # one more way for a mobile network blip to reorder/duplicate the
-    # challenge retry sequence. The helper functions (_raw_https,
-    # _emergency_doh_resolve, _req_ip_fallback) stay DEFINED (they are
-    # the no-system-DNS bootstrap for possible future use), they are
-    # simply no longer wired into req(). The only kept addition over
-    # the reference is _note_server_date() - a PASSIVE read of the
-    # Date header for the TOTP clock sync; it never alters requests.
+        _fastly_retry=False, _net_retry=False):
+    # v5.28: the reference-parity PRIMARY path (v5.26) is KEPT: one retry
+    # flag (_fastly_retry) for the Fastly 406 challenge - the exact
+    # reference request algorithm. What is RESTORED (v5.26 removed it and
+    # that broke the PACKAGED BINARY on Termux) is the emergency handling
+    # of a BROKEN SYSTEM RESOLVER, with the v5.25 flag bug avoided:
+    #   - _net_retry stays a SEPARATE flag and NEVER suppresses the 406
+    #     challenge retry (the v5.12-v5.24 bug was ONE SHARED flag; the
+    #     transient retry here keeps _fastly_retry unchanged and the 406
+    #     handler only looks at its OWN flag);
+    #   - a transient error retries ONCE (1.5 s) like a normal blip;
+    #   - after a SECOND gaierror (the persistent packaged-binary
+    #     resolver state, _resolver_broken()) every subsequent call goes
+    #     STRAIGHT to _req_ip_fallback(): emergency DoH to the well-known
+    #     resolver IPs + ONE raw HTTPS request to the resolved IP (Host +
+    #     SNI kept, the shared cookie jar, redirect following,
+    #     _note_server_date and its OWN 406 challenge handling - the
+    #     v5.25 FIX 2 - included).
     h = dict(BROWSER_HEADERS); h.update(headers or {})
     body = json.dumps(data).encode() if data is not None else None
     r = urllib.request.Request(url, data=body, method=method, headers=h)
@@ -3767,6 +4294,11 @@ def req(method: str, url: str, data=None, headers=None, timeout=30,
         with _OPENER.open(r, timeout=timeout) as resp:
             _note_server_date(resp.headers)     # time sync for TOTP
             raw = resp.read()
+            if _RESOLVER_STRIKES["n"]:
+                # a request SUCCEEDED -> the system resolver works again
+                # (the earlier failures were a transient blip, not the
+                # packaged-binary state)
+                _RESOLVER_STRIKES["n"] = 0
             return resp.status, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
         _note_server_date(e.headers)            # also from error responses
@@ -3777,14 +4309,35 @@ def req(method: str, url: str, data=None, headers=None, timeout=30,
         if (e.code == 406 and not raw and not _fastly_retry
                 and _is_firefox_host(url) and ensure_fastly_cookie()):
             return req(method, url, data, headers, timeout,
-                       _fastly_retry=True)
+                       _fastly_retry=True, _net_retry=_net_retry)
         try:    return e.code, (json.loads(raw) if raw else {})
         except Exception: return e.code, {}
-    except urllib.error.URLError:
-        # v5.26 (REFERENCE PARITY): no silent retry - a URLError
-        # (timeout, gaierror, refused) bubbles up exactly like in the
-        # reference script; the watch loop classifies it for the log
-        # (_is_transient_net_error) and retries the whole cycle.
+    except urllib.error.URLError as e:
+        # v5.28: a transient network error is retried once; a PERSISTENT
+        # gaierror (2+ strikes - the packaged-binary-on-Android broken
+        # resolver) permanently switches the request route to the
+        # direct-IP fallback that needs NO name resolution anywhere.
+        if _is_transient_net_error(e):
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, socket.gaierror):
+                _RESOLVER_STRIKES["n"] += 1
+                warn(tr("resolver_broken_note")
+                     if _resolver_broken() else tr("resolver_blip_note"))
+            if _resolver_broken():
+                # Bypass the system resolver ENTIRELY: emergency DoH
+                # straight to the well-known resolver IPs + ONE raw
+                # HTTPS request to the resolved IP (Host + SNI kept).
+                try:
+                    out = _req_ip_fallback(method, url, data, headers,
+                                           timeout)
+                    if out is not None:
+                        return out
+                except Exception:
+                    pass
+            elif not _net_retry:
+                time.sleep(1.5)
+                return req(method, url, data, headers, timeout,
+                           _fastly_retry=_fastly_retry, _net_retry=True)
         raise
 
 # ---------------- session / credential caches ----------------
@@ -3819,7 +4372,25 @@ def wipe_all_saved_data(creds: dict) -> bool:
     so the next sign-in cannot reuse anything and asks for the login data
     again. Used by the 'c' hotkey, the 'r' hotkey, --clear-cache, --relogin."""
     global COOKIE_JAR, _OPENER
+    # v5.27 (multi-account): accounts.json holds the saved logins of ALL
+    # accounts - it must SURVIVE this wipe (wiping the current session
+    # must not delete every saved account). Backup -> wipe -> restore.
+    accounts_backup = None
+    try:
+        with open(ACCOUNTS_CACHE, "rb") as f:
+            accounts_backup = f.read()
+    except OSError:
+        pass
     ok_caches = clear_all_caches()
+    if accounts_backup:
+        try:
+            os.makedirs(CONF_DIR, exist_ok=True)
+            with open(ACCOUNTS_CACHE, "wb") as f:
+                f.write(accounts_backup)
+            _chmod600(ACCOUNTS_CACHE)
+            info(tr("accounts_survived_wipe", path=ACCOUNTS_CACHE))
+        except OSError:
+            pass
     # In-memory leftovers are why a re-login used to succeed after a wipe:
     # creds (email/password/totp_secret) and the Fastly cookie must go too.
     creds.clear()
@@ -3950,6 +4521,37 @@ def apply_countries_filter(args, verified: list) -> list:
                 list=cc_list))
     return out
 
+def _filter_probe_entries(args, entries: list) -> list:
+    """v5.27 (fix 1): the upstream PROBES must run only for the local
+    proxies the user selected (--countries / the hotkey 'w' filter in
+    countries.json). Same filter logic as apply_countries_filter(): the
+    --countries CLI value of THIS run wins, then the saved per-proxy
+    keys, then the saved country tokens. When the filter matches
+    nothing, ALL entries are probed (the same fallback as
+    apply_countries_filter - the script never ends up with zero usable
+    upstreams)."""
+    flt = load_countries_filter()
+    keys = [str(k).strip().lower() for k in (flt.get("keys") or [])
+            if str(k).strip()]
+    countries = [str(c).strip().lower() for c in (flt.get("countries") or [])
+                 if str(c).strip()]
+    cli = parse_countries_arg(getattr(args, "countries", None))
+    if cli:
+        countries = cli
+        keys = []
+    if not keys and not countries:
+        return entries
+    if keys:
+        tokmap = {selection_token(i): s for i, s in enumerate(entries)}
+        out = [tokmap[t] for t in keys if t in tokmap]
+    else:
+        out = [s for s in entries if _match_country_token(s, countries)]
+    if not out:
+        return entries
+    if len(out) != len(entries):
+        info(tr("probe_filter_applied", n=len(out), m=len(entries)))
+    return out
+
 _CRED_KEYS = ("email", "password", "totp_secret",
               "totp_digits", "totp_period", "totp_algorithm")
 
@@ -4000,6 +4602,177 @@ def totp_params_from(creds: dict):
         pass
     algorithm = (creds.get("totp_algorithm") or "SHA1").upper()
     return digits, period, algorithm
+
+# ---------------- v5.27: MULTI-ACCOUNT cache (accounts.json) ----------------
+# Every SUCCESSFUL sign-in is cached as a separate account entry, so the
+# user can switch between any number of Mozilla accounts (hotkey 'a') the
+# same way the single account used to be reused from credentials.json.
+# accounts.json SURVIVES every wipe (--clear-cache / 'r' / 'c' /
+# --relogin): wiping the session of ONE account must not delete the
+# saved logins of ALL accounts (see wipe_all_saved_data).
+
+ACCOUNTS_CACHE = os.path.join(CONF_DIR, "accounts.json")
+
+def load_accounts() -> dict:
+    """{email: {password, totp_secret, totp_digits, totp_period,
+    totp_algorithm, session_token, saved_at}} - insertion ordered."""
+    try:
+        with open(ACCOUNTS_CACHE) as f:
+            accs = json.load(f)
+        if not isinstance(accs, dict):
+            accs = {}
+        return {str(k).strip().lower(): (v if isinstance(v, dict) else {})
+                for k, v in accs.items() if str(k).strip()}
+    except Exception:
+        return {}
+
+def _save_accounts(accounts: dict):
+    try:
+        os.makedirs(os.path.dirname(ACCOUNTS_CACHE), exist_ok=True)
+        with open(ACCOUNTS_CACHE, "w") as f:
+            json.dump(accounts, f)
+        _chmod600(ACCOUNTS_CACHE)
+    except OSError:
+        pass
+
+def accounts_qr_dir(args=None) -> str:
+    """v5.27 (fix 2): where the cached QR images live. Default: the
+    directory of the script itself (the user always sees the info line);
+    --qr-dir overrides it."""
+    d = (getattr(args, "qr_dir", None) or "").strip() or script_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+def account_qr_path(email: str, args=None) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.@-]+", "_", (email or "").strip().lower())
+    return os.path.join(accounts_qr_dir(args), (safe or "account") + ".png")
+
+def account_totp_now(acc: dict):
+    """(code, seconds_left) for a cached account, or None when it has no
+    TOTP secret. Computed on Mozilla-synced time like every code here."""
+    secret = (acc.get("totp_secret") or "").strip()
+    if not secret:
+        return None
+    try:
+        return totp_generate(secret,
+                              acc.get("totp_digits") or 6,
+                              acc.get("totp_period") or 30,
+                              (acc.get("totp_algorithm") or "SHA1").upper())
+    except Exception:
+        return None
+
+def cache_account(args, creds, session_token=None):
+    """v5.27 (fix 2): cache the account AFTER a successful sign-in. Silent
+    when nothing changed (the watch loop calls it on every token refresh -
+    the log must not repeat itself); prints one line when the account is
+    new or its data changed. Also copies the --qr image into the QR cache
+    dir so the 2FA secret picture is stored next to the account."""
+    email = ((getattr(args, "email", None) or "")
+             or creds.get("email") or "").strip().lower()
+    if not email:
+        return
+    accounts = load_accounts()
+    old = accounts.get(email) or {}
+    acc = dict(old)
+    pw = getattr(args, "password", None) or creds.get("password")
+    if pw:
+        acc["password"] = pw
+    secret = ((getattr(args, "totp_secret", None) or "").strip()
+              or creds.get("totp_secret") or "")
+    if secret:
+        acc["totp_secret"] = secret
+        digits, period, algorithm = totp_params_from(creds)
+        acc["totp_digits"] = digits
+        acc["totp_period"] = period
+        acc["totp_algorithm"] = algorithm
+    if session_token:
+        acc["session_token"] = session_token
+    sig = (acc.get("password"), acc.get("totp_secret"),
+           acc.get("session_token"))
+    old_sig = (old.get("password"), old.get("totp_secret"),
+               old.get("session_token"))
+    if sig == old_sig and old:
+        return                      # nothing new - stay silent
+    acc["saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    accounts[email] = acc
+    _save_accounts(accounts)
+    info(tr("account_cached", email=email))
+    # QR image of THIS run (--qr): store a copy in the QR cache dir
+    qr_src = getattr(args, "qr", None)
+    if qr_src and os.path.isfile(qr_src):
+        try:
+            with open(qr_src, "rb") as f:
+                data = f.read()
+            dst = account_qr_path(email, args)
+            with open(dst, "wb") as f:
+                f.write(data)
+            ok(tr("account_qr_saved", path=dst))
+        except OSError as e:
+            warn(tr("hotkey_open_fail", path=qr_src, err=e))
+
+def print_accounts_list(args, reveal=False):
+    """--list-accounts (masked) / --show-accounts (reveal=True: logins,
+    passwords and the CURRENT TOTP code of every cached account in plain
+    text, plus the QR cache dir)."""
+    accounts = load_accounts()
+    if not accounts:
+        info(tr("accounts_none"))
+        return
+    info(tr("accounts_list_header", n=len(accounts)))
+    for i, (em, acc) in enumerate(accounts.items()):
+        n = selection_token(i)
+        if reveal:
+            code = account_totp_now(acc)
+            info(tr("account_reveal_entry", n=n, email=em,
+                    password=acc.get("password") or "-",
+                    code=(code[0] + f" ({code[1]}s)"
+                          if code else "-")))
+        else:
+            info(tr("account_list_entry", n=n, email=em,
+                    pw=("yes" if acc.get("password") else "no"),
+                    totp=("yes" if acc.get("totp_secret") else "no"),
+                    session=("yes" if acc.get("session_token") else "no"),
+                    saved=acc.get("saved_at") or "-"))
+    info(tr("accounts_qr_dir", dir=accounts_qr_dir(args)))
+
+def export_accounts_json(args, path: str):
+    """v5.27 (fix 2, 4th parameter): --accounts-json FILE - export ALL
+    cached accounts into ONE json file: logins, passwords, the CURRENT
+    TOTP code and the cached QR image (base64) of every account."""
+    accounts = load_accounts()
+    out = []
+    for em, acc in accounts.items():
+        code = account_totp_now(acc)
+        entry = {"email": em,
+                 "password": acc.get("password"),
+                 "totp_secret": acc.get("totp_secret"),
+                 "totp_digits": acc.get("totp_digits"),
+                 "totp_period": acc.get("totp_period"),
+                 "totp_algorithm": acc.get("totp_algorithm"),
+                 "current_totp": code[0] if code else None,
+                 "session_token": acc.get("session_token"),
+                 "saved_at": acc.get("saved_at")}
+        qr = account_qr_path(em, args)
+        if os.path.isfile(qr):
+            try:
+                with open(qr, "rb") as f:
+                    entry["qr_png_base64"] = base64.b64encode(
+                        f.read()).decode("ascii")
+            except OSError:
+                pass
+        out.append(entry)
+    payload = {"exportedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                           time.gmtime()),
+               "accounts": out}
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        sys.exit(str(e))
+    ok(tr("accounts_json_saved", n=len(out), path=path))
 
 # ---------------- TOTP: QR -> secret -> code ----------------
 
@@ -5168,6 +5941,13 @@ def probe_masque(server: dict, token: str, echo_url: str) -> "tuple[bool, str]":
             # (broken in packaged Android binaries, slow/filtered on some
             # networks); the SNI above keeps the REAL hostname.
             m_ips = resolve_host(server["protocolHost"]) or []
+            if not m_ips and _doh_provider and not system_dns_fallback():
+                # v5.29 STRICT: the DoH chain failed for this hostname -
+                # do NOT hand the hostname to aioquic (it would resolve
+                # it with the SYSTEM, non-DoH, resolver); fail instead.
+                raise OSError("strict DoH: "
+                              + str(server["protocolHost"])
+                              + " did not resolve over the DoH chain")
             m_host = m_ips[0] if m_ips else server["protocolHost"]
             async with quic_connect(m_host,
                                    server["protocolPort"], configuration=cfg,
@@ -6158,9 +6938,17 @@ def ensure_session(args, creds, totp_provider, interactive=True,
         try:
             with open(CACHE) as f:
                 c = json.load(f)
-            email = email or c.get("email")
             st = c.get("sessionToken")
-            if st:
+            c_email = (c.get("email") or "").strip().lower()
+            # v5.27 (multi-account): the cached session is reused ONLY
+            # when it belongs to the SAME account being signed in. With
+            # several cached accounts (hotkey 'a') a session of account
+            # A must never be sent for account B - that would fail the
+            # Guardian call with a foreign sessionToken. When the cache
+            # entry carries no email (very old cache) stay permissive.
+            if st and (not email or not c_email
+                       or c_email == email.strip().lower()):
+                email = email or c.get("email")
                 info(tr("cached_session", email=email))
                 return st
         except Exception:
@@ -6295,6 +7083,10 @@ def collect_verified_servers(args, locations, token: str) -> list:
     # to 0 = all; a positive number still limits the probe).
     n_probe = getattr(args, "probe_count", 0)
     probe_servers = entries if not n_probe else entries[:n_probe]
+    # v5.27 (fix 1): when the user selected specific local proxies
+    # (--countries / hotkey 'w'), probe ONLY the upstreams those local
+    # proxies connect to - not every upstream of the server list.
+    probe_servers = _filter_probe_entries(args, probe_servers)
     # v5.1 (req. 7): the exit-country check runs IN THE SAME TIME as the
     # data probe (a second thread pool) - the startup no longer waits for
     # the probe to finish before the geo requests even begin.
@@ -6470,6 +7262,10 @@ def run_manager(args, creds, totp_provider):
             # req. 9: a human-readable expiry instead of "None"
             ok(tr("proxypass_received",
                   until=format_until(until, token), exp=exp_str))
+            # v5.27 (fix 2): the sign-in SUCCEEDED - cache this account
+            # (login/password/TOTP/session) in accounts.json. Silent
+            # when the entry is unchanged (every token refresh calls it).
+            cache_account(args, creds, session_token)
 
             if locations is None:
                 info(tr("serverlist_fetching"))
@@ -6697,16 +7493,44 @@ def run_manager(args, creds, totp_provider):
                                 if copy_to_clipboard(text):
                                     ok(tr("hotkey_copied", text=text))
                             elif copy_mode == "doh":
-                                name = item["provider"]
-                                set_doh_provider(name)
-                                if name:
+                                if item.get("default"):
+                                    # v5.31: '0' = the DEFAULT resolver
+                                    name = "cloudflare"
+                                    set_doh_provider(name)
+                                    save_doh_provider_cache(name)
                                     info(tr("doh_selected", provider=name,
-                                            url=DOH_PROVIDERS.get(name, name)))
+                                            url=DOH_PROVIDERS.get(name,
+                                                                   name)))
                                     info(tr("hotkey_doh", provider=name))
+                                    info(tr("doh_default_applied",
+                                            provider=name))
                                 else:
-                                    info(tr("hotkey_doh",
-                                            provider=tr("doh_system_short")))
-                                    info(tr("doh_system"))
+                                    name = item["provider"]
+                                    set_doh_provider(name)
+                                    # v5.31: persist the hotkey-'h' choice
+                                    save_doh_provider_cache(name)
+                                    if name:
+                                        info(tr("doh_selected", provider=name,
+                                                url=DOH_PROVIDERS.get(name,
+                                                                       name)))
+                                        info(tr("hotkey_doh", provider=name))
+                                    else:
+                                        info(tr("hotkey_doh",
+                                                provider=tr("doh_system_short")))
+                                        info(tr("doh_system"))
+                            elif copy_mode == "lang":
+                                # v5.30: apply the language choice
+                                if item.get("reset"):
+                                    # '0' = the DEFAULT language + DROP
+                                    # the saved choice (later runs fall
+                                    # back to env/default again)
+                                    clear_lang_cache()
+                                    set_language("en")
+                                    ok(tr("lang_reset", lang="en"))
+                                else:
+                                    set_language(item["lang"])
+                                    save_lang_cache(item["lang"])
+                                    ok(tr("lang_set", lang=item["lang"]))
                             elif copy_mode == "files":
                                 open_in_system_editor(item["path"])
                         else:
@@ -6715,6 +7539,13 @@ def run_manager(args, creds, totp_provider):
                         copy_mode = None
                         select_items = []
                         k = ""
+                        # v5.30 (user request): after APPLYING an option
+                        # (or a bad token) the selection menu EXITS
+                        # AUTOMATICALLY - the countdown phase restarts
+                        # immediately and the normal watch display
+                        # reappears instead of the menu staying open for
+                        # the rest of the sleep window.
+                        break
                     elif k in ("\x7f", "\x08"):
                         # BACKSPACE: delete the last typed character
                         if select_buf:
@@ -6990,6 +7821,74 @@ def run_manager(args, creds, totp_provider):
                         copy_to_clipboard(password)
                     else:
                         info(tr("hotkey_password_none"))
+                elif k == "a":
+                    # v5.27 (fix 3): switch between the CACHED Mozilla
+                    # accounts (accounts.json; every SUCCESSFUL sign-in
+                    # is cached). The selection menu uses the SAME token
+                    # style as the other menus (1-9, a-z, ... + Enter);
+                    # the prompt runs in the cooked terminal mode.
+                    accounts = load_accounts()
+                    if not accounts:
+                        info(tr("accounts_none"))
+                    else:
+                        _hotkey_mode(False)
+                        info(tr("accounts_menu_hint"))
+                        hint(tr("select_hint"))
+                        emails = list(accounts.keys())
+                        for i, em in enumerate(emails):
+                            hint(tr("account_menu_entry",
+                                    n=selection_token(i), email=em))
+                        try:
+                            choice = prompt_line(
+                                tr("accounts_choice_prompt")).strip().lower()
+                        except MozVpnError as e:
+                            err(str(e))
+                            choice = ""
+                        tokmap = {selection_token(i): em
+                                  for i, em in enumerate(emails)}
+                        if choice in tokmap:
+                            em = tokmap[choice]
+                            acc = accounts.get(em) or {}
+                            # Switch EVERYTHING the next loop iteration
+                            # reads: args.* (ensure_session reads them
+                            # FIRST), the creds dict and the TOTP
+                            # provider. The cached sessionToken of the
+                            # chosen account is tried first (skip the
+                            # login prompt); on a Guardian failure the
+                            # normal relogin path signs in with the
+                            # cached login/password/TOTP.
+                            args.email = em
+                            args.password = acc.get("password")
+                            st = (acc.get("session_token") or "").strip()
+                            args.session_token = (st if st and all(
+                                ch in "0123456789abcdefABCDEF"
+                                for ch in st) else None)
+                            args.totp_secret = (acc.get("totp_secret")
+                                                or "").strip() or None
+                            args.qr = None
+                            args.totp = None
+                            creds.clear()
+                            creds.update({kk: acc.get(kk)
+                                          for kk in _CRED_KEYS})
+                            creds["email"] = em
+                            totp_secret = args.totp_secret
+                            totp_provider = make_totp_provider(args, creds)
+                            session_token = args.session_token
+                            if args.session_token:
+                                # keep session.json in sync with the
+                                # switched account (restarts reuse it)
+                                save_cache(em, args.session_token)
+                            info(tr("account_switched", email=em,
+                                    session=(tr("account_session_used")
+                                             if args.session_token
+                                             else tr("account_session_fresh"))))
+                            break       # leave the sleep phase; the next
+                                        # loop iteration signs the account in
+                        elif choice:
+                            info(tr("accounts_bad_token"))
+                            _hotkey_mode(True)
+                        else:
+                            _hotkey_mode(True)
                 elif k == "d":
                     # v4.3 (req. 3): reinstall ALL Python dependencies from
                     # scratch (mirrors --reinstall-deps)
@@ -7034,27 +7933,39 @@ def run_manager(args, creds, totp_provider):
                     # cycling: every DoH preset + the system DNS entry.
                     # Applies live to the builtin engine (every new upstream
                     # connection resolves again) and to the next probe run.
+                    # v5.31: option '0' switches to the DEFAULT resolver
+                    # (cloudflare); the CURRENT resolver is marked [x];
+                    # the applied choice is PERSISTED to doh.json and
+                    # survives restarts.
                     copy_mode = "doh"
                     select_buf = ""
-                    select_items = []
+                    select_items = [{"token": "0", "default": True}]
                     for i, name in enumerate(DOH_PRESETS):
-                        select_items.append({"token": selection_token(i),
-                                             "provider": name})
+                        select_items.append(
+                            {"token": selection_token(i + 1),
+                             "provider": name})
                     select_items.append({"token": selection_token(len(
-                                                select_items)),
+                                                select_items) + 1),
                                          "provider": ""})   # system DNS
                     info(tr("doh_menu_hint"))
                     hint(tr("select_hint"))
                     for it in select_items:
-                        if it["provider"]:
+                        if it.get("default"):
+                            hint(tr("doh_menu_entry", n=it["token"],
+                                    name=tr("doh_default_desc").ljust(10),
+                                    url=""))
+                        elif it["provider"]:
                             name = it["provider"]
+                            mark = (" [x]" if name == _doh_provider else "")
                             hint(tr("doh_menu_entry", n=it["token"],
                                     name=name.ljust(10),
-                                    url=f"({DOH_PROVIDERS.get(name, name)})"))
+                                    url=f"({DOH_PROVIDERS.get(name, name)})"
+                                    ) + mark)
                         else:
+                            mark = (" [x]" if not _doh_provider else "")
                             hint(tr("doh_menu_entry", n=it["token"],
                                     name=tr("doh_system_short").ljust(10),
-                                    url=""))
+                                    url="") + mark)
                 elif k == "k":
                     # v5.1 (req. 4): toggle the DoH answer cache on/off
                     # (mirrors --doh-cache); the cache is DISABLED by default.
@@ -7117,22 +8028,71 @@ def run_manager(args, creds, totp_provider):
                     else:
                         info(tr("foxyproxy_no_proxies"))
                 elif k and k.isdigit() and k != "0":
-                    # 1-9: open the config file in the system default editor.
-                    # v5.1: when there are MORE than 9 config files, the
-                    # digits enter the selection sub-mode instead (tokens
-                    # 1-9, a-z, aa, ab, ... + Enter) - see select_items.
+                    # 1-9: open the config file in the system default
+                    # editor. v5.34 (user request): the digits now open
+                    # the file DIRECTLY again - the selection tokens of
+                    # the first nine files ARE the single digits 1-9, so
+                    # a digit press is always UNAMBIGUOUS and needs no
+                    # Enter confirmation. (v5.1-v5.33 switched the digits
+                    # into the token sub-mode whenever the list exceeded
+                    # 9 files - which the v5.32/v5.33 settings files made
+                    # the common case - and the number hotkeys stopped
+                    # opening anything directly, exactly the reported
+                    # 'files in the list but no hotkeys to open them'.)
+                    # Files BEYOND the ninth are opened with the NEW 'z'
+                    # hotkey (the full token menu, see below).
                     files = config_open_files()
-                    if len(files) > 9:
+                    idx = int(k) - 1
+                    if 0 <= idx < len(files):
+                        open_in_system_editor(files[idx])
+                elif k == "z":
+                    # v5.34 (user request): the FULL config-file selection
+                    # menu - the analog of the other hotkey menus (tokens
+                    # 1-9, a-z, aa, ab, ... + Enter, Backspace deletes,
+                    # any other key cancels, Enter applies and exits per
+                    # the v5.30 rule). This gives EVERY listed config file
+                    # a hotkey: 1-9 open directly, 'z' + the letter token
+                    # opens the rest (sing-box configs, any file past the
+                    # ninth).
+                    files = config_open_files()
+                    if not files:
+                        info(tr("hotkey_open_missing",
+                                path=tr("clear_will_remove_dir",
+                                        path=CONF_DIR)))
+                    else:
                         copy_mode = "files"
-                        select_buf = k
+                        select_buf = ""
                         select_items = [{"token": selection_token(i),
                                          "path": p}
                                         for i, p in enumerate(files)]
-                        info(tr("select_buffer", buf=select_buf))
-                    else:
-                        idx = int(k) - 1
-                        if 0 <= idx < len(files):
-                            open_in_system_editor(files[idx])
+                        info(tr("files_menu_hint", n=len(files)))
+                        hint(tr("select_hint"))
+                        for it in select_items:
+                            hint(tr("hotkey_file_entry", n=it["token"],
+                                    path=it["path"]))
+                elif k == "y":
+                    # v5.30 (user request): the INTERFACE LANGUAGE menu
+                    # (en/ru), in the SAME token+Enter style as the other
+                    # hotkey menus. The choice is PERSISTED to lang.json
+                    # in the config directory (survives restarts); option
+                    # '0' resets to the DEFAULT language and clears the
+                    # saved choice. Applying (Enter) EXITS the menu
+                    # automatically (the v5.30 menu auto-exit rule).
+                    copy_mode = "lang"
+                    select_buf = ""
+                    select_items = [{"token": "0", "reset": True},
+                                    {"token": "1", "lang": "en"},
+                                    {"token": "2", "lang": "ru"}]
+                    info(tr("lang_menu_hint", cur=_LANG))
+                    hint(tr("select_hint"))
+                    for it in select_items:
+                        if it.get("reset"):
+                            hint(tr("lang_menu_entry", n=it["token"],
+                                    desc=tr("lang_default_desc")))
+                        else:
+                            mark = (" [x]" if it["lang"] == _LANG else "")
+                            hint(tr("lang_menu_entry", n=it["token"],
+                                    desc=it["lang"]) + mark)
                 elif k == "q":
                     info(tr("hotkey_stop"))
                     _STOP = True
@@ -7811,21 +8771,34 @@ def print_config_files():
 
 def print_clear_targets():
     """req: log exactly which files/directories the 'c' hotkey and the
-    --clear-cache flag remove (the whole config directory goes away)."""
+    --clear-cache flag remove (the whole config directory goes away).
+    v5.32: the PERSISTED SETTINGS files (accounts.json, countries.json,
+    doh.json, lang.json) are listed too when they exist - they all live
+    in the config directory and are removed with it, so the user sees
+    the complete removal list."""
     info(tr("clear_will_remove_header"))
-    for path in (CACHE, CRED_CACHE, FASTLY_CACHE, SINGBOX_DIR):
+    for path in (CACHE, CRED_CACHE, FASTLY_CACHE, ACCOUNTS_CACHE,
+                 COUNTRIES_CACHE, DOH_PROVIDER_CACHE, LANG_CACHE,
+                 SINGBOX_DIR):
         if os.path.exists(path):
             hint(tr("clear_will_remove_entry", path=path))
     hint(tr("clear_will_remove_dir", path=CONF_DIR))
 
 def config_open_files() -> list:
     """Ordered list of the config/cache files that can be opened with the
-    number hotkeys: session, credentials, Fastly cookie, then every
-    sing-box config json in the singbox directory. v5.1: the list is NO
-    LONGER capped at 9 - with more than 9 files the digits switch to the
-    token selection sub-mode (1-9, a-z, aa, ... + Enter)."""
+    number hotkeys: session, credentials, Fastly cookie, then the PERSISTED
+    SETTINGS files of the hotkey menus - the account cache (accounts.json),
+    the local-proxy filter (countries.json), the DNS resolver choice
+    (doh.json) and the language choice (lang.json) - then every sing-box
+    config json in the singbox directory. v5.1: the list is NO LONGER
+    capped at 9 - with more than 9 files the digits switch to the token
+    selection sub-mode (1-9, a-z, aa, ... + Enter). v5.32: all the files
+    the script PERSISTS in the config directory are now listed (they were
+    missing from the v5.1-v5.31 list even though the settings were
+    cached)."""
     files = []
-    for p in (CACHE, CRED_CACHE, FASTLY_CACHE):
+    for p in (CACHE, CRED_CACHE, FASTLY_CACHE, ACCOUNTS_CACHE,
+              COUNTRIES_CACHE, DOH_PROVIDER_CACHE, LANG_CACHE):
         if os.path.isfile(p):
             files.append(p)
     if os.path.isdir(SINGBOX_DIR):
@@ -7964,14 +8937,15 @@ def main():
     # v5.0: DNS-over-HTTPS for the egress hostnames (Firefox-like TRR).
     ap.add_argument("--doh",
                     choices=["cloudflare", "google", "nextdns", "quad9", "off"],
-                    default=(os.environ.get("MOZVPN_DOH", "cloudflare")
-                             .strip().lower() or "cloudflare"),
+                    default=None,
                     help="DNS-over-HTTPS provider used to resolve the Fastly "
                          "egress hostnames (v5.0, like Firefox TRR - protects "
                          "against poisoned/geo-wrong system DNS that routes "
                          "you to a US PoP). Presets: cloudflare (default), "
                          "google, nextdns, quad9; 'off' = the system DNS. "
-                         "Env: MOZVPN_DOH")
+                         "v5.31: default = the SAVED hotkey-'h' choice when "
+                         "present, else env, else 'cloudflare'. Env: "
+                         "MOZVPN_DOH")
     ap.add_argument("--doh-url", metavar="URL", default=None,
                     help="Custom DoH endpoint (RFC 8484 JSON API, "
                          "?name=&type=A) - overrides the --doh preset")
@@ -7983,6 +8957,20 @@ def main():
                          "by default: without the flag every lookup queries "
                          "the DoH chain directly). Env: MOZVPN_DOH_CACHE" %
                          DOH_TTL)
+    # v5.29 (security, user request): STRICT DoH - NO automatic fallback
+    # from the DoH chain to the system (non-DoH) resolver. The fallback
+    # is strictly OPT-IN here; '--no-system-dns-fallback' is the default.
+    ap.add_argument("--system-dns-fallback",
+                    action=argparse.BooleanOptionalAction,
+                    default=_env_flag("MOZVPN_SYSTEM_DNS_FALLBACK", False),
+                    help="v5.29, security: when a DoH provider is selected "
+                         "and the WHOLE DoH chain fails, do NOT fall back "
+                         "to the system (non-DoH) resolver - the lookup "
+                         "fails instead (like Firefox TRR mode 3). This "
+                         "flag OPTS IN to the old last-resort system-DNS "
+                         "behavior; the system DNS is always available "
+                         "explicitly via --doh off. Env: "
+                         "MOZVPN_SYSTEM_DNS_FALLBACK")
     ap.add_argument("--probe-geo", choices=["warn", "drop", "off"],
                     default="warn",
                     help="Exit-country check of every probed upstream "
@@ -8085,12 +9073,29 @@ def main():
                          "v4.7.2; given together with --save the LAST flag "
                          "on the command line wins)")
     ap.add_argument("--relogin", action="store_true", help="Ignore the cached session")
+    # v5.27 (fix 2, fix 3): the multi-account cache parameters
+    ap.add_argument("--list-accounts", action="store_true",
+                    help="List all cached Mozilla accounts (accounts.json) "
+                         "and exit. An account is cached automatically after "
+                         "every successful sign-in")
+    ap.add_argument("--show-accounts", action="store_true",
+                    help="List all cached accounts with the logins, passwords "
+                         "and CURRENT TOTP codes in PLAIN TEXT and exit")
+    ap.add_argument("--qr-dir", metavar="DIR", default=None,
+                    help="Directory for the cached QR images of the 2FA "
+                         "secrets (default: the directory of this script)")
+    ap.add_argument("--accounts-json", metavar="FILE", default=None,
+                    help="Export ALL cached accounts (logins, passwords, "
+                         "current TOTP codes and QR images as base64) into "
+                         "ONE json file and exit")
     ap.add_argument("--clear-cache", action="store_true",
                     help="Remove the whole config directory (~/.config/mozvpn) with all "
                          "caches of this and previous script versions, then exit")
     ap.add_argument("--lang", choices=["en", "ru"],
-                    default=os.environ.get("MOZVPN_LANG", "en").strip().lower() or "en",
-                    help="Output language (default: en). Env: MOZVPN_LANG")
+                    default=None,
+                    help="Output language (v5.30: default = the SAVED "
+                         "hotkey-'y' choice when present, else env, else "
+                         "'en'). Env: MOZVPN_LANG")
     ap.add_argument("--no-color", action="store_true",
                     default=_truthy_env("MOZVPN_NO_COLOR"),
                     help="Disable colored log output. Env: MOZVPN_NO_COLOR")
@@ -8155,7 +9160,16 @@ def main():
     # no longer touches the window background), then set_theme() forces
     # the background (OSC 11) exactly ONCE with the final theme and the
     # final color mode - with --no-color set_theme() forces nothing at all.
-    set_language(a.lang)
+    # v5.30: the language precedence - an explicit --lang argument wins;
+    # then the PERSISTED hotkey-'y' choice (lang.json, survives restarts);
+    # then MOZVPN_LANG; then the built-in default 'en'.
+    _lang_arg = getattr(a, "lang", None)
+    if _lang_arg:
+        set_language(_lang_arg)
+    else:
+        set_language(load_lang_cache()
+                     or (os.environ.get("MOZVPN_LANG", "en").strip().lower()
+                         or "en"))
     set_color(not a.no_color)
     set_theme(a.theme)
     # v5.18: the flag representation of the proxy lines (see
@@ -8170,10 +9184,24 @@ def main():
     if a.doh_url:
         DOH_PROVIDERS["custom"] = a.doh_url
         set_doh_provider("custom")
-    elif a.doh == "off":
-        set_doh_provider("")
+    elif getattr(a, "doh", None):
+        # an EXPLICIT --doh argument wins (including 'off')
+        if a.doh == "off":
+            set_doh_provider("")
+        else:
+            set_doh_provider(a.doh)
     else:
-        set_doh_provider(a.doh)
+        # v5.31: no explicit --doh -> the SAVED hotkey-'h' choice
+        # (doh.json, survives restarts), else env, else the default
+        _saved_doh = load_doh_provider_cache()
+        if _saved_doh is not None:
+            set_doh_provider(_saved_doh)     # '' = the saved system-DNS mode
+        else:
+            set_doh_provider(
+                (os.environ.get("MOZVPN_DOH", "cloudflare").strip().lower()
+                 or "cloudflare"))
+    # v5.29: apply the strict-mode flag BEFORE any lookup or log line.
+    set_system_dns_fallback(bool(getattr(a, "system_dns_fallback", False)))
     if doh_provider():
         info(tr("doh_selected", provider=doh_provider(),
                 url=DOH_PROVIDERS.get(doh_provider(), doh_provider())))
@@ -8182,10 +9210,42 @@ def main():
         # "queried DoH / dns" lines in the log).
         chain = " -> ".join(
             [DOH_PROVIDERS.get(n, n) for n in _doh_chain()]
-            + [tr("doh_system_short")])
+            + ([tr("doh_system_short")]
+               if system_dns_fallback() else []))
         info(tr("doh_chain", chain=chain))
+        # v5.29 (security): the strict-mode state is stated ONCE here.
+        if system_dns_fallback():
+            info(tr("system_dns_fallback_on"))
+        else:
+            info(tr("doh_strict_mode"))
     else:
         info(tr("doh_system"))
+    # v5.33 (user request): make the settings files ALWAYS EXIST so the
+    # '1-9 config files' list and the 'c' removal list show the settings
+    # files from the very first run (previously countries.json / doh.json
+    # / lang.json only appeared AFTER the user saved the matching menu
+    # choice, so the lists looked incomplete - 'not fixed'). The files
+    # mirror the CURRENT EFFECTIVE state at startup:
+    #   - doh.json: the effective resolver (unless a custom --doh-url
+    #     endpoint is active - its URL may be secret, not persisted);
+    #   - lang.json: the effective language;
+    #   - accounts.json: an empty {} cache when no account is cached yet
+    #     (an empty cache is semantically 'no cached accounts');
+    #   - countries.json: ONLY when a filter is ACTIVE - the 'all
+    #     proxies' default has NO file by design (hotkey '0' / the clear
+    #     entry REMOVES the file; recreating an empty one at startup
+    #     would fight that contract).
+    if doh_provider() != "custom":
+        save_doh_provider_cache(doh_provider())
+    save_lang_cache(_LANG)
+    if not os.path.exists(ACCOUNTS_CACHE):
+        try:
+            os.makedirs(os.path.dirname(ACCOUNTS_CACHE), exist_ok=True)
+            with open(ACCOUNTS_CACHE, "w") as f:
+                json.dump({}, f)
+            _chmod600(ACCOUNTS_CACHE)
+        except Exception:
+            pass
     # v5.1 (req. 4): the DoH answer cache state at startup (opt-in)
     set_doh_cache(bool(getattr(a, "doh_cache", False)))
     if doh_cache_enabled():
@@ -8199,6 +9259,18 @@ def main():
     if a.clear_cache:
         print_clear_targets()
         sys.exit(0 if wipe_all_saved_data({}) else 1)
+
+    # v5.27 (fix 2): the multi-account cache parameters work OFFLINE -
+    # no sign-in, no probes; they print the store and exit
+    if a.list_accounts:
+        print_accounts_list(a, reveal=False)
+        sys.exit(0)
+    if a.show_accounts:
+        print_accounts_list(a, reveal=True)
+        sys.exit(0)
+    if a.accounts_json:
+        export_accounts_json(a, a.accounts_json)
+        sys.exit(0)
 
     # v4.3: full reinstall options (--reinstall-deps / --reinstall-singbox
     # mirror the 'd' and 's' hotkeys of the watch loop)
@@ -8327,6 +9399,8 @@ def main():
         exp = jwt_exp(token)
         ok(tr("proxypass_received", until=format_until(until, token),
               exp=time.strftime("%H:%M:%S", time.gmtime(exp)) if exp else "?"))
+        # v5.27 (fix 2): cache the successfully signed-in account
+        cache_account(args=a, creds=creds, session_token=session_token)
         info(tr("serverlist_fetching"))
         locations_all, recommended = fetch_serverlist(a.firefox_version,
                                                        a.client_country,
