@@ -4,6 +4,51 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-10-01 (v5.35) - THE PACKAGED-BINARY (Termux) 415 'Unsupported
+  Media Type' OAuth FAILURE FIXED - the real root cause of the live log:
+
+  The live Termux log (the packaged armv9 binary): right after the v5.28
+  two-strike detector switched req() to the emergency direct-IP route (the
+  broken packaged-resolver case), the OAuth POST /v1/oauth/token request
+  returned {'code': 415, 'errno': 999, 'error': 'Unsupported Media Type'} -
+  while the reference mozvpn.py (no emergency route at all), Windows 11
+  (a healthy resolver - the emergency route never engaged) and even the
+  RARE healthy moments of the same Termux binary (when the packaged
+  resolver happened to work and the emergency route stayed off) all signed
+  in fine.
+
+  ROOT CAUSE - DUPLICATED HTTP HEADERS IN THE EMERGENCY RAW REQUEST.
+  _req_ip_fallback() merged the urllib Request's header list into the
+  outgoing dict: urllib stores header names .capitalize()d
+  (Request.add_header), so "Content-Type" came back as "Content-type";
+  the dict already held the original-spelled "Content-Type", and a dict
+  treats different-case keys as DIFFERENT keys. _raw_https() then wrote
+  BOTH lines into the raw request ("Content-Type: ..." and
+  "Content-type: ...", the same for User-Agent and Accept-Language, and
+  Content-Length was set twice as well). api.accounts.firefox.com is
+  served through Fastly, which combines duplicate request headers into
+  ONE comma-joined value (the std.collect semantics of the Fastly/VCL
+  header model), so the FxA backend received
+  'Content-Type: application/json, application/json'; the
+  fxa-auth-server (Hapi) cannot match that media type and answers
+  415 Unsupported Media Type (errno 999) - the exact live error. The
+  emergency transport itself was HEALTHY: the DoH-to-IP bootstrap
+  resolved the host, the TLS+HTTP request reached the real FxA backend
+  and got a genuine FxA JSON error - only the header set was malformed.
+  That is also why the NORMAL urllib path (req()) never fails on any
+  platform: urllib sends exactly ONE line per header, like the reference
+  script and like every sane HTTP client.
+
+  FIX (two levels - the belt and the suspenders):
+  - _req_ip_fallback(): ONLY the Cookie header is taken from the urllib
+    Request now (that is where the shared cookie jar writes it); every
+    other header comes from the single base_headers dict;
+  - _raw_https(): the outgoing header set is DEDUPLICATED
+    case-insensitively before the wire (one header line per name, the
+    first occurrence wins, Content-Length set once) - a future caller
+    with mixed-case duplicates can never trigger this again. The normal
+    req() path is UNTOUCHED (the reference parity is preserved).
+
 VERSION 2026-09-30 (v5.34) - EVERY CONFIG FILE HAS A WORKING HOTKEY AGAIN
   (user request; completes the v5.32/v5.33 fix):
 
@@ -4130,11 +4175,29 @@ def _raw_https(ip: str, sni_host: str, port: int, method: str, path: str,
     try:
         s.settimeout(timeout)
         tls = _ssl_ctx().wrap_socket(s, server_hostname=sni_host)
+        # v5.35: the outgoing header set is DEDUPLICATED case-insensitively
+        # before the wire (one header line per name, the FIRST occurrence
+        # wins). The v5.13 caller could hand this function a dict holding
+        # BOTH "Content-Type" (the caller's original spelling) and
+        # "Content-type" (a urllib Request header_items() copy - urllib
+        # .capitalize()s every header name in Request.add_header), and the
+        # raw request then carried the SAME header twice. api.accounts.
+        # firefox.com is served through Fastly, which combines duplicate
+        # request headers into ONE comma-joined value; the FxA backend
+        # (fxa-auth-server, Hapi) received 'Content-Type: application/json,
+        # application/json' - a media type it cannot parse - and answered
+        # 415 Unsupported Media Type (the packaged-Termux-binary OAuth
+        # failure). HTTP header names are case-insensitive (RFC 9110), so
+        # a single line per name is always semantically correct.
         hdrs = {"Host": sni_host, "Connection": "close",
                 "Accept-Encoding": "identity"}
+        seen = {"host", "connection", "accept-encoding"}
         for k, v in (headers or {}).items():
-            if k.lower() != "host":
-                hdrs[k] = v
+            lk = k.lower()
+            if lk == "host" or lk in seen:
+                continue           # a case-variant duplicate - drop it
+            seen.add(lk)
+            hdrs[k] = v
         if body is not None:
             hdrs["Content-Length"] = str(len(body))
         head = (f"{method.upper()} {path} HTTP/1.1\r\n"
@@ -4235,9 +4298,19 @@ def _req_ip_fallback(method: str, url: str, data, headers,
             COOKIE_JAR.add_cookie_header(creq)
         except Exception:
             pass
+        # v5.35: ONLY the Cookie header is taken from the urllib Request.
+        # The v5.13 code merged EVERY creq.header_items() entry into the
+        # outgoing dict; urllib .capitalize()s header names
+        # ("Content-Type" -> "Content-type"), so different-case keys did
+        # NOT overwrite each other and the raw request carried the same
+        # header TWICE - Fastly joins the duplicates into
+        # 'application/json, application/json', which the FxA backend
+        # (Hapi) rejects with 415 Unsupported Media Type. base_headers
+        # stays the single source of every other header.
         send = dict(base_headers)
-        send.update({k: v for k, v in creq.header_items()
-                     if k.lower() != "host"})
+        for k, v in creq.header_items():
+            if k.lower() == "cookie" and v:
+                send["Cookie"] = v
         code, hdict, resp_body = _raw_https(
             ips[0], u2.hostname, u2.port or 443, cur_method, path,
             send, cur_body, timeout)
