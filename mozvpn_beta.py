@@ -4,6 +4,86 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-10-02 (v5.36) - THE ENDLESS 'temporary DNS failure - retrying in
+  30s' LOOP ON THE PACKAGED TERMUX BINARY FIXED - the real root cause of the
+  live log, and this time it is a NAME-AND-LINE verifiable one:
+
+  THE LIVE SYMPTOM (the packaged armv9 binary in Termux, the live log
+  2026-10-01): the OAuth token was obtained, Guardian's POST
+  /api/v1/fpn/activate answered HTTP 200 - and THEN the run died with
+  'Network error: temporary DNS failure (no address associated with
+  hostname) - retrying in 30s', over and over, forever, while the
+  reference mozvpn.py worked on the same phone EVERY time and Windows 11
+  never failed.
+
+  ROOT CAUSE - ONE NETWORK CALL THAT BYPASSED THE EMERGENCY ROUTE.
+  The v5.28 emergency direct-IP route (for the packaged-binary broken
+  system resolver) was wired into req() ONLY. But guardian_pass() fetched
+  GET /api/v1/fpn/token through a RAW '_OPENER.open(urllib.request.
+  Request(...))' call (copied from the reference script, where it is
+  correct - the reference runs as a plain script whose getaddrinfo is
+  healthy). That raw call is the ONLY network request of the whole
+  sign-in chain that did NOT go through req(). On the packaged Termux
+  binary (socket.getaddrinfo persistently broken - the known
+  packaged-Python-on-Android issue, python-for-android #1447: 'name
+  resolutions just seem to plain not work... while nslookup in termux
+  works fine') the sequence was exactly the live log:
+    1) oauth_token() -> req() -> gaierror x2 -> the two-strike detector
+       flags the resolver broken -> _req_ip_fallback() -> SUCCESS;
+    2) POST /api/v1/fpn/activate -> req() -> straight to the emergency
+       route -> 'Guardian: enroll completed (HTTP 200)';
+    3) GET /api/v1/fpn/token -> the RAW _OPENER call -> getaddrinfo ->
+       gaierror(7) EAI_NODATA -> the exception is NOT transient-fixable
+       in-process -> the watch loop classifies it as a transient blip
+       and retries in 30 s - but EVERY retry hits the same broken
+       getaddrinfo -> the endless 'temporary DNS failure' loop.
+  That is also why the binary 'very rarely works': when the packaged
+  resolver happens to be healthy for a whole run, the raw call succeeds
+  like everything else; when it is broken, EVERY refresh cycle dies at
+  the same line. And that is why every previous fix 'worked for a few
+  hours': the token refresh cycle re-enters guardian_pass() every ~10
+  minutes, and each cycle re-dies at the raw call.
+
+  THE FIX (the sign-in algorithm itself is UNTOUCHED - the reference
+  scopes, grants, stretching and the Fastly 406-challenge solver are
+  preserved verbatim):
+  1) req_full(): a req()-shaped transport that ALSO returns the response
+     HEADERS (guardian_pass needs the X-Quota-*/Retry-After headers). It
+     implements the EXACT reference request algorithm (one 406-challenge
+     retry) PLUS the v5.28 broken-resolver emergency route and the v5.12
+     one-shot transient retry. req() is now a thin wrapper over it (the
+     reference parity of every existing req() caller is preserved).
+  2) guardian_pass(): the GET /api/v1/fpn/token request now goes through
+     req_full() - the same routed transport as every other request of
+     the sign-in chain. The reference-path behavior on a healthy
+     resolver is IDENTICAL (urllib, the same headers, the same JSON
+     handling); on the broken packaged resolver the request now rides
+     the emergency direct-IP route and SUCCEEDS.
+  3) _fastly_http(): the Fastly challenge flow could not be solved in
+     the broken state either (it also opened _OPENER directly) - that
+     was the OTHER latent bypass: a fresh sign-in after the cached
+     _fs_ch_cp_* cookie expired (~1 h) would have died with waf_406
+     forever. In the broken state the challenge requests now go through
+     _fastly_http_ip() (emergency DoH -> raw HTTPS to the IP, the shared
+     cookie jar kept in sync - the Set-Cookie _fs_ch_cp_* MUST land in
+     COOKIE_JAR, fastly_solve_challenge() scans the jar).
+  4) _doh_query(): in the broken state a provider NOT in the bootstrap
+     table (nextdns / a custom --doh-url) no longer fails the whole
+     chain - the query is answered over the well-known resolver IPs.
+  5) req_full() short-circuits: once the resolver is flagged broken,
+     every request goes STRAIGHT to the emergency route (no doomed
+     getaddrinfo attempt per call, no per-call 'resolver broken' noise).
+  Verified against the Firefox architecture (the user's request):
+  Firefox itself NEVER uses the platform getaddrinfo for its network
+  stack when TRR is on - necko resolves via nsHostResolver/TRR and
+  connects to the resolved IP (TRR mode 3 = 'only DoH is employed, no
+  fall back'; network.trr.bootstrapAddress exists precisely to resolve
+  the DoH resolver itself without getaddrinfo) - see the Firefox Source
+  Docs 'DNS over HTTPS (Trusted Recursive Resolver)'. The emergency
+  route is the same design applied to this script; v5.36 closes the
+  gaps where the script still 'trusted the system resolver' by proxy.
+
+
 VERSION 2026-10-01 (v5.35) - THE PACKAGED-BINARY (Termux) 415 'Unsupported
   Media Type' OAuth FAILURE FIXED - the real root cause of the live log:
 
@@ -1949,7 +2029,7 @@ def system_dns_fallback() -> bool:
 # A single gaierror is still treated as a TRANSIENT blip (one retry);
 # only a SECOND one flags the resolver as broken for the REST of the
 # process, after which every DNS-dependent path bypasses the system
-# resolver entirely (req() -> _req_ip_fallback(), DoH -> the
+# resolver entirely (req() -> _ip_fallback_full(), DoH -> the
 # well-known resolver IPs directly). A successful resolution RESETS
 # the counter, so a genuinely healthy resolver is never bypassed.
 _RESOLVER_STRIKES = {"n": 0}
@@ -1992,7 +2072,15 @@ def _doh_query(provider_url: str, host: str) -> "list[str]":
                                 if a.get("type") in (1, 28) and a.get("data")]
                 except Exception:
                     continue
-        return []
+        # v5.36: the provider is NOT one of the bootstrap hostnames
+        # (nextdns or a custom --doh-url endpoint). The v5.28 code just
+        # gave up here (return []) - the whole chain then failed and the
+        # v5.29 strict mode killed every connection that needed the
+        # hostname. But the ANSWER of a DNS query does not depend on
+        # which resolver gives it: resolve the SAME query over the
+        # well-known resolver IPs (the emergency DoH) so a non-bootstrap
+        # provider no longer breaks the whole chain in the broken state.
+        return _emergency_doh_resolve(host) or []
     r = urllib.request.Request(url, headers={
         "Accept": "application/dns-json",
         "User-Agent": "mozvpn/5.1"})
@@ -3883,6 +3971,24 @@ def _fastly_http(method: str, url: str, data=None, headers=None, timeout=30):
         body = (data if isinstance(data, bytes)
                 else json.dumps(data, separators=(",", ":")).encode())
     r = urllib.request.Request(url, data=body, method=method, headers=h)
+    # v5.36: the challenge flow must ALSO work when the SYSTEM resolver is
+    # broken (the packaged-binary-on-Android state). The v5.13-v5.35 code
+    # opened _OPENER directly here, so in that state the Fastly challenge
+    # could NOT be solved: every *.firefox.com request that arrived with a
+    # missing/expired _fs_ch_cp_* cookie ended in the waf_406 form forever
+    # (the latent 'works for hours, then dies after the ~1h cookie expiry'
+    # recurrence). In the broken state the request goes through
+    # _fastly_http_ip() - the emergency DoH resolves the host, ONE raw
+    # HTTPS request goes to the IP (Host + SNI kept) and the shared cookie
+    # jar stays in sync (the _fs_ch_cp_* Set-Cookie must land in COOKIE_JAR
+    # - fastly_solve_challenge() scans the jar). On any failure the
+    # reference _OPENER path still runs below (best effort, the exact
+    # pre-v5.36 behavior).
+    if _resolver_broken():
+        try:
+            return _fastly_http_ip(method, url, body, h, timeout)
+        except Exception:
+            pass
     try:
         with _OPENER.open(r, timeout=timeout) as resp:
             _note_server_date(resp.headers)
@@ -4152,8 +4258,11 @@ def _net_err_public(e) -> str:
 #       goes to the IP literal);
 #   (2) _raw_https() sends ONE raw HTTPS/1.1 request straight to the
 #       resolved IP with the correct Host header and SNI;
-#   (3) _req_ip_fallback() wraps (1)+(2) into a req()-compatible call
-#       (redirect following, the shared cookie jar, JSON parsing).
+#   (3) _ip_fallback_full() (v5.36; was _req_ip_fallback) wraps (1)+(2)
+#       into a req_full()-compatible call (redirect following, the shared
+#       cookie jar, the response headers, JSON parsing);
+#   (4) v5.36 adds _fastly_http_ip(): the same direct-IP transport for
+#       the Fastly WAF challenge flow itself.
 # ---------------------------------------------------------------------------
 
 _DOH_IP_BOOTSTRAP = (
@@ -4265,15 +4374,64 @@ class _RawRespInfo:
     def info(self):
         return self._msg
 
-def _req_ip_fallback(method: str, url: str, data, headers,
-                     timeout: int) -> "tuple[int, dict] | None":
-    """v5.13: req() LAST RESORT after the system resolver failed (the
-    packaged-binary-on-Android case): resolve the URL host over the
-    emergency DoH, then ONE raw HTTPS request to the IP with the
-    correct Host header + SNI, redirect following and the shared
-    cookie jar included. Returns the req() (status, json) shape, or
-    None when the fallback cannot help (the URL is not HTTPS or the
-    emergency DoH itself failed)."""
+def _fastly_http_ip(method: str, url: str, body: "bytes | None",
+                    headers: dict, timeout: int) -> "tuple[int, bytes]":
+    """v5.36: ONE challenge-flow request when the SYSTEM resolver is
+    broken (the packaged-binary-on-Android state): the emergency DoH
+    resolves the URL host (NO getaddrinfo anywhere - the well-known
+    bootstrap resolver IPs answer directly), then ONE raw HTTPS/1.1
+    request goes to the resolved IP with the Host header + the TLS SNI
+    kept. The shared cookie jar is kept in sync on every hop: the
+    request carries the jar's Cookie header and the response's
+    Set-Cookie entries are extracted into the jar - the final
+    _fs_ch_cp_* cookie MUST land in COOKIE_JAR (fastly_solve_
+    challenge() scans the jar for it; the _OPENER cookie processor
+    fulfills the same contract on the reference path). Returns
+    (status_code, body_bytes); raises OSError on any failure (the
+    caller, _fastly_http, decides what to do)."""
+    u = urlparse(url)
+    if (u.scheme or "https").lower() != "https" or not u.hostname:
+        raise OSError(f"not an https URL: {url}")
+    ips = _emergency_doh_resolve(u.hostname)
+    if not ips:
+        raise OSError(f"emergency DoH could not resolve {u.hostname}")
+    path = (u.path or "/") + (("?" + u.query) if u.query else "")
+    # a REAL urllib Request only as the cookie-jar interface (as in
+    # _ip_fallback_full: extract_cookies needs a genuine Request)
+    creq = urllib.request.Request(url, data=body, method=method,
+                                  headers=dict(headers))
+    try:
+        COOKIE_JAR.add_cookie_header(creq)
+    except Exception:
+        pass
+    send = dict(headers)
+    for k, v in creq.header_items():
+        # v5.35 rule: ONLY the Cookie header is taken from the urllib
+        # Request (its other header names are .capitalize()d and would
+        # duplicate the originals -> the Fastly 415 bug)
+        if k.lower() == "cookie" and v:
+            send["Cookie"] = v
+    code, hdict, resp_body = _raw_https(ips[0], u.hostname, u.port or 443,
+                                        method, path, send, body, timeout)
+    _note_server_date(hdict)
+    try:
+        COOKIE_JAR.extract_cookies(_RawRespInfo(hdict), creq)
+    except Exception:
+        pass
+    return code, resp_body
+
+def _ip_fallback_full(method: str, url: str, data, headers,
+                     timeout: int) -> "tuple[int, dict, dict] | None":
+    """v5.13 -> v5.36: req_full() LAST RESORT after the system resolver
+    failed (the packaged-binary-on-Android case): resolve the URL host
+    over the emergency DoH, then ONE raw HTTPS request to the IP with
+    the correct Host header + SNI, redirect following, the shared
+    cookie jar, the v5.25 406-challenge retry and _note_server_date
+    included. v5.36: returns the FULL response
+    (status, headers_dict_lower, json) - guardian_pass() needs the
+    X-Quota-*/Retry-After headers of the /api/v1/fpn/token answer too
+    - or None when the fallback cannot help (the URL is not HTTPS or
+    the emergency DoH itself failed)."""
     u = urlparse(url)
     if (u.scheme or "https").lower() != "https" or not u.hostname:
         return None
@@ -4320,6 +4478,8 @@ def _req_ip_fallback(method: str, url: str, data, headers,
         # exists) - but the raw path had NO challenge handling at all,
         # so the 406 bubbled up as the waf_406 'retry form'. Solve the
         # challenge, re-attach the fresh cookie and redo the hop ONCE.
+        # (v5.36: in the broken state the challenge flow itself now
+        # rides _fastly_http_ip(), so this retry actually SUCCEEDS.)
         if (code == 406 and not resp_body and not waf_retried
                 and _is_firefox_host(cur_url) and ensure_fastly_cookie()):
             waf_retried = True
@@ -4334,45 +4494,60 @@ def _req_ip_fallback(method: str, url: str, data, headers,
             if code == 303 or (code in (301, 302) and cur_method == "POST"):
                 cur_method, cur_body = "GET", None
             continue
+        out_hdrs = dict(hdict)
         if not resp_body:
-            return code, {}
+            return code, out_hdrs, {}
         try:
-            return code, json.loads(resp_body)
+            return code, out_hdrs, json.loads(resp_body)
         except Exception:
-            return code, {}
+            return code, out_hdrs, {}
 
-def req(method: str, url: str, data=None, headers=None, timeout=30,
-        _fastly_retry=False, _net_retry=False):
-    # v5.28: the reference-parity PRIMARY path (v5.26) is KEPT: one retry
-    # flag (_fastly_retry) for the Fastly 406 challenge - the exact
-    # reference request algorithm. What is RESTORED (v5.26 removed it and
-    # that broke the PACKAGED BINARY on Termux) is the emergency handling
-    # of a BROKEN SYSTEM RESOLVER, with the v5.25 flag bug avoided:
-    #   - _net_retry stays a SEPARATE flag and NEVER suppresses the 406
-    #     challenge retry (the v5.12-v5.24 bug was ONE SHARED flag; the
-    #     transient retry here keeps _fastly_retry unchanged and the 406
-    #     handler only looks at its OWN flag);
-    #   - a transient error retries ONCE (1.5 s) like a normal blip;
-    #   - after a SECOND gaierror (the persistent packaged-binary
-    #     resolver state, _resolver_broken()) every subsequent call goes
-    #     STRAIGHT to _req_ip_fallback(): emergency DoH to the well-known
-    #     resolver IPs + ONE raw HTTPS request to the resolved IP (Host +
-    #     SNI kept, the shared cookie jar, redirect following,
-    #     _note_server_date and its OWN 406 challenge handling - the
-    #     v5.25 FIX 2 - included).
+def req_full(method: str, url: str, data=None, headers=None, timeout=30,
+             _fastly_retry=False, _net_retry=False):
+    """v5.36: the ROUTED request transport - req() PLUS the response
+    headers. Returns (status, headers_dict_lower, json_dict). This is
+    the single place where the request algorithm lives, so EVERY caller
+    (req() and the header-needing callers like guardian_pass()) rides
+    the EXACT same routing:
+      - the reference-parity PRIMARY path: plain urllib through the
+        shared cookie opener, one 406-challenge retry (the exact
+        reference request algorithm - the reference mozvpn.py has no
+        other retries);
+      - a transient network error retries ONCE (1.5 s) like a blip;
+      - after a SECOND gaierror (the persistent packaged-binary
+        resolver state, _resolver_broken()) every call goes STRAIGHT
+        to _ip_fallback_full(): emergency DoH to the well-known
+        resolver IPs + ONE raw HTTPS request to the resolved IP (Host
+        + SNI kept, the shared cookie jar, redirect following,
+        _note_server_date and its OWN 406 challenge handling).
+    v5.36 SHORT-CIRCUIT: once the resolver is flagged broken, the
+    doomed getaddrinfo attempt is not even made anymore (the v5.28 code
+    raised a gaierror on EVERY call first and only then switched to
+    the fallback); the normal urllib path is reached again only when
+    the emergency route cannot help at all (best effort)."""
     h = dict(BROWSER_HEADERS); h.update(headers or {})
     body = json.dumps(data).encode() if data is not None else None
+    # v5.36: the system resolver is KNOWN broken -> skip the doomed
+    # getaddrinfo attempt entirely, go straight to the emergency route.
+    if _resolver_broken():
+        try:
+            out = _ip_fallback_full(method, url, data, headers, timeout)
+            if out is not None:
+                return out
+        except Exception:
+            pass          # fall through to the urllib path (best effort)
     r = urllib.request.Request(url, data=body, method=method, headers=h)
     try:
         with _OPENER.open(r, timeout=timeout) as resp:
             _note_server_date(resp.headers)     # time sync for TOTP
             raw = resp.read()
+            hdrs = {k.lower(): v for k, v in resp.headers.items()}
             if _RESOLVER_STRIKES["n"]:
                 # a request SUCCEEDED -> the system resolver works again
                 # (the earlier failures were a transient blip, not the
                 # packaged-binary state)
                 _RESOLVER_STRIKES["n"] = 0
-            return resp.status, (json.loads(raw) if raw else {})
+            return resp.status, hdrs, (json.loads(raw) if raw else {})
     except urllib.error.HTTPError as e:
         _note_server_date(e.headers)            # also from error responses
         raw = e.read()
@@ -4381,10 +4556,11 @@ def req(method: str, url: str, data=None, headers=None, timeout=30,
         # retry ONCE - the exact reference behavior.
         if (e.code == 406 and not raw and not _fastly_retry
                 and _is_firefox_host(url) and ensure_fastly_cookie()):
-            return req(method, url, data, headers, timeout,
-                       _fastly_retry=True, _net_retry=_net_retry)
-        try:    return e.code, (json.loads(raw) if raw else {})
-        except Exception: return e.code, {}
+            return req_full(method, url, data, headers, timeout,
+                            _fastly_retry=True, _net_retry=_net_retry)
+        hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
+        try:    return e.code, hdrs, (json.loads(raw) if raw else {})
+        except Exception: return e.code, hdrs, {}
     except urllib.error.URLError as e:
         # v5.28: a transient network error is retried once; a PERSISTENT
         # gaierror (2+ strikes - the packaged-binary-on-Android broken
@@ -4401,17 +4577,28 @@ def req(method: str, url: str, data=None, headers=None, timeout=30,
                 # straight to the well-known resolver IPs + ONE raw
                 # HTTPS request to the resolved IP (Host + SNI kept).
                 try:
-                    out = _req_ip_fallback(method, url, data, headers,
-                                           timeout)
+                    out = _ip_fallback_full(method, url, data, headers,
+                                            timeout)
                     if out is not None:
                         return out
                 except Exception:
                     pass
             elif not _net_retry:
                 time.sleep(1.5)
-                return req(method, url, data, headers, timeout,
-                           _fastly_retry=_fastly_retry, _net_retry=True)
+                return req_full(method, url, data, headers, timeout,
+                                _fastly_retry=_fastly_retry, _net_retry=True)
         raise
+
+def req(method: str, url: str, data=None, headers=None, timeout=30,
+        _fastly_retry=False, _net_retry=False):
+    """v5.36: req_full() without the headers - the same (status, json)
+    shape every existing caller was written against; the request
+    algorithm (reference parity + the broken-resolver emergency route)
+    lives in req_full() only, so no caller can bypass it anymore."""
+    status, _hdrs, d = req_full(method, url, data, headers, timeout,
+                                _fastly_retry=_fastly_retry,
+                                _net_retry=_net_retry)
+    return status, d
 
 # ---------------- session / credential caches ----------------
 
@@ -5307,23 +5494,26 @@ def guardian_pass(oauth: str):
                  detail=str(d1)[:120]))
 
     # ProxyPass JWT
-    r = urllib.request.Request(GUARDIAN + "/api/v1/fpn/token",
-                               headers=auth, method="GET")
-    try:
-        with _OPENER.open(r, timeout=30) as resp:
-            _note_server_date(resp.headers)
-            raw = resp.read()
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        _note_server_date(e.headers)
-        raw = e.read()
-        hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
-        status = e.code
-    try:
-        d = json.loads(raw) if raw else {}
-    except ValueError:
-        d = {}
+    # v5.36: THE FIX of the endless 'temporary DNS failure - retrying in
+    # 30s' loop on the packaged Termux binary. The v5.13-v5.35 code sent
+    # this ONE request through a RAW _OPENER.open() call (copied from the
+    # reference mozvpn.py, where it is correct - the reference runs as a
+    # plain script whose getaddrinfo is healthy on the very same phone).
+    # That raw call was the ONLY network request of the whole sign-in
+    # chain that did NOT go through req(): in the packaged-binary broken-
+    # resolver state OAuth and /fpn/activate rode the emergency direct-IP
+    # route and SUCCEEDED, while THIS call hit socket.getaddrinfo ->
+    # gaierror(7) EAI_NODATA on EVERY retry - the watch loop classified
+    # it as a transient blip and re-died every 30 s, exactly the live
+    # log ('Guardian: enroll completed (HTTP 200)' -> the endless DNS
+    # retry). guardian_pass() now rides the SAME routed transport as
+    # every other request: req_full() - the reference urllib path when
+    # the resolver is healthy (identical headers, cookies, JSON and
+    # header handling), the emergency direct-IP route when it is not.
+    # The response HEADERS (X-Quota-*, Retry-After) are returned with
+    # the answer, as the raw code did.
+    status, hdrs, d = req_full("GET", GUARDIAN + "/api/v1/fpn/token",
+                              headers=auth, timeout=30)
 
     if status != 200:
         detail = ""
