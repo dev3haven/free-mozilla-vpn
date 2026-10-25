@@ -163,6 +163,9 @@
 #      requires `pkg install patchelf ccache binutils ldd
 #      termux-elf-cleaner`, and the Nuitka 2.6.7/2.7 releases contain
 #      dedicated Termux fixes (standalone rpath, module mode).
+#      The Nuitka VERSION in this job is pinned to 4.2.2 (FIX 21): the
+#      4.3+ inline scons copy crashes on the clang-only Termux
+#      toolchain (No tool module ilink found).
 #      CRYPTOGRAPHY: the requirements.txt pin
 #      `cryptography==46.0.3; sys_platform == "win32"` does NOT apply in
 #      Termux (sys_platform == "linux"); instead of building cryptography
@@ -344,6 +347,10 @@
 #      (current release, verified 2026-10-25) pronounces Python 3.15
 #      experimentally supported in its changelog; the official PyPI
 #      range is still "Python 3 (3.4 - 3.14) are supported".
+#      The Nuitka version is PINNED per cell (2026-10-25): 4.3.1 in the
+#      Python 3.15 cells (the only line with 3.15 support), 4.2.2 in
+#      the Termux cell (the 4.3 inline scons copy crashes there —
+#      FIX 21).
 #
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
@@ -419,7 +426,9 @@
 #   * linux-x86 runs natively on the x86_64 kernel — no emulation.
 #   * Nuitka 4.3.1 supports Python 3.4–3.14 (3.15 experimentally) and
 #     does NOT cross-compile; every
-#     target is built natively with a PRE-BUILT CPython.
+#     target is built natively with a PRE-BUILT CPython. The version
+#     is pinned explicitly per cell (see FIX 21 for why the Termux
+#     cell stays on 4.2.2).
 #   * For 32-bit Python on Windows, Nuitka requires MSVC (NOT MinGW);
 #     MSVC is preinstalled on windows-latest; windows-11-arm ships
 #     Visual Studio with ARM64 build tools.
@@ -548,7 +557,20 @@ jobs:
           # Nuitka --include-package=setuptools hard-fails without it.
           python -m pip install --upgrade pip setuptools wheel
           # Build tooling: Nuitka compiler + helpers for onefile compression.
-          python -m pip install --upgrade nuitka ordered-set
+          # PINNED to 4.3.1 (2026-10-25): the unpinned --upgrade is what
+          # broke the Termux job the same day (FIX 21) — a release
+          # pipeline must not change its compiler between runs. These
+          # cells build on Python 3.15, so they NEED the 4.3 line (the
+          # only one with 3.15 support, experimental per the changelog);
+          # 4.3.1 is the current stable (verified 2026-10-25; the failing
+          # run itself confirmed it: "up to date with stable release
+          # 4.3.1"). The Windows/Linux cells are NOT affected by the
+          # FIX 21 scons bug: Windows resolves the mslink tool, and
+          # every Linux cell has gcc/g++ (preinstalled on the runners,
+          # apt-installed inside the i386 container), so gnulink is
+          # found and the broken ilink fallback is never reached. Bump
+          # the pin deliberately after reading the Nuitka changelog.
+          python -m pip install nuitka==4.3.1 ordered-set
           # zstandard: optional onefile compressor (uncompressed fallback).
           python -m pip install --upgrade zstandard || \
             echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
@@ -778,7 +800,13 @@ jobs:
               # Nuitka --include-package=setuptools requires it.
               python -m pip install --upgrade pip setuptools wheel
               # Build tooling: Nuitka + onefile compression helpers.
-              python -m pip install --upgrade nuitka ordered-set
+              # PINNED to 4.3.1 (2026-10-25) for build reproducibility:
+              # the unpinned --upgrade silently broke the Termux job the
+              # same day (FIX 21). This cell is NOT affected by that
+              # bug: gcc and g++ are apt-installed above, so the scons
+              # gnulink tool is found and the pruned ilink fallback is
+              # never reached. Python 3.15 requires the 4.3 line.
+              python -m pip install nuitka==4.3.1 ordered-set
               # zstandard: optional onefile compressor; libffi-dev makes
               # the source build succeed. If it still fails, continue
               # WITHOUT it: the payload is packed UNCOMPRESSED.
@@ -1057,7 +1085,33 @@ jobs:
                 exit 1
               fi
               # Build tooling: Nuitka + onefile compression helpers.
-              python -m pip install --upgrade nuitka ordered-set
+              # FIX 21 (2026-10-25): Nuitka is PINNED to 4.2.2 here.
+              # The release/2.0.0 run (2026-10-25) crashed with 4.3.1:
+              #   scons: *** [__constants.o] No tool module ilink found
+              #   in .../nuitka/build/inline_copy/lib/scons-4.10.1/SCons/Tool
+              # The 4.3 changelog switched ALL Python 3.7+ platforms to
+              # the scons-4.10.1 inline copy previously used ONLY on
+              # Windows; that copy is PRUNED and ships NO ilink.py.
+              # Scons picks the linker with tool_list(): for a posix
+              # platform the candidates are gnulink first, then ilink.
+              # gnulink.exists() of scons 4.10.1 answers True only when
+              # gcc or g++ is found — Termux ships ONLY clang, so the
+              # probe falls through to ilink and dies on the missing
+              # module. The same pruning regression class hit Nuitka
+              # 2.8.8/2.8.9 (issues #3679, #3695, #3734) and was fixed
+              # back then in 2.8.10 by restoring the inline copy.
+              # The 4.2 line — the September 2026 live runs used 4.2.1 —
+              # builds non-Windows with the scons-4.3.0 inline copy,
+              # which DOES contain ilink.py: the fallback succeeds,
+              # gnulink is used and the build completes. 4.2.2 (the
+              # LAST hotfix of the 4.2 line, released 2026-10-02/03,
+              # verified on PyPI 2026-10-25; 4.2.3 does not exist) keeps
+              # that layout; its fixes touch nothing Termux related,
+              # and the Termux interpreter Python 3.14.8 is inside the
+              # official 4.2 support range (Python 3.4-3.14).
+              # Unpin ONLY after checking that a newer Nuitka tag ships
+              # ilink.py again inside its scons-4.10.1+ inline copy.
+              python -m pip install nuitka==4.2.2 ordered-set
               python -m pip install --upgrade zstandard || \
                 echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
               # FIX 9: versions ONLY via importlib.metadata (pyotp does
