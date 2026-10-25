@@ -4,6 +4,121 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-10-25 (v6.5) - THE PROFILE-EXCLUSIVE DATA FIX (the user's
+  report: 'you made a GLOBAL default fastly_cookie for some reason,
+  which makes no sense at all. When a new account is added, a NEW
+  fastly_cookie and other parameters that can belong ONLY to a
+  separate profile must be obtained/created and can never cross').
+  ONE correction of the v6.4 profile model; every algorithm NOT
+  listed here is UNTOUCHED (the sign-in chain, the Fastly solver,
+  the probe/engine design, the TLS matrix, the hotkey UX and the
+  whole feature set stay exactly as v6.4 left them):
+
+  1) THE FASTLY COOKIE AND THE SING-BOX CONFIGS ARE PROFILE-EXCLUSIVE
+     AND ARE NEVER STORED OUTSIDE AN ACCOUNT ENTRY. The v6.4
+     'profile_defaults' placeholder could also hold them (while no
+     account existed yet) - WRONG: a cookie/config of profile A can
+     never be inherited or reused by profile B. The placeholder now
+     holds the SETTINGS ONLY (language/resolver/filter - preferences
+     that may legitimately be configured before the first sign-in
+     and adopted by the first account). The exclusive roots
+     ('fastly_cookie', 'singbox_configs') have NO placeholder at
+     all: while their account does not exist yet (the sign-in of a
+     NEW account solves its FIRST Fastly challenge BEFORE its entry
+     is created) the value is STAGED in memory (_PENDING_PROFILE)
+     and flushed into the account entry the moment it is created
+     (save_cache/cache_account); with no account the value is
+     dropped - a NEW account therefore always receives its OWN
+     fresh cookie and configs, and the previous profile's data
+     stays untouched.
+
+  2) THE SIGN-IN BINDS THE EXCLUSIVE DATA TO THE ACCOUNT BEING
+     SIGNED IN, not to whoever is 'current' at that moment (the '+'
+     flow of the 'a' menu signs in a NEW account while the previous
+     one is still current; a plain --email start does the same):
+     _SIGNIN_EMAIL routes cfg_get/cfg_set of the exclusive roots to
+     the signing-in account for the duration of the actual login
+     call, so its FIRST cookie lands in ITS entry (via the staging
+     stash), never in the previous profile's.
+
+  3) THE '+' FLOW (a new account = a new profile) STARTS CLEAN:
+     the in-memory HTTP session (the cookie jar with the previous
+     profile's Fastly cookie, the challenge latch) is reset
+     (_reset_fastly_session - the same v5.23 sequence
+     wipe_all_saved_data uses) and the local-proxy engine is
+     stopped, so the sign-in obtains a FRESH cookie bound to the
+     new account and the engine is rebuilt from ITS tokens, filter
+     and configs after the sign-in.
+
+  4) A SIGN-IN THAT SWITCHES THE ACCOUNT NOW APPLIES THE NEW
+     PROFILE (the watch loop detects current != the profile of the
+     moment and runs apply_profile_runtime: the language, the
+     resolver and the Fastly cookie of the NEW account, plus an
+     engine rebuild). Covers the '+' flow and a plain --email start
+     against a stored different current account; token refreshes
+     and re-logins of the SAME account trigger nothing.
+
+  5) MIGRATION: a pre-v6.4 GLOBAL fastly_cookie/singbox_configs of
+     a file with NO account is DROPPED (it belongs to nobody; a
+     fresh cookie is obtained at the next sign-in); with a current
+     account it folds into that account as before. Pre-v6.5
+     exclusive leftovers inside 'profile_defaults' are cleaned on
+     load. The first-run file migration (fastly-cookie.json) goes
+     into the CURRENT account's entry only, never the placeholder.
+
+VERSION 2026-10-25 (v6.4) - THE PROFILE-BOUND UBER-CONFIG (one user-requested
+  change; every algorithm NOT listed here is UNTOUCHED - the sign-in
+  chain, the Fastly solver, the probe/engine design, the TLS matrix,
+  the hotkey UX and the whole feature set are preserved exactly as
+  v6.3 left them):
+
+  1) EVERY ACCOUNT IS A PROFILE, AND EVERY CONFIGURATION BELONGS TO A
+     PROFILE (the user's report: 'fastly_cookie is not bound to the
+     account in your config. That cannot be: the accounts in
+     config.json are profiles, and all their configs must belong to
+     them and change with them - including every setting like doh and
+     the language. And the sing-box settings belong to the profiles
+     too'). THE LAYOUT CHANGE (config.json, CONFIG_VERSION 2):
+       * the Fastly WAF cookie, the settings section (doh, doh_cache,
+         lang, countries_filter, singbox_declined) and the sing-box
+         outbound configs now live INSIDE the account entry they
+         belong to (config.json['accounts'][email]['fastly_cookie'],
+         [...]['settings'], [...]['singbox_configs']);
+       * a pre-v6.4 config.json is migrated on the first load: the
+         old GLOBAL top-level sections are folded into the CURRENT
+         account's entry (the only profile that could have been using
+         them), or into the 'profile_defaults' placeholder when the
+         file has no account yet;
+       * while NO current account exists (a fresh install before the
+         first sign-in), the profile-scoped settings live in the
+         top-level 'profile_defaults' section; the FIRST account the
+         script ever creates ADOPTS them (its own values win for
+         keys it already has), so nothing is ever lost;
+       * the ACCESS LAYER is unchanged for every caller: cfg_get()/
+         cfg_set() transparently route the ('settings', ...),
+         ('fastly_cookie', ...) and ('singbox_configs', ...) paths to
+         the profile node of the CURRENT account (or to
+         profile_defaults while there is none) - every existing
+         consumer (the 'h'/'y'/'w' menus, the DoH chain, the language
+         switcher, the sing-box engine, the Fastly cookie cache, the
+         countries filter) keeps working verbatim;
+       * SWITCHING the profile (hotkey 'a', --select-account, the
+         auto-switch after deleting the current account) now re-applies
+         the whole profile at runtime: the saved language, the saved
+         DoH resolver (an explicit --lang/--doh/--doh-url argument of
+         this run still wins, exactly like at startup), the countries
+         filter and the sing-box configs of the newly selected
+         account, plus its Fastly cookie - the in-memory cookie jar,
+         the opener and the challenge latch are reset first (the same
+         v5.23 sequence wipe_all_saved_data uses) so the cookie of
+         profile A can never leak into the session of profile B; the
+         local-proxy engine is stopped so the next watch-loop
+         iteration rebuilds it from the NEW profile's configs and
+         filter;
+       * the wipe contract is unchanged: clear_all_caches() keeps the
+         account store - which now carries the profiles' settings,
+         cookies and sing-box configs with it.
+
 VERSION 2026-10-25 (v6.3) - THE Ctrl+O FIX (it really DID conflict with
   the plain 'o' on Windows) + THE ORIGINAL HINT STYLING of the Ctrl
   combinations (two user-reported items; everything else is untouched
@@ -2360,7 +2475,7 @@ def system_dns_fallback() -> bool:
     return _system_dns_fallback
 
 # v5.28: the SYSTEM-RESOLVER-BROKEN detector. In the PACKAGED binary on
-# Android (Nuitka/PyInstaller on arm, e.g. mozvpn_beta-termux-armv9)
+# Android (Nuitka/PyInstaller on arm, e.g. mozvpn-termux-armv9)
 # socket.getaddrinfo can be PERSISTENTLY broken - every name fails with
 # gaierror 'No address associated with hostname' (EAI_NODATA) while
 # nslookup/the browser/the PLAIN python script work fine on the same
@@ -2903,14 +3018,14 @@ STR = {
   "doh_geo_mismatch": "Geo check: {hp} exits in {geo} ({city}), but the location is {cc} ({cname}). The egress PoP is reached via a wrong route (usually a geo-wrong DNS answer); the IPv6 route may still show the right country.",
   "doh_geo_ok": "Geo check: {hp} exits in {geo} ({city}) \u2014 matches the location {cc}.",
   "doh_menu_hint": "Choose the DNS resolver {_e} \u2014 type its number/letter and press Enter (Backspace deletes, any other key cancels):",
-  "lang_menu_hint": "Choose the interface language {_e} \u2014 type its number and press Enter (current: {cur}). Option 0 resets to the DEFAULT language and clears the saved choice. The choice is saved to config.json (settings.lang) and survives restarts (Backspace deletes, any other key cancels; the menu exits automatically after applying).",
+  "lang_menu_hint": "Choose the interface language {_e} \u2014 type its number and press Enter (current: {cur}). Option 0 resets to the DEFAULT language and clears the saved choice. The choice is saved to config.json (settings.lang of the current profile) and survives restarts (Backspace deletes, any other key cancels; the menu exits automatically after applying).",
   "lang_menu_entry": "  {n} - {desc}",
   "lang_default_desc": "DEFAULT language (English) - resets the saved choice",
-  "lang_set": "Interface language {_e}: {lang} \u2014 saved to config.json (settings.lang), survives restarts.",
+  "lang_set": "Interface language {_e}: {lang} \u2014 saved to config.json (settings.lang of the current profile), survives restarts.",
   "lang_reset": "Interface language {_e}: reset to the DEFAULT ({lang}) \u2014 the saved choice is cleared.",
   "doh_menu_entry": "  {n} - {name}{url}",
   "doh_default_desc": "DEFAULT",
-  "doh_default_applied": "DNS resolver {_e}: switched to the DEFAULT provider ({provider}). The choice is saved to the config directory (config.json, settings.doh) and survives restarts.",
+  "doh_default_applied": "DNS resolver {_e}: switched to the DEFAULT provider ({provider}). The choice is saved to the config directory (config.json, settings.doh of the current profile) and survives restarts.",
   "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} \u2014 new upstream connections use it immediately (the sing-box engine resolves on its own).",
   "hotkey_doh_cache": "Hotkey 'k': DoH cache {state} (mirrors --doh-cache).",
   "select_hint": "Type the number/letter of an item, then press Enter. Backspace deletes the last character, any other key cancels.",
@@ -2937,6 +3052,7 @@ STR = {
   "accounts_choice_prompt": "Account number/letter (Enter = cancel): ",
   "accounts_bad_token": "There is no account with that token - cancelled.",
   "account_switched": "Switched to the account {_e}: {email} ({session}).",
+  "profile_applied": "Profile settings applied {_e}: {email} - the language, the DNS resolver, the proxy selection, the sing-box configs and the Fastly cookie of the profile are now active.",
   "account_session_used": "the cached sessionToken will be tried first, then a fresh sign-in",
   "account_session_fresh": "a fresh sign-in with the cached login/password",
   "account_cached": "Account cached {_e}: {email} (config.json).",
@@ -2989,7 +3105,7 @@ STR = {
   "unexpected_error": "Unexpected error: {err!r} - retrying in 30s.",
   "next_refresh": "Next refresh {_e} in {sec}s ({at} UTC).",
   "confirm_exit_hint": "Press Ctrl+C to stop.",
-  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \U0001f503 r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache)\n  \U0001f4c2 o - open the config directory (config.json lives there)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f4f7 g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - account menu: switch to another CACHED Mozilla account, '+' adds a NEW account, '-' deletes one (config.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \U0001f4bf s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme)\n  \U0001f308 n - toggle the colored log output on/off (--no-color)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1-9 - open a config file (the settings of config.json) in the system default editor\n  \U0001f4c6 z - the FULL config-file menu with a hotkey for EVERY file (letters for the files past the ninth)\n  \U0001f50d Ctrl+O - find & remove every leftover of the OLD config format (--clean-old-config)\n  \u23f9\ufe0f Ctrl+C - stop the script (the first press stops immediately; --confirm-exit requires a second press within 5 s)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q - stop.",
+  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \U0001f503 r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache)\n  \U0001f4c2 o - open the config directory (config.json lives there)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f4f7 g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - account menu: switch to another CACHED Mozilla account ('+' adds a NEW one, '-' deletes one) - the WHOLE profile switches with it: the DNS resolver, the language, the proxy selection, the sing-box configs and the Fastly cookie (config.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \U0001f4bf s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme)\n  \U0001f308 n - toggle the colored log output on/off (--no-color)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1-9 - open a config file (the settings of config.json) in the system default editor\n  \U0001f4c6 z - the FULL config-file menu with a hotkey for EVERY file (letters for the files past the ninth)\n  \U0001f50d Ctrl+O - find & remove every leftover of the OLD config format (--clean-old-config)\n  \u23f9\ufe0f Ctrl+C - stop the script (the first press stops immediately; --confirm-exit requires a second press within 5 s)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q - stop.",
   "hotkey_relogin": "Hotkey 'r' \u267b\ufe0f: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
   "hotkey_clear": "Hotkey 'c' \U0001f9f9: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
   "hotkey_engine": "Hotkey 'e': switching the engine to {engine} - local proxies will restart with it.",
@@ -3228,14 +3344,14 @@ STR = {
   "doh_geo_mismatch": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}), \u0430 \u043b\u043e\u043a\u0430\u0446\u0438\u044f \u2014 {cc} ({cname}). \u0410\u043f\u0441\u0442\u0440\u0438\u043c \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442\u0441\u044f \u043f\u043e \u043d\u0435\u0432\u0435\u0440\u043d\u043e\u043c\u0443 \u043c\u0430\u0440\u0448\u0440\u0443\u0442\u0443 (\u043e\u0431\u044b\u0447\u043d\u043e \u0438\u0437-\u0437\u0430 \u0433\u0435\u043e-\u043d\u0435\u0432\u0435\u0440\u043d\u043e\u0433\u043e DNS-\u043e\u0442\u0432\u0435\u0442\u0430); \u043c\u0430\u0440\u0448\u0440\u0443\u0442 \u043f\u043e IPv6 \u043c\u043e\u0436\u0435\u0442 \u043f\u0440\u0438 \u044d\u0442\u043e\u043c \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u0443\u044e \u0441\u0442\u0440\u0430\u043d\u0443.",
   "doh_geo_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}) \u2014 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u0441 \u043b\u043e\u043a\u0430\u0446\u0438\u0435\u0439 {cc}.",
   "doh_menu_hint": "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442):",
-  "lang_menu_hint": "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u044F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043E \u043D\u043E\u043C\u0435\u0440 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 Enter (\u0442\u0435\u043A\u0443\u0449\u0438\u0439: {cur}). \u041E\u043F\u0446\u0438\u044F 0 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u043D\u0430 \u044F\u0437\u044B\u043A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E \u0438 \u043E\u0447\u0438\u0449\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440. \u0412\u044B\u0431\u043E\u0440 \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u0435\u0442\u0441\u044F \u0432 config.json (settings.lang) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u043E\u0432 (Backspace \u0443\u0434\u0430\u043B\u044F\u0435\u0442, \u043B\u044E\u0431\u0430\u044F \u0434\u0440\u0443\u0433\u0430\u044F \u043A\u043B\u0430\u0432\u0438\u0448\u0430 \u043E\u0442\u043C\u0435\u043D\u044F\u0435\u0442; \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u0438\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u043C\u0435\u043D\u044E \u0437\u0430\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438).",
+  "lang_menu_hint": "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u044F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043E \u043D\u043E\u043C\u0435\u0440 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 Enter (\u0442\u0435\u043A\u0443\u0449\u0438\u0439: {cur}). \u041E\u043F\u0446\u0438\u044F 0 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u043D\u0430 \u044F\u0437\u044B\u043A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E \u0438 \u043E\u0447\u0438\u0449\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440. \u0412\u044B\u0431\u043E\u0440 \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u0435\u0442\u0441\u044F \u0432 config.json (settings.lang \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u043E\u0432 (Backspace \u0443\u0434\u0430\u043B\u044F\u0435\u0442, \u043B\u044E\u0431\u0430\u044F \u0434\u0440\u0443\u0433\u0430\u044F \u043A\u043B\u0430\u0432\u0438\u0448\u0430 \u043E\u0442\u043C\u0435\u043D\u044F\u0435\u0442; \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u0438\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u043C\u0435\u043D\u044E \u0437\u0430\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438).",
   "lang_menu_entry": "  {n} - {desc}",
   "lang_default_desc": "\u042F\u0417\u042B\u041A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E (\u0430\u043D\u0433\u043B\u0438\u0439\u0441\u043A\u0438\u0439) \u2014 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440",
-  "lang_set": "\u042F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e}: {lang} \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u0432 config.json (settings.lang), \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u043E\u0432.",
+  "lang_set": "\u042F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e}: {lang} \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u0432 config.json (settings.lang \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f), \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u043E\u0432.",
   "lang_reset": "\u042F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e}: \u0441\u0431\u0440\u043E\u0448\u0435\u043D \u043D\u0430 \u044F\u0437\u044B\u043A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E ({lang}) \u2014 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440 \u043E\u0447\u0438\u0449\u0435\u043D.",
   "doh_menu_entry": "  {n} - {name}{url}",
   "doh_default_desc": "\u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e",
-  "doh_default_applied": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e ({provider}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 config.json (settings.doh) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u043e\u0432.",
+  "doh_default_applied": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e ({provider}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 config.json (settings.doh \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u043e\u0432.",
   "hotkey_doh": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'h': DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 {provider} \u2014 \u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u043c \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e \u0441\u0440\u0430\u0437\u0443 (\u0434\u0432\u0438\u0436\u043e\u043a sing-box \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0441\u0430\u043c).",
   "hotkey_doh_cache": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'k': \u043a\u044d\u0448 DoH {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --doh-cache).",
   "select_hint": "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u043f\u0443\u043d\u043a\u0442\u0430 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 \u0432\u044b\u0431\u043e\u0440.",
@@ -3262,6 +3378,7 @@ STR = {
   "accounts_choice_prompt": "\u041d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0430 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 (Enter = \u043e\u0442\u043c\u0435\u043d\u0430): ",
   "accounts_bad_token": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u0441 \u0442\u0430\u043a\u0438\u043c \u0442\u043e\u043a\u0435\u043d\u043e\u043c \u043d\u0435\u0442 - \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.",
   "account_switched": "\u041f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 \u043d\u0430 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 {_e}: {email} ({session}).",
+  "profile_applied": "\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u043f\u0440\u043e\u0444\u0438\u043b\u044f \u043f\u0440\u0438\u043c\u0435\u043d\u0435\u043d\u044b {_e}: {email} \u2014 \u0435\u0433\u043e \u044f\u0437\u044b\u043a, DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440, \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438, \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 sing-box \u0438 cookie Fastly \u0442\u0435\u043f\u0435\u0440\u044c \u0430\u043a\u0442\u0438\u0432\u043d\u044b.",
   "account_session_used": "\u0441\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u0440\u043e\u0431\u0443\u0435\u0442\u0441\u044f \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 sessionToken, \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434",
   "account_session_fresh": "\u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434 \u0441 \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u043c \u043b\u043e\u0433\u0438\u043d\u043e\u043c/\u043f\u0430\u0440\u043e\u043b\u0435\u043c",
   "account_cached": "\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u0437\u0430\u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d {_e}: {email} (config.json).",
@@ -3314,7 +3431,7 @@ STR = {
   "unexpected_error": "\u041d\u0435\u043f\u0440\u0435\u0434\u0432\u0438\u0434\u0435\u043d\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {err!r} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u044e \u0447\u0435\u0440\u0435\u0437 30 \u0441.",
   "next_refresh": "\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 {_e} \u0447\u0435\u0440\u0435\u0437 {sec} \u0441 ({at} UTC).",
   "confirm_exit_hint": "Ctrl+C \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438.",
-  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \U0001f503 r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 (\u0442\u0430\u043c \u043b\u0435\u0436\u0438\u0442 config.json)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f4f7 g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043c\u0435\u043d\u044e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442, '+' \u2014 \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u041d\u041e\u0412\u042b\u0419, '-' \u2014 \u0443\u0434\u0430\u043b\u0438\u0442\u044c (config.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \U0001f4bf s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1-9 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u043a\u043e\u043d\u0444\u0438\u0433\u0430 (\u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u0438\u0437 config.json) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u041f\u041e\u041b\u041d\u041e\u0415 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0430\u0446\u0438\u0438: \u0433\u043e\u0440\u044f\u0447\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u0434\u043b\u044f \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0444\u0430\u0439\u043b\u0430 (\u0431\u0443\u043a\u0432\u044b \u0434\u043b\u044f \u0444\u0430\u0439\u043b\u043e\u0432 \u0434\u0430\u043b\u044c\u0448\u0435 \u0434\u0435\u0432\u044f\u0442\u043e\u0433\u043e)\n  \U0001f50d Ctrl+O \u2014 \u043d\u0430\u0439\u0442\u0438 \u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u0442\u043a\u0438 \u0421\u0422\u0410\u0420\u041e\u0413\u041e \u0444\u043e\u0440\u043c\u0430\u0442\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (--clean-old-config)\n  \u23f9\ufe0f Ctrl+C \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043f\u0442 (\u043f\u0435\u0440\u0432\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442 \u0441\u0440\u0430\u0437\u0443; \u0441 --confirm-exit \u043d\u0443\u0436\u043d\u043e \u0432\u0442\u043e\u0440\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
+  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \U0001f503 r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 (\u0442\u0430\u043c \u043b\u0435\u0436\u0438\u0442 config.json)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f4f7 g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043c\u0435\u043d\u044e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 ('+' \u2014 \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u041d\u041e\u0412\u042b\u0419, '-' \u2014 \u0443\u0434\u0430\u043b\u0438\u0442\u044c) \u2014 \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 \u043d\u0438\u043c \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u0412\u0415\u0421\u042c \u043f\u0440\u043e\u0444\u0438\u043b\u044c: DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440, \u044f\u0437\u044b\u043a, \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438, \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 sing-box \u0438 cookie Fastly (config.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \U0001f4bf s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1-9 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u043a\u043e\u043d\u0444\u0438\u0433\u0430 (\u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u0438\u0437 config.json) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u041f\u041e\u041b\u041d\u041e\u0415 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0430\u0446\u0438\u0438: \u0433\u043e\u0440\u044f\u0447\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u0434\u043b\u044f \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0444\u0430\u0439\u043b\u0430 (\u0431\u0443\u043a\u0432\u044b \u0434\u043b\u044f \u0444\u0430\u0439\u043b\u043e\u0432 \u0434\u0430\u043b\u044c\u0448\u0435 \u0434\u0435\u0432\u044f\u0442\u043e\u0433\u043e)\n  \U0001f50d Ctrl+O \u2014 \u043d\u0430\u0439\u0442\u0438 \u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u0442\u043a\u0438 \u0421\u0422\u0410\u0420\u041e\u0413\u041e \u0444\u043e\u0440\u043c\u0430\u0442\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (--clean-old-config)\n  \u23f9\ufe0f Ctrl+C \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043f\u0442 (\u043f\u0435\u0440\u0432\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442 \u0441\u0440\u0430\u0437\u0443; \u0441 --confirm-exit \u043d\u0443\u0436\u043d\u043e \u0432\u0442\u043e\u0440\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
   "hotkey_relogin": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'r' \u267b\ufe0f: \u041f\u041e\u041b\u041d\u041e\u0415 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435 \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 \u2014 \u043a\u044d\u0448\u0435\u0439, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u043e\u0432, \u043a\u043e\u043d\u0444\u0438\u0433\u043e\u0432 sing-box \u2014 \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434.",
   "hotkey_clear": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'c' \U0001f9f9: \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0443\u0434\u0430\u043b\u0435\u043d\u044b (\u043a\u044d\u0448\u0438, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u044b, \u043a\u043e\u043d\u0444\u0438\u0433\u0438 sing-box) \u2014 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u044e\u0441\u044c \u0441 \u0447\u0438\u0441\u0442\u043e\u0433\u043e \u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u044f.",
   "hotkey_engine": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'e': \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u044e \u0434\u0432\u0438\u0436\u043e\u043a \u043d\u0430 {engine} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
@@ -3635,6 +3752,7 @@ _EMOJI = {
     "accounts_qr_dir": "\U0001F5BC\uFE0F ",
     "accounts_menu_hint": "\U0001F465 ",
     "account_switched": "\U0001F465 ",
+    "profile_applied": "\U0001F9F1 ",
     "account_cached": "\U0001F465 ",
     "account_qr_saved": "\U0001F5BC\uFE0F ",
     "accounts_json_saved": "\U0001F4BE ",
@@ -5178,13 +5296,16 @@ def _chmod600(path: str):
 # ---------------------------------------------------------------------------
 # v6.0: THE UBER-CONFIG STORE. Every persisted configuration lives in the
 # ONE plain-text file CONFIG_FILE (next to this script by default; the
-# --config FILE parameter of v6.1 points it anywhere else; chmod 600):
+# --config FILE parameter of v6.1 points it anywhere else; chmod 600).
+# v6.4: EVERY ACCOUNT IS A PROFILE - the Fastly WAF cookie, the settings
+# and the sing-box configs live INSIDE the account entry they belong to
+# and switch with it (CONFIG_VERSION 2):
 #   {
-#     "version": 1,                   # the store format version
+#     "version": 2,                   # the store format version
 #     "first_run": false,            # TRUE until the first run has finished
 #                                     # its one-time migration
 #     "migrated_at": "2026-...",     # when that migration ran
-#     "current_account": "a@b.c",    # the account of this run
+#     "current_account": "a@b.c",    # the profile of this run
 #     "accounts": {                  # EVERY cached account, in PLAIN TEXT:
 #         "a@b.c": {"password": "...", "totp_secret": "...",
 #                    "totp_digits": 6, "totp_period": 30,
@@ -5193,13 +5314,26 @@ def _chmod600(path: str):
 #                                                # session.json duplicate
 #                                                # is gone)
 #                    "qr_png_base64": "...",     # the 2FA QR image
-#                    "saved_at": "2026-..."}
+#                    "saved_at": "2026-...",
+#                    # v6.4: the PROFILE data of this account -
+#                    "settings": {"doh": "cloudflare", "doh_cache": false,
+#                                 "lang": "en",
+#                                 "countries_filter": {"countries": [...],
+#                                                      "keys": [...]},
+#                                 "singbox_declined": false},
+#                    "fastly_cookie": {"name": "...", "value": "...",
+#                                      "expiresAt": ...},
+#                    "singbox_configs": {"moz-us-nyc-20001-0.json":
+#                                        { ... outbound ... }}}
 #     },
-#     "settings": {"doh": "cloudflare", "doh_cache": false, "lang": "en",
-#                  "countries_filter": {"countries": [...], "keys": [...]},
-#                  "singbox_declined": false},
-#     "fastly_cookie": {"name": "...", "value": "...", "expiresAt": ...},
-#     "singbox_configs": {"moz-us-nyc-20001-0.json": { ... outbound ... }}
+#     "profile_defaults": {}         # v6.4/v6.5: the SETTINGS (never the
+#                                     # Fastly cookie / sing-box configs -
+#                                     # those are PROFILE-EXCLUSIVE and
+#                                     # live ONLY inside account entries)
+#                                     # while NO current account exists
+#                                     # yet (a fresh install before the
+#                                     # first sign-in); the FIRST account
+#                                     # the script creates ADOPTS them
 #   }
 # All user data stays in PLAIN TEXT exactly like the old files (explicit
 # user decision). Writes are ATOMIC (tmp file + os.replace), so a crash
@@ -5210,25 +5344,71 @@ def _chmod600(path: str):
 # copy of every value (per account).
 # ---------------------------------------------------------------------------
 
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 _CFG = None                    # the in-memory config.json (loaded lazily)
 _CFG_LOCK = threading.Lock()
 
+# v6.4: the config roots that are PROFILE data. cfg_get()/cfg_set() route
+# these three roots to the profile node of the CURRENT account - every
+# existing caller keeps its ('settings', ...)/('fastly_cookie', ...)/
+# ('singbox_configs', ...) paths and just works against the profile of
+# the moment.
+# v6.5: the roots are of TWO kinds now:
+#   * 'settings' - a PREFERENCE (language, resolver, filter, the
+#     sing-box decline marker): while NO account exists yet (a fresh
+#     install before the first sign-in) its values live in the
+#     top-level 'profile_defaults' placeholder and the FIRST account
+#     adopts them (nothing configured before the first sign-in is
+#     ever lost);
+#   * 'fastly_cookie' and 'singbox_configs' - PROFILE-EXCLUSIVE data
+#     (the user's own rule: a profile's data can never cross into
+#     another profile): they are NEVER stored outside an account
+#     entry - there is NO placeholder for them. While the account
+#     they belong to does not exist yet (the sign-in of a NEW account
+#     solves its FIRST Fastly challenge BEFORE its entry is created)
+#     the value is STAGED in the in-memory _PENDING_PROFILE stash and
+#     flushed into the account entry the moment it is created; a NEW
+#     account therefore always receives its OWN fresh cookie/configs,
+#     and the previous profile's data stays untouched.
+_PROFILE_ROOTS = ("settings", "fastly_cookie", "singbox_configs")
+# v6.5: the EXCLUSIVE roots - routed to the account being signed in /
+# the current one, never to the 'profile_defaults' placeholder.
+_PROFILE_EXCLUSIVE_ROOTS = ("fastly_cookie", "singbox_configs")
+
+# v6.5: the account being signed IN right now. During its sign-in the
+# Fastly challenge may be solved (and its cookie saved) BEFORE the
+# account is made current (the '+' flow of the 'a' menu signs in a NEW
+# account while the PREVIOUS one is still current) - the exclusive
+# roots route to THIS email then, not to the current one. Set around
+# the actual login call in ensure_session, cleared afterwards.
+_SIGNIN_EMAIL = None
+
+# v6.5: email -> {root: value} - the PROFILE-EXCLUSIVE data staged in
+# memory while its account entry does not exist yet; flushed into the
+# entry at account creation (save_cache/cache_account), dropped when
+# the sign-in fails.
+_PENDING_PROFILE = {}
+
 def cfg_default() -> dict:
     """A fresh, empty uber-config (first_run=True until the initial
-    migration of the very first run has completed)."""
+    migration of the very first run has completed). v6.4: no GLOBAL
+    settings/cookie/singbox sections anymore - they live inside the
+    account entries; 'profile_defaults' holds the SETTINGS only, and
+    only while no account exists yet (v6.5: the Fastly cookie and the
+    sing-box configs are PROFILE-EXCLUSIVE and are never stored
+    outside an account entry)."""
     return {"version": CONFIG_VERSION,
             "first_run": True,
             "migrated_at": None,
             "current_account": None,
             "accounts": {},
-            "settings": {},
-            "fastly_cookie": None,
-            "singbox_configs": {}}
+            "profile_defaults": {}}
 
 def cfg_load() -> dict:
     """Load config.json into memory (once); a missing/corrupt file yields
-    the fresh default. Returns the in-memory store."""
+    the fresh default. Returns the in-memory store. v6.4: a file of the
+    pre-v6.4 layout (GLOBAL settings/fastly_cookie/singbox_configs) is
+    folded into the profile it belongs to on the first load."""
     global _CFG
     if _CFG is not None:
         return _CFG
@@ -5246,6 +5426,7 @@ def cfg_load() -> dict:
         for k, v in base.items():
             data.setdefault(k, v)
     _CFG = data
+    _migrate_profile_layout()
     return _CFG
 
 def cfg_save():
@@ -5264,10 +5445,106 @@ def cfg_save():
         except OSError:
             pass                # a read-only config dir must not crash the run
 
+def _profile_email():
+    """v6.5: the account whose PROFILE data is being accessed RIGHT
+    NOW: the account being signed IN takes precedence (during its
+    sign-in its exclusive data must bind to IT, even though it is
+    not current yet - and may not even exist in config.json), then
+    the current account. None when neither exists."""
+    em = (_SIGNIN_EMAIL or cfg_current_email() or "").strip().lower()
+    return em or None
+
+def _pending_root(root):
+    """v6.5: the PROFILE-EXCLUSIVE section staged in memory for the
+    account of the moment (its entry does not exist yet - the sign-in
+    of a NEW account). Returns the staged section dict or None."""
+    em = _profile_email()
+    if not em:
+        return None
+    pend = _PENDING_PROFILE.get(em)
+    if not isinstance(pend, dict):
+        return None
+    v = pend.get(root)
+    return v if isinstance(v, dict) else None
+
+def _flush_pending_profile_data(email: str):
+    """v6.5: move the PROFILE-EXCLUSIVE data staged in memory (the
+    FIRST Fastly cookie of a brand-new account, solved during its
+    sign-in BEFORE its entry existed) into that account's entry -
+    called the moment the entry is created/made current. A no-op when
+    nothing is staged; the stash is dropped when there is still no
+    entry to own it (the sign-in failed - the cookie belongs to
+    nobody and a fresh one is solved next time)."""
+    em = (email or "").strip().lower()
+    if not em:
+        return
+    pend = _PENDING_PROFILE.pop(em, None)
+    if not isinstance(pend, dict) or not pend:
+        return
+    acc = cfg_accounts().get(em)
+    if not isinstance(acc, dict):
+        return              # no profile to own it - drop the stash
+    for root in _PROFILE_EXCLUSIVE_ROOTS:
+        v = pend.get(root)
+        if v in (None, {}, ""):
+            continue
+        if not acc.get(root):
+            acc[root] = v
+    cfg_save()
+
+def _profile_node(root=None):
+    """v6.4/v6.5: the dict holding the PROFILE data being accessed -
+    the entry of the account being signed in (it takes precedence
+    DURING its sign-in) or of the current account. While NO such
+    account exists: for the 'settings' root the top-level
+    'profile_defaults' placeholder is the target (the language/
+    resolver may be configured before the first sign-in; the FIRST
+    account adopts them); for the PROFILE-EXCLUSIVE roots
+    (fastly_cookie, singbox_configs) there is NO target - None (their
+    values are never shared between profiles: a NEW account always
+    receives a NEW fresh cookie/configs; the value is staged in
+    memory instead, see cfg_set/_PENDING_PROFILE). Never returns
+    None for 'settings'."""
+    em = _profile_email()
+    acc = cfg_accounts().get(em) if em else None
+    if isinstance(acc, dict):
+        return acc
+    if root in (None, "settings"):
+        store = cfg_load()
+        pd = store.get("profile_defaults")
+        if not isinstance(pd, dict):
+            pd = {}
+            store["profile_defaults"] = pd
+        return pd
+    return None
+
 def cfg_get(path, default=None):
     """Read a value from the store; path is a tuple of keys
-    (e.g. ("settings", "doh") or ("fastly_cookie",))."""
+    (e.g. ("settings", "doh") or ("fastly_cookie",)). v6.4: the PROFILE
+    roots ("settings", "fastly_cookie", "singbox_configs") are routed
+    to the profile of the moment - the account being signed in, else
+    the current one. v6.5: the 'settings' root falls back to the
+    'profile_defaults' placeholder while no account exists; the
+    EXCLUSIVE roots (fastly_cookie, singbox_configs) have NO
+    placeholder - while their account does not exist yet the staged
+    in-memory copy is returned instead."""
+    path = tuple(path)
     node = cfg_load()
+    if path and path[0] in _PROFILE_ROOTS:
+        if path[0] == "settings":
+            section = _profile_node("settings").get(path[0])
+        else:
+            owner = _profile_node(path[0])
+            if isinstance(owner, dict):
+                section = owner.get(path[0])
+            else:
+                # v6.5: no account entry owns it (yet) - the only
+                # copy is the staged one of the sign-in in progress
+                section = _pending_root(path[0])
+        if not isinstance(section, dict):
+            return default
+        node = section
+        path = path[1:]
     for k in path:
         if not isinstance(node, dict) or k not in node:
             return default
@@ -5276,17 +5553,59 @@ def cfg_get(path, default=None):
 
 def cfg_set(path, value):
     """Write a value into the store and SAVE config.json at once.
-    value=None REMOVES the key (no null clutter in the file)."""
+    value=None REMOVES the key (no null clutter in the file). v6.4: the
+    PROFILE roots ("settings", "fastly_cookie", "singbox_configs") are
+    routed to the profile node of the CURRENT account (or to the
+    'profile_defaults' placeholder while no account exists). v6.5: the
+    EXCLUSIVE roots (fastly_cookie, singbox_configs) route to the
+    account being signed in / the current one and have NO placeholder -
+    while that account does not exist yet the value is STAGED in the
+    in-memory _PENDING_PROFILE stash (flushed into the entry at its
+    creation, dropped when the sign-in fails); with no account to own
+    it at all the write is skipped (the in-memory session state still
+    carries it for this run)."""
+    path = tuple(path)
+    if not path:
+        return
     with _CFG_LOCK:
         node = cfg_load()
-        for k in path[:-1]:
-            node = node.setdefault(k, {})
-            if not isinstance(node, dict):
-                raise ValueError(f"config path {'/'.join(path)} not writable")
-        if value is None:
-            node.pop(path[-1], None)
-        else:
-            node[path[-1]] = value
+        if path[0] in _PROFILE_ROOTS:
+            if path[0] == "settings":
+                owner = _profile_node("settings")
+            else:
+                owner = _profile_node(path[0])
+                if owner is None:
+                    # v6.5: PROFILE-EXCLUSIVE data of an account that
+                    # does not exist yet (the sign-in of a NEW account
+                    # solves its FIRST Fastly challenge before its
+                    # entry is created) - stage it in memory; it is
+                    # flushed into the entry at creation and dropped
+                    # when the sign-in fails
+                    em = _profile_email()
+                    if not em:
+                        return      # nobody can own this value
+                    owner = _PENDING_PROFILE.setdefault(em, {})
+            if len(path) == 1:
+                # the WHOLE profile root (e.g. the fastly_cookie object)
+                if value is None:
+                    owner.pop(path[0], None)
+                else:
+                    owner[path[0]] = value
+                path = ()
+            else:
+                node = owner.setdefault(path[0], {})
+                if not isinstance(node, dict):
+                    raise ValueError(f"config path {path[0]} not writable")
+                path = path[1:]
+        if path:
+            for k in path[:-1]:
+                node = node.setdefault(k, {})
+                if not isinstance(node, dict):
+                    raise ValueError(f"config path {'/'.join(path)} not writable")
+            if value is None:
+                node.pop(path[-1], None)
+            else:
+                node[path[-1]] = value
     cfg_save()
 
 def cfg_accounts() -> dict:
@@ -5313,8 +5632,174 @@ def cfg_current_account() -> dict:
     return acc if isinstance(acc, dict) else {}
 
 def cfg_set_current(email: str):
-    """Make an account current (creates no data - the entry must exist)."""
-    cfg_set(("current_account",), (email or "").strip().lower() or None)
+    """Make an account current (creates no data - the entry must exist).
+    v6.4: when the store still carries the PROVISIONAL profile
+    ('profile_defaults' - the settings saved while NO account existed),
+    the account ADOPTS it here: its own values win, the placeholder is
+    cleared."""
+    em = (email or "").strip().lower() or None
+    cfg_set(("current_account",), em)
+    if em:
+        _adopt_profile_defaults(em)
+
+def _adopt_profile_defaults(email: str):
+    """v6.4/v6.5: fold the PROVISIONAL profile ('profile_defaults' -
+    the SETTINGS saved while NO account existed: language, resolver,
+    the countries filter, the sing-box decline marker) into the
+    account that has just become current, then clear the placeholder.
+    The account's OWN values win for every key it already has; missing
+    keys are filled from the defaults. A no-op once the placeholder is
+    empty (every later cfg_set_current of the same account). The
+    PROFILE-EXCLUSIVE data (a Fastly cookie, sing-box configs) is
+    never adopted: v6.5 keeps it out of the placeholder entirely - a
+    NEW account always receives its OWN fresh cookie/configs."""
+    store = cfg_load()
+    pd = store.get("profile_defaults")
+    if not isinstance(pd, dict) or not pd:
+        return
+    em = (email or "").strip().lower()
+    accs = store.get("accounts")
+    acc = accs.get(em) if (isinstance(accs, dict) and em) else None
+    if isinstance(acc, dict):
+        v = pd.pop("settings", None)
+        if isinstance(v, dict) and v:
+            own = acc.get("settings")
+            if isinstance(own, dict):
+                merged = dict(v)
+                merged.update(own)       # the account's own values win
+                acc["settings"] = merged
+            else:
+                acc["settings"] = v
+    # v6.5: exclusive leftovers a pre-v6.5 file may carry inside the
+    # placeholder belong to NO profile (no account existed when they
+    # were saved) - drop them; a fresh cookie is obtained at the next
+    # sign-in and the configs are rebuilt from that account's proxies
+    for root in _PROFILE_EXCLUSIVE_ROOTS:
+        pd.pop(root, None)
+    store["profile_defaults"] = {}
+    cfg_save()
+
+def _migrate_profile_layout():
+    """v6.4 (CONFIG_VERSION 2): fold the pre-v6.4 GLOBAL sections of
+    config.json (the top-level 'settings'/'fastly_cookie'/
+    'singbox_configs') into the profile they belong to - the CURRENT
+    account's entry (the only profile that could have been using them).
+    v6.5: the 'settings' of a file with NO account yet go into the
+    'profile_defaults' placeholder (adopted by the first account); the
+    PROFILE-EXCLUSIVE sections (fastly_cookie, singbox_configs) of a
+    file with no account belong to NOBODY - they are dropped (a fresh
+    cookie is obtained at the next sign-in, the configs are rebuilt
+    from that account's proxies; the values can never be shared
+    between profiles). Runs on every load; the top-level sections are
+    REMOVED afterwards, which makes the check idempotent."""
+    store = cfg_load()          # _CFG is already set by the caller
+    legacy = {r: store.get(r) for r in _PROFILE_ROOTS if r in store}
+    if not legacy:
+        # v6.5: also clean the EXCLUSIVE leftovers a pre-v6.5 file may
+        # carry inside the 'profile_defaults' placeholder (they were
+        # saved while no account existed - no profile can own them)
+        pd = store.get("profile_defaults")
+        if isinstance(pd, dict):
+            for root in _PROFILE_EXCLUSIVE_ROOTS:
+                if root in pd:
+                    pd.pop(root, None)
+                    cfg_save()
+        return
+    # the target profile: the CURRENT account's entry, else the
+    # placeholder section (SETTINGS only)
+    em = cfg_current_email()
+    accs = store.get("accounts")
+    node = None
+    if em and isinstance(accs, dict) and isinstance(accs.get(em), dict):
+        node = accs[em]
+    else:
+        node = store.setdefault("profile_defaults", {})
+        if not isinstance(node, dict):
+            store["profile_defaults"] = {}
+            node = store["profile_defaults"]
+    for root, v in legacy.items():
+        store.pop(root, None)
+        if v in (None, {}, ""):
+            continue
+        if root == "settings" and isinstance(v, dict):
+            own = node.get(root)
+            if isinstance(own, dict):
+                merged = dict(v)
+                merged.update(own)   # the account's own values win
+                node[root] = merged
+            else:
+                node[root] = v
+        elif root in _PROFILE_EXCLUSIVE_ROOTS:
+            # v6.5: EXCLUSIVE data goes into the CURRENT account only;
+            # with no account it belongs to nobody and is dropped
+            # (never shared, never adopted by a future profile)
+            if node is not store.get("profile_defaults") \
+                    and not node.get(root):
+                node[root] = v
+        elif not node.get(root):
+            node[root] = v
+    if isinstance(store.get("version"), int) and store["version"] < CONFIG_VERSION:
+        store["version"] = CONFIG_VERSION
+    cfg_save()
+
+def _reset_fastly_session():
+    """v6.5: drop the in-memory HTTP session state (the cookie jar with
+    the PREVIOUS profile's Fastly cookie, the opener, the challenge
+    latch) so the NEXT profile starts with a CLEAN session - the cookie
+    of profile A must never be reused for profile B. The same sequence
+    wipe_all_saved_data uses (v5.23)."""
+    global COOKIE_JAR, _OPENER
+    COOKIE_JAR = http.cookiejar.CookieJar()
+    _OPENER = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(COOKIE_JAR))
+    _fastly_state["solved"] = False
+    _fastly_state["failed"] = False
+
+def apply_profile_runtime(args):
+    """v6.4: re-apply the settings of the CURRENT profile after a
+    profile switch (the hotkey 'a' selection, --select-account, the
+    auto-switch after deleting the current account, the sign-in of a
+    NEW account in the watch loop). The precedence is
+    exactly the startup one: an EXPLICIT --lang / --doh / --doh-url
+    argument of this run still wins; otherwise the SAVED choice of the
+    newly selected profile applies, else the MOZVPN_LANG / MOZVPN_DOH
+    environment variable, else the built-in default. The Fastly WAF
+    cookie is PROFILE-EXCLUSIVE data too: the in-memory cookie jar, the
+    opener and the challenge latch are reset first
+    (_reset_fastly_session, the same v5.23 sequence
+    wipe_all_saved_data uses), then the cookie of the NEW profile is
+    loaded - the session of profile A can never leak into profile B.
+    The effective values are mirrored back into the profile entry
+    (the v5.33 'settings exist from the very first run' contract).
+    The countries filter, the sing-box decline marker and the
+    sing-box configs need no in-memory handling: every consumer reads
+    them lazily through cfg_get() and therefore follows the profile of
+    the moment."""
+    # 1) the language of the profile
+    if not getattr(args, "lang", None):
+        saved = load_lang_cache()
+        set_language(saved
+                     or (os.environ.get("MOZVPN_LANG", "en").strip().lower()
+                         or "en"))
+    # 2) the DNS resolver of the profile
+    if not getattr(args, "doh_url", None) and not getattr(args, "doh", None):
+        saved = load_doh_provider_cache()
+        if saved is not None:
+            set_doh_provider(saved)      # '' = the saved system-DNS mode
+        else:
+            set_doh_provider(
+                (os.environ.get("MOZVPN_DOH", "cloudflare").strip().lower()
+                 or "cloudflare"))
+    # 3) the Fastly WAF cookie of the profile: reset the in-memory
+    #    session first, then load the cookie of the NEW profile
+    _reset_fastly_session()
+    load_fastly_cache()
+    # 4) mirror the effective settings into the profile entry (the
+    #    v5.33 'exists from the first run' contract), then report
+    if doh_provider() != "custom":
+        save_doh_provider_cache(doh_provider())
+    save_lang_cache(_LANG)
+    info(tr("profile_applied", email=cfg_current_email() or "-"))
 
 # ---------------------------------------------------------------------------
 # v6.0: the FIRST-RUN migration (req. 6) and the old-format cleanup
@@ -5395,36 +5880,46 @@ def migrate_old_config_if_first_run() -> bool:
             if not _CFG.get("current_account"):
                 _CFG["current_account"] = em
         moved.append("credentials.json")
-    # 4) fastly-cookie.json - the Fastly WAF cookie
+    # 4) fastly-cookie.json - the Fastly WAF cookie (v6.5: the cookie is
+    #    PROFILE-EXCLUSIVE data - it goes into the CURRENT account's
+    #    entry and NOWHERE else; with no account yet it is dropped: a
+    #    fresh cookie is obtained at the first sign-in and can never be
+    #    'pre-owned' by a profile that does not exist)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "fastly-cookie.json"))
     if isinstance(data, dict) and data.get("name") and data.get("value"):
-        _CFG["fastly_cookie"] = {
-            "name": data.get("name"), "value": data.get("value"),
-            "expiresAt": data.get("expiresAt") or 0}
-        moved.append("fastly-cookie.json")
-    # 5) countries.json - the local-proxy filter
+        em = cfg_current_email()
+        node = cfg_accounts().get(em) if em else None
+        if isinstance(node, dict):
+            node["fastly_cookie"] = {
+                "name": data.get("name"), "value": data.get("value"),
+                "expiresAt": data.get("expiresAt") or 0}
+            moved.append("fastly-cookie.json")
+    # 5) countries.json - the local-proxy filter (v6.4: into the PROFILE)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "countries.json"))
     if isinstance(data, dict):
         flt = {k: data[k] for k in ("countries", "keys")
                if data.get(k) is not None}
         if flt:
-            _CFG["settings"]["countries_filter"] = flt
+            _profile_node().setdefault("settings", {})["countries_filter"] = flt
         moved.append("countries.json")
-    # 6) doh.json - the resolver choice
+    # 6) doh.json - the resolver choice (v6.4: into the PROFILE)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "doh.json"))
     if isinstance(data, dict):
-        _CFG["settings"]["doh"] = (data.get("provider")
-                                   or "").strip().lower()
+        _profile_node().setdefault("settings", {})["doh"] = (
+            data.get("provider") or "").strip().lower()
         moved.append("doh.json")
-    # 7) lang.json - the language choice
+    # 7) lang.json - the language choice (v6.4: into the PROFILE)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "lang.json"))
     if isinstance(data, dict):
-        _CFG["settings"]["lang"] = (data.get("lang") or "en").strip().lower()
+        _profile_node().setdefault("settings", {})["lang"] = (
+            data.get("lang") or "en").strip().lower()
         moved.append("lang.json")
-    # 8) singbox-install.json - the install-decline marker
+    # 8) singbox-install.json - the install-decline marker (v6.4: into
+    #    the PROFILE)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "singbox-install.json"))
     if isinstance(data, dict):
-        _CFG["settings"]["singbox_declined"] = bool(data.get("declined"))
+        _profile_node().setdefault("settings", {})["singbox_declined"] = \
+            bool(data.get("declined"))
         moved.append("singbox-install.json")
     # 9) the cached QR pngs of the 2FA secrets -> base64 in the account
     #    entries (the old default location was the script directory)
@@ -5562,7 +6057,10 @@ def save_cache(email, session_token):
     """v6.0: the session token is stored in the CURRENT account entry of
     config.json (and that account becomes the current one). The separate
     session.json file is gone - there is exactly ONE copy of the token,
-    inside the account, so it can never diverge from the credentials."""
+    inside the account, so it can never diverge from the credentials.
+    v6.5: creating/making current the account also flushes its staged
+    PROFILE-EXCLUSIVE data (its FIRST Fastly cookie, solved during the
+    sign-in before this entry existed) into the entry."""
     try:
         email = (email or "").strip().lower()
         if not email:
@@ -5578,6 +6076,7 @@ def save_cache(email, session_token):
             _CFG["accounts"] = accounts
             _CFG["current_account"] = email
         cfg_save()
+        _flush_pending_profile_data(email)
     except OSError:
         pass
 
@@ -5888,6 +6387,25 @@ def cache_account(args, creds, session_token=None):
     accounts[email] = acc
     _save_accounts(accounts)
     cfg_set_current(email)
+    # v6.5: the entry has just been created/made current - flush the
+    # PROFILE-EXCLUSIVE data staged during its sign-in (its FIRST
+    # Fastly cookie) into it
+    _flush_pending_profile_data(email)
+    # v6.4: a NEW profile starts with the CURRENT effective settings
+    # (the v5.33 'settings exist from the very first run' contract,
+    # now per profile): when the account entry has NO 'settings'
+    # section of its own yet (a brand-new profile - the '+' flow of
+    # the 'a' menu, or the very first sign-in before the startup
+    # mirror was adopted), the effective language and resolver of
+    # THIS session become its first saved values, so the profile is
+    # complete from its very first run and a restart reproduces the
+    # session that created it. An account that already HAS settings
+    # (its own, or adopted from the provisional 'profile_defaults')
+    # is NOT touched - its profile wins.
+    if not isinstance(cfg_get(("settings",)), dict):
+        if doh_provider() != "custom":
+            save_doh_provider_cache(doh_provider())
+        save_lang_cache(_LANG)
     info(tr("account_cached", email=email))
 
 def print_accounts_list(args, reveal=False):
@@ -8207,8 +8725,20 @@ def ensure_session(args, creds, totp_provider, interactive=True,
         else:
             raise MozVpnError(tr("password_missing"))
     info(tr("signing_in"))
-    st = fxa_login(email, pw, totp_provider, interactive=interactive,
-                   tp=totp_params_from(creds))
+    # v6.5: the Fastly cookie (and every other PROFILE-EXCLUSIVE value)
+    # obtained during THIS sign-in belongs to the account being signed
+    # in - NOT to whoever is 'current' at the moment (the '+' flow of
+    # the 'a' menu signs in a NEW account while the previous one is
+    # still current). The account's entry may not exist yet - the value
+    # is staged in memory and flushed into the entry when the account
+    # is created (save_cache below).
+    global _SIGNIN_EMAIL
+    _SIGNIN_EMAIL = (email or "").strip().lower() or None
+    try:
+        st = fxa_login(email, pw, totp_provider, interactive=interactive,
+                       tp=totp_params_from(creds))
+    finally:
+        _SIGNIN_EMAIL = None
     save_cache(email, st)
     save_credentials(email=email, password=pw)
     ok(tr("session_cached", path=CONFIG_FILE))
@@ -8491,6 +9021,12 @@ def run_manager(args, creds, totp_provider):
                     engine = SingBoxEngine(args, token_holder)
                 else:
                     engine = BuiltinProxyEngine(args, token_holder)
+            # v6.5: the sign-in may have SWITCHED the account (the '+'
+            # flow signs in a NEW account, and even a plain --email
+            # start signs in an account that is not the stored current
+            # one; save_cache makes the signed-in account current).
+            # Remember the profile of the moment to detect the switch.
+            _prev_profile_email = cfg_current_email()
             session_token = ensure_session(
                 args, creds, totp_provider,
                 interactive=not args.no_input,
@@ -8510,6 +9046,19 @@ def run_manager(args, creds, totp_provider):
             # (login/password/TOTP/session) in accounts.json. Silent
             # when the entry is unchanged (every token refresh calls it).
             cache_account(args, creds, session_token)
+            if _prev_profile_email and \
+                    cfg_current_email() != _prev_profile_email:
+                # v6.5: the account CHANGED during the sign-in - the
+                # WHOLE profile follows: apply its settings and its
+                # Fastly cookie at runtime and stop the engine so the
+                # next iteration rebuilds it from the NEW profile's
+                # sing-box configs and countries filter (the FIRST
+                # sign-in of a run needs no apply: the in-memory state
+                # already matches the fresh profile)
+                apply_profile_runtime(args)
+                if engine:
+                    engine.stop_all()
+                engine = None
 
             if locations is None:
                 info(tr("serverlist_fetching"))
@@ -9121,6 +9670,22 @@ def run_manager(args, creds, totp_provider):
                         totp_provider = None
                         session_token = None
                         force_relogin = True
+                        # v6.5: a NEW account is a NEW profile: its
+                        # PROFILE-EXCLUSIVE data starts CLEAN. Reset
+                        # the in-memory session (the cookie jar still
+                        # holds the PREVIOUS profile's Fastly cookie
+                        # and the challenge latch is still set) so
+                        # the sign-in of the new account obtains its
+                        # OWN fresh cookie - bound to IT (staged and
+                        # flushed into its new entry), never written
+                        # into the previous profile. The engine runs
+                        # the OLD profile's proxies/configs - stop it;
+                        # it is rebuilt from the NEW profile's tokens
+                        # and filter after the sign-in.
+                        _reset_fastly_session()
+                        if engine:
+                            engine.stop_all()
+                        engine = None
                         break   # leave the sleep phase; the next loop
                                 # iteration prompts for the new login
                     elif choice == "-":
@@ -9187,6 +9752,11 @@ def run_manager(args, creds, totp_provider):
                                         if args.session_token:
                                             save_cache(first,
                                                        args.session_token)
+                                        # v6.4: the auto-switch is a
+                                        # FULL profile switch too -
+                                        # apply the settings of the
+                                        # first remaining account
+                                        apply_profile_runtime(args)
                                     else:
                                         cfg_set_current(None)
                                         info(tr("accounts_delete_last"))
@@ -9201,6 +9771,10 @@ def run_manager(args, creds, totp_provider):
                                         totp_provider = None
                                         session_token = None
                                         force_relogin = True
+                                        # v6.4: no profile is left -
+                                        # fall back to the provisional
+                                        # profile (env/default settings)
+                                        apply_profile_runtime(args)
                                 # the sing-box configs of the deleted
                                 # session are stale: restart the engine
                                 # on the next iteration
@@ -9245,6 +9819,21 @@ def run_manager(args, creds, totp_provider):
                                 session=(tr("account_session_used")
                                          if args.session_token
                                          else tr("account_session_fresh"))))
+                        # v6.4: the WHOLE profile switches with the
+                        # account - re-apply the saved language, the
+                        # saved DoH resolver and the Fastly cookie of
+                        # the newly selected profile at runtime (the
+                        # explicit --lang/--doh/--doh-url argument of
+                        # this run still wins, like at startup)
+                        apply_profile_runtime(args)
+                        # v6.4: the sing-box configs (and the local
+                        # proxy selection) of the OLD profile are
+                        # stale now: stop the engine so the next loop
+                        # iteration rebuilds it from the NEW
+                        # profile's configs and filter
+                        if engine:
+                            engine.stop_all()
+                        engine = None
                         break       # leave the sleep phase; the next
                                     # loop iteration signs the account in
                     elif choice:
@@ -10684,10 +11273,16 @@ def main():
             info(tr("doh_strict_mode"))
     else:
         info(tr("doh_system"))
-    # v5.33 -> v6.0 (req. 4): the settings live INSIDE config.json - the
-    # effective resolver/language are mirrored into the uber-config at
-    # startup so config.json (and its settings) exists from the very
-    # first run and the '1-9 config files' list shows it immediately.
+    # v5.33 -> v6.4 (req. 4 + the profile rework): the settings live
+    # INSIDE config.json, and since v6.4 they belong to the CURRENT
+    # PROFILE (the account) - the effective resolver/language are
+    # mirrored into the CURRENT ACCOUNT's settings at startup (via
+    # _profile_node(), so cfg_get/cfg_set route to
+    # config.json['accounts'][<current>]['settings']) so config.json
+    # (and the profile's settings) exists from the very first run and
+    # the '1-9 config files' list shows it immediately. Switching the
+    # profile (hotkey 'a' / --select-account) re-applies the new
+    # profile's settings via apply_profile_runtime().
     #   - settings.doh: the effective resolver (unless a custom --doh-url
     #     endpoint is active - its URL may be secret, not persisted);
     #   - settings.lang: the effective language;
@@ -10774,6 +11369,10 @@ def main():
                 session=(tr("account_session_used")
                          if a.session_token
                          else tr("account_session_fresh"))))
+        # v6.4: --select-account is a FULL profile switch - apply the
+        # settings of the newly selected account (the rest of main()
+        # and the watch loop then run with its language/resolver/cookie)
+        apply_profile_runtime(a)
 
     # v6.0 (req. 5): --add-account - sign in to a NEW account: the
     # in-memory sign-in targets are cleared so the email/password/2FA
