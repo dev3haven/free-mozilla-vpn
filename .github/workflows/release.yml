@@ -26,6 +26,52 @@
 #    do not work on glibc Linux: different libc + ELF interpreter —
 #    see the NOTE below)
 #
+# BINARY NAMING (FIX 23, 2026-10-25): every job name AND every built
+# binary file name now carries the C library the binary runs against.
+# The Termux jobs have always declared theirs in the job name (Bionic);
+# the same annotation now exists for every target:
+#   linux-* (runner builds)  — glibc 2.39 — the Ubuntu 24.04 runner
+#                              image, x64 AND arm64 (Launchpad, glibc
+#                              source package in noble: 2.39-0ubuntu8.9,
+#                              verified 2026-10-25). The x86_64 cell is
+#                              PINNED to ubuntu-24.04 (NOT ubuntu-
+#                              latest): GitHub is migrating the
+#                              ubuntu-latest label from Ubuntu 24.04 to
+#                              26.04 between 2026-10-19 and 2026-11-19
+#                              (GitHub changelog, 2026-09-17), and 26.04
+#                              ships glibc 2.43 (Launchpad, glibc in
+#                              resolute: 2.43-2ubuntu2.4) — a floating
+#                              label would make both the produced
+#                              binary AND its glibc2.39 name a LIE on
+#                              some runs mid-window. A release pipeline
+#                              must be deterministic.
+#   linux-x86 (i386 container) — glibc 2.41 — the python:${PYTHON_VERSION}
+#                              -slim image is the Debian 13 "trixie"
+#                              slim build (the docker-library
+#                              official-images tag list: 3.15-slim =
+#                              3.15.1-slim-trixie), and trixie ships
+#                              glibc 2.41 (Debian packages, libc6 in
+#                              trixie, verified 2026-10-25). The HOST
+#                              runner's glibc does not matter here —
+#                              the binary is produced entirely inside
+#                              the trixie i386 container.
+#   windows-*                 — UCRT — the Universal C Runtime, the
+#                              OS C library since Windows 10 (Microsoft
+#                              Learn, "Universal CRT deployment");
+#                              Nuitka standalone binaries depend on the
+#                              Visual C runtime, and Nuitka ships/
+#                              copies the dependent DLLs itself
+#                              (Nuitka User Manual).
+#   termux-*                  — Bionic — Android's libc (unchanged;
+#                              the termux binary is built inside real
+#                              Termux and runs ONLY in Termux).
+# The release assets are therefore named:
+#   mozvpn-linux-x86_64-glibc2.39, mozvpn-linux-armv8-glibc2.39,
+#   mozvpn-linux-armv9-glibc2.39, mozvpn-linux-x86-glibc2.41,
+#   mozvpn-termux-armv8-bionic, mozvpn-termux-armv9-bionic,
+#   mozvpn-windows-x86_64-ucrt.exe, mozvpn-windows-x86-ucrt.exe,
+#   mozvpn-windows-arm64-ucrt.exe.
+#
 # ARMv8 vs ARMv9 (why two separate builds, and why both are "aarch64"):
 #   * ARMv9-A is a superset of ARMv8-A at the A64 base level, so an
 #     ARMv8-built binary RUNS on ARMv9 hardware — but it can never use
@@ -186,9 +232,12 @@
 #      exported before pip. The armv9 variant is built with
 #      MARCH="-mtune=neoverse-n2" (scheduler tuning only, ARMv8 ISA
 #      baseline — FIX 18: -march=armv9-a emits SVE2 and SIGILLs on
-#      phones). Both jobs are continue-on-error: true —
-#      the Termux build is EXPERIMENTAL and its failure must not break
-#      the release of the other targets. The Termux binary runs ONLY
+#      phones). The Termux jobs are NOT continue-on-error anymore
+#      (FIX 22, 2026-10-25): the release/2.0.0 run attached a PARTIAL
+#      release (7 of 9 binaries) precisely because a silently failed
+#      Termux job was tolerated — now a Termux failure fails the run
+#      immediately, and the release gate additionally refuses to
+#      attach an incomplete binary set. The Termux binary runs ONLY
 #      in Termux on Android (Bionic libc), NOT on regular glibc
 #      Linux — and vice versa.
 #
@@ -356,11 +405,33 @@
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn-* file to the GitHub Release as a
 # SEPARATE asset (softprops/action-gh-release supports multi-line file
-# lists and glob patterns in `files`). Each asset keeps its OS-specific
-# name: mozvpn-windows-x86_64.exe, mozvpn-linux-x86_64, etc.
+# lists and glob patterns in `files`). Each asset keeps its
+# OS-specific name — the full list is in the BINARY NAMING block above
+# (mozvpn-linux-x86_64-glibc2.39, mozvpn-windows-x86_64-ucrt.exe,
+# mozvpn-termux-armv8-bionic, ...).
 # Per GitHub documentation, an asset filename must be unique within one
 # release — the unified target naming guarantees that (one file per
 # target). Nothing is zipped anywhere in this workflow anymore.
+#
+# FIX 22 (release completeness gate, 2026-10-25): the release/2.0.0 run
+#      attached only 7 of the 9 binaries to the release page. The Termux
+#      jobs had failed (the FIX 21 Nuitka 4.3 scons crash), continue-
+#      error absorbed the failure, and the release-bundle job globs
+#      whatever landed in dist/ — so an INCOMPLETE release was
+#      published WITHOUT ANY ERROR (the release page showed 9 items =
+#      7 binaries + 2 source-code archives instead of the full 11 of
+#      the previous releases). The user's verdict: publishing a partial
+#      release is an error. The fix, two-fold:
+#        (a) build-termux is NOT continue-on-error anymore — a Termux
+#            failure turns the whole run red immediately;
+#        (b) the release-bundle job verifies the COMPLETE expected
+#            file set BEFORE attaching anything: one missing binary =
+#            the job fails and NOTHING is attached. A partial release
+#            is now impossible by construction.
+#      (The run that builds on a plain branch push never attaches —
+#      only tag pushes and release events do — so the missing Termux
+#      binaries of release/2.0.0 were never re-attached; re-publish
+#      the release to attach the full set with the fixed config.)
 #
 # FIX 1 (the historical windows-arm64 FATAL): since Python 3.12 the
 #     CPython distributions from setup-python and the official python
@@ -484,16 +555,30 @@ jobs:
   # builds on the ARMv9 (Cobalt 100 / Neoverse N2) arm64 runner.
   # --------------------------------------------------------------------------
   build:
-    name: Build ${{ matrix.target }}
+    # FIX 23: the job name shows the C library the built binary runs
+    # against — the same annotation the Termux jobs always had.
+    name: Build ${{ matrix.target }} (${{ matrix.libc }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # FIX 23: pinned to ubuntu-24.04, NOT ubuntu-latest. GitHub
+          # is migrating the ubuntu-latest label from Ubuntu 24.04 to
+          # 26.04 gradually between 2026-10-19 and 2026-11-19 (GitHub
+          # changelog, 2026-09-17) — mid-window runs would randomly
+          # land on glibc 2.43 instead of 2.39, which would make both
+          # the binary and its glibc2.39 name non-deterministic. The
+          # explicit label is deterministic and keeps the annotation
+          # truthful (Launchpad, glibc in noble: 2.39-0ubuntu8.9,
+          # verified 2026-10-25).
+          # libc = display form (job name); tag = file-name token.
+          - os: ubuntu-24.04
             target: linux-x86_64
             python_arch: x64
             march: ""
+            libc: "glibc 2.39"
+            tag: glibc2.39
           # Both ARM builds run on ubuntu-24.04-arm (Cobalt 100 =
           # Neoverse N2 = ARMv9-A hardware). The armv8 build uses the
           # compiler default (ARMv8-A baseline — runs on ALL aarch64
@@ -502,26 +587,43 @@ jobs:
           # Nuitka applies the CCFLAGS/LDFLAGS environment values on
           # top of its own flags; -march=armv9-a is supported by
           # GCC >= 12 and by clang (D109517).
+          # Same glibc 2.39 as the x86_64 cell: the arm64 runner image
+          # is also Ubuntu 24.04 (noble, glibc 2.39).
           - os: ubuntu-24.04-arm
             target: linux-armv8
             python_arch: arm64
             march: ""
+            libc: "glibc 2.39"
+            tag: glibc2.39
           - os: ubuntu-24.04-arm
             target: linux-armv9
             python_arch: arm64
             march: "-march=armv9-a"
+            libc: "glibc 2.39"
+            tag: glibc2.39
+          # Windows binaries run against the Universal C Runtime —
+          # the OS C library since Windows 10 (Microsoft Learn,
+          # "Universal CRT deployment"); Nuitka ships the dependent
+          # VC runtime DLLs itself (Nuitka User Manual), so "ucrt" is
+          # the complete runtime annotation for every Windows target.
           - os: windows-latest
             target: windows-x86_64
             python_arch: x64
             march: ""
+            libc: "UCRT"
+            tag: ucrt
           - os: windows-11-arm
             target: windows-arm64
             python_arch: arm64
             march: ""
+            libc: "UCRT"
+            tag: ucrt
           - os: windows-latest
             target: windows-x86
             python_arch: x86
             march: ""
+            libc: "UCRT"
+            tag: ucrt
 
     steps:
       - name: Checkout
@@ -643,7 +745,7 @@ jobs:
             --clang \
             --jobs=4 \
             --output-dir=build \
-            --output-filename="mozvpn-${{ matrix.target }}" \
+            --output-filename="mozvpn-${{ matrix.target }}-${{ matrix.tag }}" \
             --company-name="${{ env.APP_NAME }}" \
             --product-name="${{ env.APP_NAME }}" \
             --file-description="${{ env.APP_NAME }} (mozvpn)" \
@@ -670,7 +772,7 @@ jobs:
             --include-package=aioquic `
             --jobs=4 `
             --output-dir=build `
-            --output-filename="mozvpn-${{ matrix.target }}.exe" `
+            --output-filename="mozvpn-${{ matrix.target }}-${{ matrix.tag }}.exe" `
             --company-name="${{ env.APP_NAME }}" `
             --product-name="${{ env.APP_NAME }}" `
             --file-description="${{ env.APP_NAME }} (mozvpn)" `
@@ -686,7 +788,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          BIN="build/mozvpn-${{ matrix.target }}"
+          BIN="build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}"
           file "$BIN"
           # FIX 19: the smoke test is now FATAL. The old `|| true`
           # swallowed exactly the failures the smoke test exists to
@@ -708,7 +810,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bin = "build/mozvpn-${{ matrix.target }}.exe"
+          $bin = "build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}.exe"
           if (-not (Test-Path $bin)) { throw "Binary not found: $bin" }
           # FIX 19: the smoke test is now FATAL. The binary is built
           # with --windows-console-mode=force, so the console-enabled
@@ -727,8 +829,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-${{ matrix.target }}
-          path: build/mozvpn-${{ matrix.target }}*
+          name: mozvpn-${{ matrix.target }}-${{ matrix.tag }}
+          path: build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}*
           if-no-files-found: error
           retention-days: 14
 
@@ -740,9 +842,17 @@ jobs:
   # all actions run on the host and the build runs via plain `docker run`
   # with the workspace bind-mounted (requirements.txt is visible inside
   # via the bind mount).
+  #
+  # FIX 23 (libc annotation, 2026-10-25): this binary is linked against
+  # the glibc of the python:3.15-slim CONTAINER — that image is the
+  # Debian 13 "trixie" slim build (docker-library official-images tag
+  # list: 3.15-slim = 3.15.1-slim-trixie), and trixie ships glibc 2.41
+  # (Debian packages, libc6 in trixie, verified 2026-10-25). The HOST
+  # runner's glibc is irrelevant (the binary never touches it), so the
+  # annotation is glibc2.41 — NOT the runner's 2.39.
   # --------------------------------------------------------------------------
   build-linux-x86:
-    name: Build linux-x86 (32-bit)
+    name: Build linux-x86 (glibc 2.41)
     runs-on: ubuntu-latest
 
     steps:
@@ -833,7 +943,7 @@ jobs:
                 --include-package=aioquic \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-linux-x86" \
+                --output-filename="mozvpn-linux-x86-glibc2.41" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
                 --file-description="Free Mozilla VPN (mozvpn)" \
@@ -847,16 +957,16 @@ jobs:
               # script uses argparse and exits 0; the i386 binary runs
               # natively on the x86_64 runner kernel. A SIGILL/crash
               # exits non-zero and FAILS the build under set -e.
-              file build/mozvpn-linux-x86
-              ./build/mozvpn-linux-x86 --help
-              echo "smoke: build/mozvpn-linux-x86 --help exited 0"
+              file build/mozvpn-linux-x86-glibc2.41
+              ./build/mozvpn-linux-x86-glibc2.41 --help
+              echo "smoke: build/mozvpn-linux-x86-glibc2.41 --help exited 0"
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-linux-x86
-          path: build/mozvpn-linux-x86*
+          name: mozvpn-linux-x86-glibc2.41
+          path: build/mozvpn-linux-x86-glibc2.41*
           if-no-files-found: error
           retention-days: 14
 
@@ -923,13 +1033,16 @@ jobs:
   # on phones without userspace SVE2 — verified live on a real
   # device; clang emits SVE unconditionally for Armv9-A per
   # llvm/llvm-project#114987). armv8 — the plain default baseline.
-  # The build is EXPERIMENTAL: continue-on-error: true — a Termux job
-  # failure must not block the release of the other targets.
+  # The build is no longer continue-on-error (FIX 22, 2026-10-25):
+  # a Termux job failure previously published a silently PARTIAL
+  # release (the release/2.0.0 incident — 7 of 9 binaries attached).
+  # Now a Termux failure fails the run immediately, and the
+  # release-bundle job refuses to attach anything unless the COMPLETE
+  # binary set is present.
   # --------------------------------------------------------------------------
   build-termux:
     name: Build termux-${{ matrix.target }} (Bionic, Android)
     runs-on: ubuntu-24.04-arm
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -1141,7 +1254,7 @@ jobs:
                 --clang \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-termux-${TARGET}" \
+                --output-filename="mozvpn-termux-${TARGET}-bionic" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
                 --file-description="Free Mozilla VPN (mozvpn, Termux/Android Bionic)" \
@@ -1157,8 +1270,8 @@ jobs:
               # (like the FIX 18 armv9 incident) exits non-zero
               # (128+4=132) and FAILS the build under set -e — a
               # broken binary can no longer ship unnoticed.
-              file build/mozvpn-termux-"${TARGET}"
-              ./build/mozvpn-termux-"${TARGET}" --help
+              file build/mozvpn-termux-"${TARGET}"-bionic
+              ./build/mozvpn-termux-"${TARGET}"-bionic --help
               echo "smoke: termux ${TARGET} --help exited 0"
               # NOTE: the binary is NOT copied out through a bind mount
               # anymore (FIX 14). The host extracts it from the stopped
@@ -1169,7 +1282,7 @@ jobs:
           # container — docker cp officially works with stopped containers,
           # and no host path is ever mounted.
           docker cp \
-            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-termux-${{ matrix.target }} \
+            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-termux-${{ matrix.target }}-bionic \
             termux-out/
           docker rm mozvpn-termux-build
 
@@ -1177,14 +1290,14 @@ jobs:
         run: |
           set -euo pipefail
           ls -la termux-out
-          test -f termux-out/mozvpn-termux-${{ matrix.target }}
-          file termux-out/mozvpn-termux-${{ matrix.target }}
+          test -f termux-out/mozvpn-termux-${{ matrix.target }}-bionic
+          file termux-out/mozvpn-termux-${{ matrix.target }}-bionic
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-termux-${{ matrix.target }}
-          path: termux-out/mozvpn-termux-${{ matrix.target }}
+          name: mozvpn-termux-${{ matrix.target }}-bionic
+          path: termux-out/mozvpn-termux-${{ matrix.target }}-bionic
           if-no-files-found: error
           retention-days: 14
 
@@ -1192,13 +1305,17 @@ jobs:
   # Release: downloads ALL build artifacts into one folder and attaches
   # every binary to the GitHub Release as a SEPARATE asset — NO zip (FIX 8).
   # Runs for v* tags, release/** tags, or a published GitHub Release.
-  # Built only when all `needs` jobs succeeded (no `always()`); the Termux
-  # jobs are continue-on-error, so a failed EXPERIMENTAL Termux build does
-  # not block the release of the stable targets.
+  # Built only when all `needs` jobs succeeded (no `always()`). The Termux
+  # jobs are NOT continue-on-error anymore (FIX 22): the release/2.0.0
+  # run attached a PARTIAL release (7 of 9 binaries) because a silently
+  # failed Termux job was tolerated and this job simply globbed whatever
+  # landed in dist/. Now the COMPLETE binary set is verified BEFORE
+  # anything is attached: one missing binary = the job fails = nothing
+  # is attached. A partial release is impossible by construction.
   #
   # Per GitHub's release-assets documentation, asset names must be unique
   # within a release — the unified target naming (one file per OS/arch,
-  # mozvpn-<target>[.exe]) guarantees that. softprops/action-gh-release
+  # mozvpn-<target>-<libc>) guarantees that. softprops/action-gh-release
   # attaches each matched file as its own asset and supports glob patterns
   # in `files`.
   # --------------------------------------------------------------------------
@@ -1215,30 +1332,59 @@ jobs:
 
     steps:
       # Download all build artifacts into the SAME folder (merge-multiple:
-      # true) so every binary lands side by side as dist/mozvpn-<target>.
+      # true) so every binary lands side by side as dist/mozvpn-<target>-<libc>.
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: Verify binaries
+      # ---------------------------------------------------------------------
+      # FIX 22 (2026-10-25): the release completeness gate. The
+      # release/2.0.0 run attached only SEVEN binaries: the Termux jobs
+      # had failed (the FIX 21 Nuitka 4.3 scons crash), continue-on-
+      # error absorbed the failure, and the old "verify" step only
+      # checked that dist/ was non-empty — so an incomplete release was
+      # published WITHOUT ANY ERROR. This step checks the COMPLETE
+      # expected set BEFORE anything is attached; ONE missing binary
+      # means exit 1, the job fails and NOTHING is attached. If a new
+      # target is ever added to the build matrix, add its file here too.
+      # ---------------------------------------------------------------------
+      - name: Verify the COMPLETE binary set (FIX 22)
         run: |
           set -euo pipefail
           ls -laR dist
-          if ! ls dist/mozvpn-* >/dev/null 2>&1; then
-            echo "ERROR: no binaries found in dist/ — nothing to attach to the release" >&2
+          expected=(
+            "mozvpn-linux-x86_64-glibc2.39"
+            "mozvpn-linux-armv8-glibc2.39"
+            "mozvpn-linux-armv9-glibc2.39"
+            "mozvpn-linux-x86-glibc2.41"
+            "mozvpn-termux-armv8-bionic"
+            "mozvpn-termux-armv9-bionic"
+            "mozvpn-windows-x86_64-ucrt.exe"
+            "mozvpn-windows-x86-ucrt.exe"
+            "mozvpn-windows-arm64-ucrt.exe"
+          )
+          missing=0
+          for f in "${expected[@]}"; do
+            if [ ! -f "dist/$f" ]; then
+              echo "ERROR: expected release binary is MISSING: dist/$f" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "ERROR: the binary set is INCOMPLETE — refusing to attach a partial release (FIX 22)." >&2
             exit 1
           fi
-          echo "Binaries to attach as individual release assets:"
+          echo "All ${#expected[@]} expected binaries are present:"
           ls -1 dist/mozvpn-*
 
       # Each file matching the glob becomes its OWN release asset:
-      # mozvpn-linux-x86_64, mozvpn-linux-armv8,
-      # mozvpn-linux-armv9, mozvpn-linux-x86,
-      # mozvpn-termux-armv8, mozvpn-termux-armv9,
-      # mozvpn-windows-x86_64.exe, mozvpn-windows-x86.exe,
-      # mozvpn-windows-arm64.exe — no zip is created anywhere.
+      # mozvpn-linux-x86_64-glibc2.39, mozvpn-linux-armv8-glibc2.39,
+      # mozvpn-linux-armv9-glibc2.39, mozvpn-linux-x86-glibc2.41,
+      # mozvpn-termux-armv8-bionic, mozvpn-termux-armv9-bionic,
+      # mozvpn-windows-x86_64-ucrt.exe, mozvpn-windows-x86-ucrt.exe,
+      # mozvpn-windows-arm64-ucrt.exe — no zip is created anywhere.
       - name: Attach binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
