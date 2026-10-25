@@ -1,5 +1,5 @@
 # ============================================================================
-# Free Mozilla VPN — build mozvpn_beta.py with Nuitka (Python 3.14)
+# Free Mozilla VPN — build mozvpn.py with Nuitka (Python 3.15)
 #
 # Targets (unified uname-style naming, identical for every OS):
 #   linux-x86_64   — 64-bit Intel/AMD Linux (a.k.a. x64 / amd64)
@@ -76,20 +76,21 @@
 #     * win_arm64: pyca dropped win_arm64 wheels after 46.0.3 — on
 #       46.0.4+ pip builds the sdist with maturin/Rust and dies on the
 #       missing OpenSSL (pyca/cryptography#14249);
-#     * win32 (32-bit Windows): support REMOVED in the current release
-#       line ("BACKWARDS INCOMPATIBLE: Support for 32-bit Windows has
+#     * win32 (32-bit Windows): support REMOVED in the 49.0.0 release
+#       (2026-06-12; changelog: "BACKWARDS INCOMPATIBLE: Support for
+#       32-bit Windows has
 #       been removed") — pip again falls back to the Rust sdist build
 #       and dies on the missing OpenSSL (exactly the FATAL seen live in
 #       the windows-x86 job, 2026-09-24).
 #   46.0.3 ships abi3 wheels for win32, win_amd64 AND win_arm64; abi3
-#   wheels are forward-compatible across Python 3.x (so 3.14 is fine)
+#   wheels are forward-compatible across Python 3.x (so 3.15 is fine)
 #   and still satisfy aioquic's `cryptography>=42.0.0`. Linux and macOS
 #   keep resolving to the latest release (prebuilt wheels exist there;
 #   on i686 Linux the sdist build succeeds thanks to the apt packages
 #   below).
 #
 #   This is THE fix for the "dependencies NOT installed in the exe" bug:
-#   mozvpn_beta.py imports these packages behind try/except ImportError,
+#   mozvpn.py imports these packages behind try/except ImportError,
 #   and Nuitka compiles what is importable at BUILD time — with the
 #   packages installed in the build env, the binary embeds them; the
 #   startup dependency report then shows "installed" instead of
@@ -166,13 +167,13 @@
 #      `cryptography==46.0.3; sys_platform == "win32"` does NOT apply in
 #      Termux (sys_platform == "linux"); instead of building cryptography
 #      from its sdist, the prebuilt Termux package python-cryptography
-#      (50.0.1 in termux-packages as of the live run 2026-09-24;
+#      (50.0.2 in termux-packages as of 2026-10-25;
 #      deps: openssl + python + python-pip) is installed BEFORE
 #      `pip install -r requirements.txt` — pip then sees
 #      `cryptography>=42.0.0` (the aioquic requirement) as already
 #      satisfied and does not touch it at all. Pillow is likewise
 #      installed as the prebuilt Termux package python-pillow
-#      (12.3.0, live run). The rest (pyotp — pure Python, zxing-cpp,
+#      (13.0.0, verified 2026-10-25). The rest (pyotp — pure Python, zxing-cpp,
 #      aioquic + pylsqpack) is built by pip from sdists with the Termux
 #      clang: Termux does NOT use -dev packages — headers ship inside
 #      the packages themselves (openssl, libjpeg-turbo, zlib), so
@@ -189,7 +190,7 @@
 #      Linux — and vice versa.
 #
 # FIX 14 (Termux build: bind-mount-independent file transfer, 2026-09-25):
-#      A LIVE RUN failed at `cp /src/mozvpn_beta.py` with "No such file or
+#      A LIVE RUN failed at `cp /src/mozvpn.py` with "No such file or
 #      directory", even though -v "$GITHUB_WORKSPACE:/src" had been passed
 #      to docker run. Everything BEFORE the cp worked (pkg update, 69
 #      packages via apt, pip) — so the network, privileges and the
@@ -203,7 +204,7 @@
 #      the daemon. The cause cannot be diagnosed from the log, so the
 #      fix ELIMINATES THE ENTIRE CLASS of the problem — the
 #      build-termux job NO LONGER uses bind-mounts at all:
-#        * INPUT: `docker build` bakes mozvpn_beta.py + requirements.txt
+#        * INPUT: `docker build` bakes mozvpn.py + requirements.txt
 #          into an image layer via COPY. The docker CLIENT uploads the
 #          build context to the daemon as a tar stream (Docker docs:
 #          Build context), so the host path is not needed by the daemon
@@ -250,8 +251,8 @@
 #      exists, and linking the extension against it resolves the Py*
 #      symbols at dlopen.
 #      FIX: LDFLAGS inside the Termux script gains -lpython${PYVER},
-#      where PYVER is derived from the interpreter itself (3.14 in the
-#      current Termux) — the libpython name follows the Python major
+#      where PYVER is derived from the interpreter itself (3.14.8 in
+#      the current Termux, verified 2026-10-25) — the libpython name follows the Python major
 #      automatically, with no hardcoding. aioquic/pylsqpack only benefit
 #      from this (their .so files also get all symbols resolved). A
 #      stable-ABI module linked against libpython works on Termux
@@ -314,7 +315,7 @@
 #          OnefileBootstrap.c) — the smoke test sees the REAL program
 #          exit status, including crashes of the extracted payload.
 #        * argparse exits with status 0 after printing --help
-#          (errors exit 2), and mozvpn_beta.py parses args with
+#          (errors exit 2), and mozvpn.py parses args with
 #          argparse in main(), so a healthy binary MUST exit 0.
 #        * POSIX shells report death-by-signal N as 128+N, so SIGILL
 #          (signal 4) surfaces as exit code 132 — detectable.
@@ -339,16 +340,17 @@
 #      support, 2026-02), softprops/action-gh-release@v3. Runners
 #      re-verified: ubuntu-24.04-arm and windows-11-arm are standard
 #      supported arm64 runners (windows-11-arm moves to the VS2026
-#      image in September 2026 — still the same label). Nuitka
-#      officially supports Python 3.14 (current release line; PyPI:
-#      "Python 3 (3.4 - 3.14) are supported").
+#      image in September 2026 — still the same label). Nuitka 4.3.1
+#      (current release, verified 2026-10-25) pronounces Python 3.15
+#      experimentally supported in its changelog; the official PyPI
+#      range is still "Python 3 (3.4 - 3.14) are supported".
 #
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
-# true) and attaches every mozvpn_beta-* file to the GitHub Release as a
+# true) and attaches every mozvpn-* file to the GitHub Release as a
 # SEPARATE asset (softprops/action-gh-release supports multi-line file
 # lists and glob patterns in `files`). Each asset keeps its OS-specific
-# name: mozvpn_beta-windows-x86_64.exe, mozvpn_beta-linux-x86_64, etc.
+# name: mozvpn-windows-x86_64.exe, mozvpn-linux-x86_64, etc.
 # Per GitHub documentation, an asset filename must be unique within one
 # release — the unified target naming guarantees that (one file per
 # target). Nothing is zipped anywhere in this workflow anymore.
@@ -361,12 +363,16 @@
 #     Fix: `pip install --upgrade pip setuptools wheel` runs in EVERY
 #     build job before nuitka.
 #
-# FIX 5 (linux-x86 FATAL): on CPython 3.14 zstandard has no prebuilt
-#     wheel for i386, so pip builds it from source via cffi (the CFFI
-#     backend per the python-zstandard docs), and cffi needs <ffi.h>
-#     from libffi-dev, which python:*-slim images lack. The same cell
-#     may also have to BUILD aioquic from source (no cp314 wheel) —
-#     cffi/libffi-dev covers that chain too. Fix: libffi-dev is
+# FIX 5 (linux-x86 FATAL): the current zstandard line (0.25.0, verified
+#     2026-10-25 on PyPI) ships wheels only up to cp314 — on CPython
+#     3.15 there is no prebuilt i386 wheel, so pip builds it from
+#     source (the cffi backend chain per the python-zstandard docs),
+#     and cffi needs <ffi.h> from libffi-dev, which python:*-slim
+#     images lack. aioquic 1.7.0 itself ships a cp311-abi3 manylinux
+#     i686 wheel (verified 2026-10-25 on PyPI; abi3 covers Python
+#     3.15), but if its wheel is ever unavailable the same cell has to
+#     BUILD it from source — libffi-dev covers that chain too.
+#     Fix: libffi-dev is
 #     apt-installed in the container job, with an || fallback for
 #     zstandard ONLY (aioquic stays REQUIRED — the build fails if it
 #     cannot be built).
@@ -390,9 +396,12 @@
 #     actions/setup-python@v7 (FIX 20),
 #     actions/upload-artifact@v7, actions/download-artifact@v8,
 #     softprops/action-gh-release@v3 — current, valid major tags.
-#   * setup-python provides pre-built CPython 3.14 for x64/x86 on
-#     windows-latest and for arm64 on windows-11-arm; ubuntu-24.04-arm
-#     provides the system aarch64 CPython 3.14 for the armv8/armv9
+#   * setup-python provides pre-built CPython 3.15.1 (the current
+#     stable, 2026-10-21) for x64/x86 on windows-latest and for arm64
+#     on windows-11-arm and linux arm64 (the 3.15.1 manifest asset
+#     list, verified 2026-10-25, covers win32/win_amd64/win_arm64 +
+#     the linux aarch64 builds); ubuntu-24.04-arm
+#     provides the system aarch64 CPython 3.15 for the armv8/armv9
 #     builds via apt/python3-... — see the jobs below.
 #   * Tag filter "release/**" ("*" alone does NOT match "/" in tag
 #     filters); a tag push uses the workflow file FROM THE COMMIT the
@@ -408,12 +417,13 @@
 #     the host; the build runs via plain `docker run` with the
 #     workspace bind-mounted.
 #   * linux-x86 runs natively on the x86_64 kernel — no emulation.
-#   * Nuitka supports Python 3.4–3.14 and does NOT cross-compile; every
+#   * Nuitka 4.3.1 supports Python 3.4–3.14 (3.15 experimentally) and
+#     does NOT cross-compile; every
 #     target is built natively with a PRE-BUILT CPython.
 #   * For 32-bit Python on Windows, Nuitka requires MSVC (NOT MinGW);
 #     MSVC is preinstalled on windows-latest; windows-11-arm ships
 #     Visual Studio with ARM64 build tools.
-#   * --include-package=pip / =setuptools stays: mozvpn_beta.py runs
+#   * --include-package=pip / =setuptools stays: mozvpn.py runs
 #     pip AT RUNTIME (hotkey 'd' / --reinstall-deps), and Nuitka
 #     standalone does not bundle pip/setuptools by default.
 #   * nuitka / ordered-set / zstandard / setuptools / wheel are BUILD
@@ -436,8 +446,23 @@ on:
 
 env:
   APP_NAME: "Free Mozilla VPN"
-  SCRIPT: mozvpn_beta.py
-  PYTHON_VERSION: "3.14"
+  SCRIPT: mozvpn.py
+  # Python 3.15.1 — the current stable (2026-10-21). Verified 2026-10-25:
+  #   * setup-python v7 ships 3.15.1 for win32-x86/x64, win arm64 and
+  #     linux arm64 (manifest asset list), so every matrix cell builds
+  #     with a pre-built interpreter;
+  #   * the official python:3.15-slim Docker image includes the i386
+  #     architecture (docker-library official-images), so the 32-bit
+  #     container build keeps working;
+  #   * Nuitka 4.3.1 pronounces Python 3.15 experimentally supported
+  #     (its changelog; the official PyPI range is still 3.4-3.14);
+  #   * Pillow 13.0.0 ships cp315 wheels (incl. win32/win_arm64), the
+  #     cryptography 46.0.3 / aioquic 1.7.0 cp311-abi3 and the
+  #     zxing-cpp 3.1.1 cp312-abi3 wheels are forward-compatible with
+  #     3.15 (all verified on PyPI 2026-10-25; zxing-cpp win32 has no
+  #     wheel at any Python — the windows-x86 cell builds it from
+  #     source with the preinstalled MSVC, exactly as before).
+  PYTHON_VERSION: "3.15"
   FILE_VERSION: "1.0.0.0"
 
 permissions:
@@ -596,10 +621,10 @@ jobs:
             --clang \
             --jobs=4 \
             --output-dir=build \
-            --output-filename="mozvpn_beta-${{ matrix.target }}" \
+            --output-filename="mozvpn-${{ matrix.target }}" \
             --company-name="${{ env.APP_NAME }}" \
             --product-name="${{ env.APP_NAME }}" \
-            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" \
+            --file-description="${{ env.APP_NAME }} (mozvpn)" \
             --file-version="${{ env.FILE_VERSION }}" \
             --product-version="${{ env.FILE_VERSION }}" \
             --remove-output \
@@ -623,10 +648,10 @@ jobs:
             --include-package=aioquic `
             --jobs=4 `
             --output-dir=build `
-            --output-filename="mozvpn_beta-${{ matrix.target }}.exe" `
+            --output-filename="mozvpn-${{ matrix.target }}.exe" `
             --company-name="${{ env.APP_NAME }}" `
             --product-name="${{ env.APP_NAME }}" `
-            --file-description="${{ env.APP_NAME }} (mozvpn_beta)" `
+            --file-description="${{ env.APP_NAME }} (mozvpn)" `
             --file-version="${{ env.FILE_VERSION }}" `
             --product-version="${{ env.FILE_VERSION }}" `
             --copyright="${{ env.APP_NAME }}" `
@@ -639,7 +664,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          BIN="build/mozvpn_beta-${{ matrix.target }}"
+          BIN="build/mozvpn-${{ matrix.target }}"
           file "$BIN"
           # FIX 19: the smoke test is now FATAL. The old `|| true`
           # swallowed exactly the failures the smoke test exists to
@@ -661,7 +686,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $bin = "build/mozvpn_beta-${{ matrix.target }}.exe"
+          $bin = "build/mozvpn-${{ matrix.target }}.exe"
           if (-not (Test-Path $bin)) { throw "Binary not found: $bin" }
           # FIX 19: the smoke test is now FATAL. The binary is built
           # with --windows-console-mode=force, so the console-enabled
@@ -680,8 +705,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn_beta-${{ matrix.target }}
-          path: build/mozvpn_beta-${{ matrix.target }}*
+          name: mozvpn-${{ matrix.target }}
+          path: build/mozvpn-${{ matrix.target }}*
           if-no-files-found: error
           retention-days: 14
 
@@ -780,30 +805,30 @@ jobs:
                 --include-package=aioquic \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn_beta-linux-x86" \
+                --output-filename="mozvpn-linux-x86" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
-                --file-description="Free Mozilla VPN (mozvpn_beta)" \
+                --file-description="Free Mozilla VPN (mozvpn)" \
                 --file-version="1.0.0.0" \
                 --product-version="1.0.0.0" \
                 --remove-output \
                 --assume-yes-for-downloads \
-                "mozvpn_beta.py"
+                "mozvpn.py"
               # Smoke test (FIX 19: FATAL — no || true anymore; see
               # the matrix-job smoke step). --help works because the
               # script uses argparse and exits 0; the i386 binary runs
               # natively on the x86_64 runner kernel. A SIGILL/crash
               # exits non-zero and FAILS the build under set -e.
-              file build/mozvpn_beta-linux-x86
-              ./build/mozvpn_beta-linux-x86 --help
-              echo "smoke: build/mozvpn_beta-linux-x86 --help exited 0"
+              file build/mozvpn-linux-x86
+              ./build/mozvpn-linux-x86 --help
+              echo "smoke: build/mozvpn-linux-x86 --help exited 0"
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn_beta-linux-x86
-          path: build/mozvpn_beta-linux-x86*
+          name: mozvpn-linux-x86
+          path: build/mozvpn-linux-x86*
           if-no-files-found: error
           retention-days: 14
 
@@ -823,13 +848,13 @@ jobs:
   # run on glibc Linux.
   #
   # FILE TRANSFER ORDER (FIX 14, 2026-09-25) — WITHOUT bind-mounts:
-  #   INPUT:  docker build bakes mozvpn_beta.py + requirements.txt
+  #   INPUT:  docker build bakes mozvpn.py + requirements.txt
   #          into an image layer via COPY (the docker client uploads
   #          the build context to the daemon as a tar stream — the
   #          host path is not needed by the daemon). In the live run
   #          2026-09-24/25 the bind-mount
   #          -v "$GITHUB_WORKSPACE:/src" turned out to be EMPTY
-  #          inside the container (cp /src/mozvpn_beta.py → "No such
+  #          inside the container (cp /src/mozvpn.py → "No such
   #          file or directory" while pkg/apt/pip were working), so
   #          the job no longer relies on host bind mounts at all.
   #   OUTPUT: the build container is started WITHOUT --rm under the
@@ -840,8 +865,8 @@ jobs:
   #
   # The dependency installation ORDER matters:
   #   1. pkg installs the prebuilt Termux packages python, python-pip,
-  #      python-cryptography (50.0.1 in termux-packages, live run
-  #      2026-09-24) and python-pillow (12.3.0); plus the Nuitka
+  #      python-cryptography (50.0.2 in termux-packages, verified
+  #      2026-10-25) and python-pillow (13.0.0); plus the Nuitka
   #      toolchain per the official documentation:
   #      clang binutils patchelf ccache ldd termux-elf-cleaner file,
   #      and ALSO cmake + ninja (FIX 13): zxing-cpp builds via
@@ -915,7 +940,7 @@ jobs:
           # -----------------------------------------------------------------
           cat > termux-builder.Dockerfile <<'DOCKERFILE'
           FROM termux/termux-docker:aarch64
-          COPY mozvpn_beta.py requirements.txt /src/
+          COPY mozvpn.py requirements.txt /src/
           DOCKERFILE
           docker build -t mozvpn-termux-builder -f termux-builder.Dockerfile "$GITHUB_WORKSPACE"
           docker run \
@@ -952,14 +977,14 @@ jobs:
               # (and `ninja`) installed via pkg, scikit-build-core finds
               # cmake on PATH and never touches the PyPI cmake.
               # The sources come from the IMAGE LAYER baked by docker build
-              # (COPY mozvpn_beta.py requirements.txt /src/ — FIX 14), not
+              # (COPY mozvpn.py requirements.txt /src/ — FIX 14), not
               # from a host bind mount. COPY files are root:root 0644 —
               # readable by the `system` user. We copy them INSIDE the
               # Termux prefix: Android disallows exec from external mounted
               # paths, and Nuitka compiles and runs intermediate binaries
               # in its output-dir.
               mkdir -p "$HOME/mozvpn"
-              cp /src/mozvpn_beta.py /src/requirements.txt "$HOME/mozvpn"/
+              cp /src/mozvpn.py /src/requirements.txt "$HOME/mozvpn"/
               cd "$HOME/mozvpn"
               export PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
               # FIX 15: Android linker64 resolves dlopen symbols STRICTLY —
@@ -1022,7 +1047,7 @@ jobs:
               python -m pip install --upgrade setuptools wheel
               # Runtime dependencies: requirements.txt is the single source
               # of truth. cryptography and Pillow are already satisfied by
-              # the prebuilt Termux packages (python-cryptography 50.0.1 >=
+              # the prebuilt Termux packages (python-cryptography 50.0.2 >=
               # 42.0.0 — the aioquic requirement; python-pillow), pip does
               # not touch them.
               if [ -f requirements.txt ]; then
@@ -1062,15 +1087,15 @@ jobs:
                 --clang \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn_beta-termux-${TARGET}" \
+                --output-filename="mozvpn-termux-${TARGET}" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
-                --file-description="Free Mozilla VPN (mozvpn_beta, Termux/Android Bionic)" \
+                --file-description="Free Mozilla VPN (mozvpn, Termux/Android Bionic)" \
                 --file-version="1.0.0.0" \
                 --product-version="1.0.0.0" \
                 --remove-output \
                 --assume-yes-for-downloads \
-                "mozvpn_beta.py"
+                "mozvpn.py"
               # Smoke test inside the real Termux (FIX 19: FATAL —
               # no || true anymore; see the matrix-job smoke step).
               # The binary is Bionic and runs right here on the
@@ -1078,8 +1103,8 @@ jobs:
               # (like the FIX 18 armv9 incident) exits non-zero
               # (128+4=132) and FAILS the build under set -e — a
               # broken binary can no longer ship unnoticed.
-              file build/mozvpn_beta-termux-"${TARGET}"
-              ./build/mozvpn_beta-termux-"${TARGET}" --help
+              file build/mozvpn-termux-"${TARGET}"
+              ./build/mozvpn-termux-"${TARGET}" --help
               echo "smoke: termux ${TARGET} --help exited 0"
               # NOTE: the binary is NOT copied out through a bind mount
               # anymore (FIX 14). The host extracts it from the stopped
@@ -1090,7 +1115,7 @@ jobs:
           # container — docker cp officially works with stopped containers,
           # and no host path is ever mounted.
           docker cp \
-            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn_beta-termux-${{ matrix.target }} \
+            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-termux-${{ matrix.target }} \
             termux-out/
           docker rm mozvpn-termux-build
 
@@ -1098,14 +1123,14 @@ jobs:
         run: |
           set -euo pipefail
           ls -la termux-out
-          test -f termux-out/mozvpn_beta-termux-${{ matrix.target }}
-          file termux-out/mozvpn_beta-termux-${{ matrix.target }}
+          test -f termux-out/mozvpn-termux-${{ matrix.target }}
+          file termux-out/mozvpn-termux-${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn_beta-termux-${{ matrix.target }}
-          path: termux-out/mozvpn_beta-termux-${{ matrix.target }}
+          name: mozvpn-termux-${{ matrix.target }}
+          path: termux-out/mozvpn-termux-${{ matrix.target }}
           if-no-files-found: error
           retention-days: 14
 
@@ -1119,7 +1144,7 @@ jobs:
   #
   # Per GitHub's release-assets documentation, asset names must be unique
   # within a release — the unified target naming (one file per OS/arch,
-  # mozvpn_beta-<target>[.exe]) guarantees that. softprops/action-gh-release
+  # mozvpn-<target>[.exe]) guarantees that. softprops/action-gh-release
   # attaches each matched file as its own asset and supports glob patterns
   # in `files`.
   # --------------------------------------------------------------------------
@@ -1136,7 +1161,7 @@ jobs:
 
     steps:
       # Download all build artifacts into the SAME folder (merge-multiple:
-      # true) so every binary lands side by side as dist/mozvpn_beta-<target>.
+      # true) so every binary lands side by side as dist/mozvpn-<target>.
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -1147,21 +1172,21 @@ jobs:
         run: |
           set -euo pipefail
           ls -laR dist
-          if ! ls dist/mozvpn_beta-* >/dev/null 2>&1; then
+          if ! ls dist/mozvpn-* >/dev/null 2>&1; then
             echo "ERROR: no binaries found in dist/ — nothing to attach to the release" >&2
             exit 1
           fi
           echo "Binaries to attach as individual release assets:"
-          ls -1 dist/mozvpn_beta-*
+          ls -1 dist/mozvpn-*
 
       # Each file matching the glob becomes its OWN release asset:
-      # mozvpn_beta-linux-x86_64, mozvpn_beta-linux-armv8,
-      # mozvpn_beta-linux-armv9, mozvpn_beta-linux-x86,
-      # mozvpn_beta-termux-armv8, mozvpn_beta-termux-armv9,
-      # mozvpn_beta-windows-x86_64.exe, mozvpn_beta-windows-x86.exe,
-      # mozvpn_beta-windows-arm64.exe — no zip is created anywhere.
+      # mozvpn-linux-x86_64, mozvpn-linux-armv8,
+      # mozvpn-linux-armv9, mozvpn-linux-x86,
+      # mozvpn-termux-armv8, mozvpn-termux-armv9,
+      # mozvpn-windows-x86_64.exe, mozvpn-windows-x86.exe,
+      # mozvpn-windows-arm64.exe — no zip is created anywhere.
       - name: Attach binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/mozvpn_beta-*
+          files: dist/mozvpn-*
           generate_release_notes: true
