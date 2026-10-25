@@ -1,12 +1,12 @@
 # ============================================================================
-# Free Mozilla VPN (mozvpn_beta.py) — RUNTIME dependencies.
+# Free Mozilla VPN (mozvpn.py) — RUNTIME dependencies.
 #
 # This is THE single source of truth for the script's runtime deps; the
 # CI workflow (release.yml) only runs `pip install -r requirements.txt`
 # and FAILS if it cannot be satisfied — nothing runtime-related is
 # pinned or hardcoded in the workflow.
 #
-# Direct runtime deps of mozvpn_beta.py:
+# Direct runtime deps of mozvpn.py:
 #   pyotp      — TOTP code generation (REQUIRED for 2FA)
 #   zxing-cpp  — QR decoding (REQUIRED to read 2FA QR images)
 #   Pillow     — image opening for the QR loader (REQUIRED)
@@ -21,15 +21,15 @@
 #                     crossbario/autobahn-python#1945);
 #                   * win32 (32-bit Windows): support REMOVED — the
 #                     changelog deprecated 32-bit Windows in the 46.x
-#                     line ("will be removed in two releases") and 50.0.1
-#                     states "BACKWARDS INCOMPATIBLE: Support for 32-bit
-#                     Windows has been removed".
+#                     line ("will be removed in two releases") and 49.0.0
+#                     (2026-06-12) states "BACKWARDS INCOMPATIBLE: Support
+#                     for 32-bit Windows has been removed".
 #                 On both platforms pip falls back to the sdist and tries
 #                 a Rust/maturin build, which dies with "Could not find
 #                 directory of OpenSSL installation". 46.0.3 is the last
 #                 release line that ships wheels for win32, win_amd64 AND
 #                 win_arm64; the abi3 wheels are forward-compatible
-#                 across Python 3.x (so 3.14 is fine) and still satisfy
+#                 across Python 3.x (so 3.15 is fine) and still satisfy
 #                 aioquic's `cryptography>=42.0.0`.
 #                 The pin is applied to ALL Windows via the PEP 508
 #                 marker `sys_platform == "win32"` — uniform and immune
@@ -42,12 +42,12 @@
 #                 (sys_platform == "linux"), so pip would resolve the
 #                 latest release and try a Rust/maturin sdist build —
 #                 instead the workflow pre-installs Termux's own
-#                 prebuilt package `python-cryptography` (45.0.3 in
-#                 termux-packages) BEFORE `pip install -r
-#                 requirements.txt`; pip then sees the requirement
-#                 `cryptography>=42.0.0` already satisfied and never
-#                 rebuilds it. Same trick for Pillow (`python-pillow`
-#                 Termux package).
+#                 prebuilt package `python-cryptography` (50.0.2 in
+#                 termux-packages, verified 2026-10-25) BEFORE `pip
+#                 install -r requirements.txt`; pip then sees the
+#                 requirement `cryptography>=42.0.0` already satisfied
+#                 and never rebuilds it. Same trick for Pillow
+#                 (`python-pillow` Termux package).
 # ============================================================================
 
 pyotp
