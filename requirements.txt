@@ -14,8 +14,9 @@
 #                without it every upstream falls back to HTTP CONNECT)
 #
 # Transitive dependency of aioquic that needs an explicit constraint:
-#   cryptography — aioquic requires `cryptography>=42.0.0`. Two problem
-#                 platforms in the CURRENT release line (50.x, Aug 2026):
+#   cryptography — aioquic requires `cryptography>=43.0.0`. Two problem
+#                 platforms in the current release line (50.x; latest
+#                 50.0.2, released 2026-09-30):
 #                   * win_arm64: no wheel at all — pyca dropped them
 #                     after 46.0.3 (pyca/cryptography#14249,
 #                     crossbario/autobahn-python#1945);
@@ -27,17 +28,24 @@
 #                 On both platforms pip falls back to the sdist and tries
 #                 a Rust/maturin build, which dies with "Could not find
 #                 directory of OpenSSL installation". 46.0.3 is the last
-#                 release line that ships wheels for win32, win_amd64 AND
-#                 win_arm64; the abi3 wheels are forward-compatible
-#                 across Python 3.x (so 3.15 is fine) and still satisfy
-#                 aioquic's `cryptography>=42.0.0`.
+#                 RELEASE shipping wheels for win32, win_amd64 AND
+#                 win_arm64 (its successor 46.0.4 already dropped
+#                 win_arm64; 49.0.0 dropped win32); the abi3 wheels are
+#                 forward-compatible across Python 3.x (so 3.15 is fine)
+#                 and still satisfy aioquic's `cryptography>=43.0.0`.
 #                 The pin is applied to ALL Windows via the PEP 508
 #                 marker `sys_platform == "win32"` — uniform and immune
 #                 to the platform_machine() ambiguity of 32-bit Python
-#                 under WOW64. Linux and macOS keep resolving to the
-#                 latest release, which has prebuilt wheels there (on
-#                 i686 Linux the workflow apt-installs pkg-config +
-#                 libssl-dev so the sdist build succeeds).
+#                 under WOW64. Linux keeps resolving to the latest
+#                 release, which has prebuilt wheels there (on i686
+#                 Linux the workflow apt-installs pkg-config +
+#                 libssl-dev so the sdist build succeeds). macOS is not
+#                 targeted by this workflow; note that the latest
+#                 releases ship macOS arm64 wheels only. FORWARD-LOOKING:
+#                 the unreleased 51.0.0 changelog requires "CFFI 2.1.1
+#                 or newer on Python 3.15 to avoid an ABI issue" —
+#                 recheck this pin before ever unpinning cryptography
+#                 on Windows Python 3.15.
 #                 TERMUX (Android): the marker does NOT apply there
 #                 (sys_platform == "linux"), so pip would resolve the
 #                 latest release and try a Rust/maturin sdist build —
@@ -45,7 +53,7 @@
 #                 prebuilt package `python-cryptography` (50.0.2 in
 #                 termux-packages, verified 2026-10-25) BEFORE `pip
 #                 install -r requirements.txt`; pip then sees the
-#                 requirement `cryptography>=42.0.0` already satisfied
+#                 requirement `cryptography>=43.0.0` already satisfied
 #                 and never rebuilds it. Same trick for Pillow
 #                 (`python-pillow` Termux package).
 # ============================================================================
