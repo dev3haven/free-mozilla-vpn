@@ -54,8 +54,11 @@
 #                 (Alpine 3.24 musl container), plus zlib1g-dev +
 #                 libjpeg-dev (glibc) / zlib-dev + jpeg-dev (musl) for
 #                 the Pillow sdist; the Rust toolchain for the
-#                 cryptography sdist is fetched by its build backend
-#                 itself (seen live; FIX 10 in release.yml). macOS is
+#                 cryptography sdist is bootstrapped by its build
+#                 backend on glibc (seen live; FIX 10 in release.yml)
+#                 and comes from the Alpine native rust package on
+#                 musl x86, where rustup has no i686-unknown-linux-musl
+#                 host toolchain (FIX 28 in release.yml). macOS is
 #                 not targeted by this workflow; note that the latest
 #                 releases ship macOS arm64 wheels only. FORWARD-LOOKING:
 #                 the unreleased 51.0.0 changelog requires "CFFI 2.1.1
