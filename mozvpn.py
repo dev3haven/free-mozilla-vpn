@@ -4,6 +4,59 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-10-31 (v9.5) - THE LATENCY TRIO (the user's report:
+  'everything works, but it FEELS slower'; every algorithm NOT
+  listed here is UNTOUCHED). Three findings, all on the builtin
+  engine's data path, all verified against the analogs:
+
+  1) THE RELAY SOCKETS KEPT THEIR HANDSHAKE TIMEOUTS. The SOCKS5/
+     HTTP handshake phases set conn.settimeout(60), and the egress
+     socket carried timeout=20 out of _tls_connect - but the RELAY
+     threads (the _relay pump) then recv() on those same sockets:
+     after 20/60 seconds of SILENCE the recv raised socket.timeout,
+     the relay half-closed the tunnel and the client silently lost
+     the connection (a browser keep-alive, a preconnect socket, an
+     IMAP IDLE). Every idle tunnel died, and the next request
+     re-paid the whole SOCKS5 + egress-TLS handshake - the run
+     'worked but felt slower'. THE FIX: both sockets go BLOCKING
+     (settimeout(None)) right before the relay threads start - the
+     v6.6/v6.7 design intent ('the FIRST relay direction is waited
+     for UNBOUNDED - the tunnel's real lifetime'; a dead peer is
+     reaped by the TCP keepalive, not by a recv timeout) finally
+     holds. The handshake phases keep their timeouts.
+
+  2) TCP_NODELAY WAS NEVER SET - on ANY socket of the file. Python
+     leaves Nagle ON by default; the Go reference client (whose
+     keepalive pacing v6.6 ported) runs with TCP_NODELAY ON because
+     Go's net package sets it by DEFAULT, and nginx ships
+     tcp_nodelay on as well. Nagle's write-write-read interaction
+     with the receiver's delayed ACK stalls relayed small writes
+     40-200 ms (Linux TCP_DELACK_MIN/MAX) - and it directly fights
+     the tls_split design: the fragmented ClientHello's small TCP
+     segments were serialized waiting for each other's ACKs on
+     EVERY egress handshake and EVERY relayed DoH query. THE FIX:
+     the new best-effort _tcp_nodelay() (the exact _tcp_keepalive
+     shape) on the engine's conn + upstream (both handlers), on
+     the egress raw socket inside _tls_connect (covers the probe /
+     the doctor / the engine) and on the DNS relay's local tunnel
+     socket.
+
+  3) THE EGRESS HOSTNAME WAS RE-RESOLVED OVER DoH ON EVERY CLIENT
+     CONNECTION. _open_upstream -> _tls_connect -> resolve_host():
+     once the v5.6 memo (DOH_MEMO_TTL = 60 s) expired, EVERY new
+     connection paid a FULL strict-DoH chain round (fresh TLS
+     handshakes to the DoH providers) for the script's OWN egress
+     hostname - a browser opening dozens of connections re-resolved
+     the same Fastly anycast name again and again. THE FIX: the
+     mature-proxy shape (Squid's ipcache; sing-box resolves its
+     outbound server once and re-dials on failure): the engine
+     caches the per-proxy answer (engine instance scope; the fill
+     AND the refresh both go through resolve_host() - the STRICT-DoH
+     semantics are untouched, no system DNS anywhere) and DROPS the
+     entry on the first connect failure so the next connection
+     re-resolves. _tls_connect gains an optional ips= parameter
+     (None = the old behavior for every other caller).
+
 VERSION 2026-10-31 (v9.4) - THE 502 LOG DEDUP (the user's report:
   'Egress answered HTTP 502 for <...>' lines keep coming while
   everything works, and the run feels slower than it should; every
@@ -10089,7 +10142,24 @@ def _peek_plain(raw: socket.socket) -> str:
         pass
     return ""
 
-def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
+def _tls_connect(host: str, port: int, timeout: int = 20,
+                 ips: "list[str] | None" = None) -> "ssl.SSLSocket":
+    """TCP + TLS to the egress with a fallback matrix of ClientHello profiles.
+    Raises the last error, annotated with a plaintext peek when the peer
+    answered something that was not TLS at all.
+    v5.6 probe speedup: the hostname is resolved ONCE before the profile
+    loop and the resolved IP list is reused by every profile attempt -
+    previously each of the 4 attempts ran a FRESH DoH resolution (and the
+    in-probe echo fallback 4 more), which with the DoH cache off and a
+    slow/blocked first DoH provider added many seconds to EVERY probe
+    (the '10+ seconds' live-run complaint).
+    v9.5 (the user's report): ips= lets the CALLER hand in an
+    already-resolved answer (the engine's per-proxy egress cache of
+    _open_upstream) so no DoH round runs per client connection;
+    None (the default) keeps the byte-for-byte old behavior for every
+    other caller. Both raw sockets also get TCP_NODELAY now (see
+    _tcp_nodelay): the fragmented ClientHello of tls_split must not
+    be serialized by Nagle waiting for its own ACKs."""
     """TCP + TLS to the egress with a fallback matrix of ClientHello profiles.
     Raises the last error, annotated with a plaintext peek when the peer
     answered something that was not TLS at all.
@@ -10100,7 +10170,8 @@ def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
     slow/blocked first DoH provider added many seconds to EVERY probe
     (the '10+ seconds' live-run complaint)."""
     last_err = None
-    ips = resolve_host(host)          # v5.6: resolve once, reuse below
+    if ips is None:                   # v9.5: caller-supplied answer
+        ips = resolve_host(host)      # v5.6: resolve once, reuse below
     for name, ctx in _tls_profiles():
         raw = None
         try:
@@ -10117,6 +10188,10 @@ def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
             break
         try:
             raw.settimeout(timeout)
+            # v9.5: Nagle OFF on the egress socket (Go's net default,
+            # nginx tcp_nodelay) - the fragmented ClientHello segments
+            # and the relayed small writes must not wait for ACKs.
+            _tcp_nodelay(raw)
             if tls_split():
                 # v6.6 (item 12): the fragmented-ClientHello handshake.
                 # ANY failure here falls back to the plain profile walk
@@ -10134,6 +10209,7 @@ def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
                         pass
                     raw = _connect_resolved_ips(ips, host, port, timeout)
                     raw.settimeout(timeout)
+                    _tcp_nodelay(raw)   # v9.5: the fresh socket too
             return ctx.wrap_socket(raw, server_hostname=host)
         except Exception as e:
             # a TLS-HANDSHAKE failure: the next ClientHello profile may
@@ -11588,6 +11664,24 @@ def _tcp_keepalive(sock):
         except Exception:
             pass
 
+def _tcp_nodelay(sock):
+    """v9.5 (the user's report): best-effort TCP_NODELAY - the Go
+    reference parity the v6.6 keepalive port missed: Go's net package
+    sets TCP_NODELAY ON by default (its Dial author: 'a no-brainer'),
+    nginx ships tcp_nodelay on, and Nagle's write-write-read
+    interaction with the receiver's delayed ACK stalls relayed small
+    writes 40-200 ms (Linux TCP_DELACK_MIN/MAX; the classic 'ACK
+    delay' interaction). It also directly fights the tls_split
+    design: the fragmented ClientHello rides SMALL TCP segments, and
+    Nagle serializes them waiting for each other's ACKs - on every
+    egress handshake and every relayed DoH query. Purely advisory,
+    the same shape as _tcp_keepalive: every platform keeps working
+    without the option."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
 class TokenHolder:
     """Thread-safe holder of the current proxyPass. The builtin engine reads
     the token for every new client connection, so token rotation never needs
@@ -12026,6 +12120,12 @@ class DnsRelay:
             sk = socket.create_connection(("127.0.0.1", proxy["port"]),
                                           timeout=timeout)
             sk.settimeout(timeout)
+            # v9.5: Nagle OFF on the local tunnel socket - the DoH TLS
+            # handshake inside rides the fragmented ClientHello whose
+            # small segments must not be serialized by Nagle (see
+            # _tcp_nodelay), and the SOCKS5 handshake is a classic
+            # small write-write-read sequence.
+            _tcp_nodelay(sk)
             if get_proxy_type() == "socks5":
                 # the client side of RFC 1928: method negotiation, then
                 # CONNECT with the DOMAIN name (ATYP=03 - the name goes
@@ -12191,6 +12291,12 @@ class BuiltinProxyEngine:
         self._sockets = []
         self._threads = []
         self._stopping = threading.Event()
+        # v9.5 (the user's report): the per-proxy EGRESS IP cache of
+        # _open_upstream (host -> the last strict-DoH answer, dropped
+        # on the first connect failure so the next connection
+        # re-resolves; the Squid ipcache / sing-box outbound shape).
+        self._egress_ips = {}
+        self._egress_ips_lock = threading.Lock()
 
     def build_proxies(self, locations, verified):
         """v5.0: verified is the LIST of per-server entries from
@@ -12299,8 +12405,39 @@ class BuiltinProxyEngine:
 
     def _open_upstream(self, proxy) -> "ssl.SSLSocket":
         """TCP + TLS to the Mozilla/Fastly egress (same profile matrix as the
-        probe, so the probe result predicts what the engine can do)."""
-        return _tls_connect(proxy["host"], proxy["upstreamPort"], timeout=20)
+        probe, so the probe result predicts what the engine can do).
+        v9.5 (the user's report): the per-proxy EGRESS IP CACHE. Every
+        client CONNECT rides this method, and _tls_connect used to run
+        resolve_host() - a FULL strict-DoH chain round (fresh TLS
+        handshakes to the DoH providers) - on EVERY connection whose
+        answer fell outside the v5.6 60 s memo: a browser opening
+        dozens of connections re-resolved the script's OWN egress
+        hostname again and again. The mature-proxy shape (Squid's
+        ipcache; sing-box resolves its outbound server once and
+        re-dials on failure) is resolve ONCE per upstream and
+        re-resolve only when the cached answer FAILS: the cache rides
+        the engine instance, the fill AND the refresh both go through
+        resolve_host() (the STRICT-DoH semantics are untouched - no
+        system DNS anywhere), and a connect failure DROPS the entry
+        so the next connection re-resolves over DoH."""
+        host = proxy["host"]
+        with self._egress_ips_lock:
+            cached = self._egress_ips.get(host)
+        if cached is not None:
+            try:
+                return _tls_connect(host, proxy["upstreamPort"],
+                                    timeout=20, ips=cached)
+            except Exception:
+                with self._egress_ips_lock:
+                    self._egress_ips.pop(host, None)   # stale -> re-resolve
+                raise
+        ips = resolve_host(host)
+        if ips:
+            with self._egress_ips_lock:
+                self._egress_ips[host] = ips
+            return _tls_connect(host, proxy["upstreamPort"],
+                                timeout=20, ips=ips)
+        return _tls_connect(host, proxy["upstreamPort"], timeout=20)
 
     def _handle_client_socks(self, conn, proxy):
         """v8.0 (A4): ONE client connection over SOCKS5 (RFC 1928, the
@@ -12402,6 +12539,11 @@ class BuiltinProxyEngine:
             # v6.6 (item 6): TCP keepalive on BOTH sockets of the tunnel
             _tcp_keepalive(conn)
             _tcp_keepalive(upstream)
+            # v9.5 (the user's report): Nagle OFF on the tunnel sockets
+            # too (see _tcp_nodelay) - the relayed writes must not be
+            # stalled 40-200 ms by the delayed-ACK interaction.
+            _tcp_nodelay(conn)
+            _tcp_nodelay(upstream)
             try:
                 req = (f"CONNECT {target_full} HTTP/1.1\r\n"
                        f"Host: {target_full}\r\n"
@@ -12480,6 +12622,20 @@ class BuiltinProxyEngine:
                 _head, _sep, _early = resp.partition(b"\r\n\r\n")
                 if _early:
                     conn.sendall(_early)
+                # v9.5 (the user's report): the RELAY sockets go
+                # BLOCKING before the pumps start. The handshake phases
+                # set conn.settimeout(60) and the egress socket carried
+                # timeout=20 out of _tls_connect - without this reset
+                # the relay recv()s raised socket.timeout after 20/60 s
+                # of SILENCE and tore down every idle tunnel (browser
+                # keep-alives, preconnects), so each next request
+                # re-paid the whole SOCKS5 + egress-TLS handshake: the
+                # run 'worked but felt slower'. The v6.6/v6.7 design is
+                # the UNBOUNDED first-direction wait - a dead peer is
+                # reaped by the TCP keepalive above, not by a recv
+                # timeout.
+                conn.settimeout(None)
+                upstream.settimeout(None)
                 t1 = threading.Thread(target=_relay, args=(conn, upstream),
                                       daemon=True)
                 t2 = threading.Thread(target=_relay, args=(upstream, conn),
@@ -12642,6 +12798,21 @@ class BuiltinProxyEngine:
                     # Any bytes the client sent past its head go to the tunnel
                     if leftover:
                         upstream.sendall(leftover)
+                    # v9.5 (the user's report): the RELAY sockets go
+                    # BLOCKING before the pumps start. The handshake
+                    # phases set conn.settimeout(60) and the egress
+                    # socket carried timeout=20 out of _tls_connect -
+                    # without this reset the relay recv()s raised
+                    # socket.timeout after 20/60 s of SILENCE and tore
+                    # down every idle tunnel (browser keep-alives,
+                    # preconnects), so each next request re-paid the
+                    # whole SOCKS5 + egress-TLS handshake: the run
+                    # 'worked but felt slower'. The v6.6/v6.7 design
+                    # is the UNBOUNDED first-direction wait - a dead
+                    # peer is reaped by the TCP keepalive above, not
+                    # by a recv timeout.
+                    conn.settimeout(None)
+                    upstream.settimeout(None)
                     t1 = threading.Thread(target=_relay, args=(conn, upstream), daemon=True)
                     t2 = threading.Thread(target=_relay, args=(upstream, conn), daemon=True)
                     t1.start(); t2.start()
