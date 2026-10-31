@@ -4,6 +4,1204 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-10-31 (v9.3) - THE FULL IMPLEMENTATION AUDIT (the user's
+  request: check EVERY implementation for correctness and adequacy, the
+  comments AND the code, compare with the analog projects and verify
+  THEIR implementations too; every algorithm NOT listed here is
+  UNTOUCHED - the audit swept the FxA/Guardian auth chain, the Fastly
+  solver, the crypto, the DoH stack, the raw-IP fallbacks, the TLS
+  split, the probes, both engines, the DNS relay, the pass monitor,
+  the exports, the doctor and the watch loop against mozilla/fxa
+  (account.ts), product-details.mozilla.org and the Go reference
+  client's CURRENT sources, and found everything else CORRECT).
+
+  1) THE DOCTOR TYPO: step 6 posted /account/credentials_status (an
+     UNDERSCORE) while the real FxA route - verified against
+     mozilla/fxa packages/fxa-auth-server/lib/routes/account.ts
+     (PR #21517) - is /account/credentials/status, the exact route
+     get_credentials_status() already rides. The underscore form
+     always 404'd and the step's 'any REAL server answer is a pass'
+     rule masked the typo as an OK; the doctor now exercises the
+     REAL route (a 404 answer can no longer masquerade as a pass
+     either - only 200/400/403 of the real endpoint count).
+
+  2) THE DOCTOR DoH STEP no longer reports a misleading FAIL when
+     the user chose the SYSTEM resolver (DoH 'off'): resolve_host()
+     is a no-op BY DESIGN in that mode, and the system resolution is
+     already proven by step 4; the step now says exactly that (the
+     new tr key doctor_doh_system, en+ru) and PASSES.
+
+  3) THE FASTLY SOLVER IDENTITY: the challenge flow rode a
+     Chrome-macOS UA (the pagpeter/fastly-antibot-era port) while
+     every FxA API request rode the pinned Firefox UA - an
+     inconsistent client identity on the SAME *.firefox.com hosts.
+     The Go reference client pinned its solver to the FxA UA on
+     2026-10-31 with the exact reason ('challenge cookies may be
+     tied to the client identity'); FASTLY_UA is now the SAME
+     Firefox UA as BROWSER_HEADERS (a real Firefox sends it to
+     accounts.firefox.com too), so the solver and the API requests
+     present ONE identity.
+
+  4) THE PINNED FIREFOX VERSION: 158.0.1 -> 159.0, the ACTUAL
+     current stable (product-details.mozilla.org
+     LATEST_FIREFOX_VERSION, released 2026-10-27; the Go reference
+     client pins 159.0 as well). The value drives the serverlist
+     filter_expression (env.version versionCompare) and the
+     User-Agent, so it must stay a plausible CURRENT Firefox.
+
+  5) THE CLIENTMETRICS STUB parity with the Go solver
+     (fastly.go clientMetricsAnswer, the 2026-08-22 sync): the
+     answer now also carries detector_results {} and v 2, and
+     error_trace is JSON null (the old stub predates both fields
+     and sent a '""' string).
+
+  6) THE STALE DoH COMMENTS (a comment-vs-code mismatch the audit
+     class is about): the resolve_host() and _doh_chain()
+     docstrings still said 'the SYSTEM resolver is the last
+     resort' - untrue since the v5.29 STRICT default (the system
+     resolver runs only with the explicit --system-dns-fallback
+     opt-in, or when DoH is off). The wording now matches the
+     code; the code itself was already correct.
+
+  7) check_running() (the builtin engine's defensive listener
+     restart) could itself CRASH: getsockname() on a socket that
+     already died raises OSError and the set comprehension
+     propagated it into the watch loop's generic 'Unexpected
+     error' retry - the opposite of what a defensive method is
+     for. Every listener's port is now read best-effort; a dead
+     socket simply counts as 'not alive' and gets restarted.
+
+VERSION 2026-10-31 (v9.2) - THE SPURIOUS 'SESSION LOOKS BROKEN' REFRESHES
+  (the user's report: 'Egress answered HTTP 502' lines and the '3+
+  distinct targets failed... refreshing the pass now' cascade started
+  appearing in the latest version; every algorithm NOT listed here is
+  UNTOUCHED).
+
+  1) THE ROOT CAUSE: the v6.6 pass-health books grew FOREVER. The
+     '3+ distinct targets' rule of _PassMonitor kept ONE entry per
+     DISTINCT target with NO expiry and NO success reset - three
+     unrelated ONE-OFF failures of three different destinations
+     (dead/blocked sites), however far apart in time, accumulated
+     until the script concluded 'the session looks broken' and
+     refreshed the proxyPass even though the tunnel served successful
+     CONNECTs the whole time. THE V9.0 CONNECTION: the socks5 default
+     made such failures VISIBLE - with remote DNS (the socks5h
+     semantics) a dead/blocked destination now fails AT THE EGRESS
+     with 502 instead of dying in the local resolver, so the books
+     filled with the ordinary 'this site is dead from the exit
+     country' noise. THE FIX (verified online 2026-10-31 against
+     Firefox's OWN IPP design - the proxy state machine escalates
+     only REPEATED failures and RESETS the connection/error history
+     when the connection works again; the pass rotation fires on the
+     401-class rejection while staying ACTIVE): (a) a failure counts
+     only while it is FRESH - a _PASS_FAIL_WINDOW of 60 s prunes
+     stale entries before the threshold check (a REAL broken session
+     bursts through three distinct targets in seconds; one-off noise
+     spread minutes apart can never trip it); (b) every SUCCESSFUL
+     CONNECT through an egress drops THAT egress's recorded failures
+     (the books are now target -> (ts, egress host)) - a working
+     tunnel is direct evidence the session is alive; (c) a pass
+     rotation (mark_refresh) clears the books - the old entries
+     belong to the OLD pass. The stale-pass burst case still
+     refreshes in seconds, and the 400/401/403 PASS-REJECTION class
+     is UNTOUCHED (still an immediate refresh).
+
+  2) THE DNS RELAY'S OWN DoH TARGET NO LONGER FEEDS THE PASS-HEALTH
+     BOOKS. The engine sees the relay's DoH CONNECT like any client's;
+     with the v9.1 'the CHOSEN provider ONLY' contract a blocked or
+     unreachable provider fails EVERY relayed DNS query - one
+     'Egress answered HTTP 502' line per query plus a book entry each
+     time. v9.2: the current DoH wire target (_is_doh_wire_target)
+     is exempted from the target-failure classes (502/504 / the
+     tunnel-open timeout) with ONE calm
+     connect_target_doh_unreachable line per run per target (the new
+     tr key, en+ru); the PASS-REJECTION classes stay counted for it -
+     a rejected pass is a rejected pass whatever the target. The
+     relayed queries keep their own failure semantics (nothing is
+     sent, the client's resolver retries).
+
+VERSION 2026-10-31 (v9.1) - THE RELAY DoH: THE USER'S CHOICE ONLY (the
+  user's request; every algorithm NOT listed here is UNTOUCHED).
+
+  1) NO MORE 'BY THE CIRCLE' DoH CHAIN IN THE DNS RELAY. The
+     v8.5/v9.0 relay chain (the selected provider FIRST, then the
+     hardcoded cloudflare/google/quad9 trio - DNS_RELAY_FALLBACK -
+     inside the SAME DNS_RELAY_BUDGET) is REPLACED by EXACTLY ONE
+     target: the provider the USER chose - the hotkey-'h' menu /
+     --doh / the SAVED settings.doh (the choice that survives
+     restarts). A custom --doh-url endpoint stays the USER's choice
+     too (its URL is parsed best-effort exactly as before); when
+     NOTHING is chosen - or the choice is 'off', because the relay
+     speaks DoH BY DESIGN and cannot query a system resolver
+     through the egress - the built-in DEFAULT 'cloudflare' applies
+     (the exact v6.8 default). THE REASON (the user's): a fallback
+     walk answers through a provider the user did NOT pick - the
+     same leak class v9.0 closed for the PROXIES is now closed for
+     the DoH TARGET: if the chosen provider is dead, or a custom
+     JSON-only endpoint cannot speak the RFC 8484 wireformat, the
+     relay fails THAT query (nothing is sent; the client's resolver
+     retries, like any plain DNS) - it NEVER silently answers
+     through somebody else. DNS_RELAY_FALLBACK is REMOVED (dead
+     code); DNS_RELAY_TIMEOUT (5 s) still bounds the ONE attempt
+     and DNS_RELAY_BUDGET stays the per-query cap.
+
+  2) THE HOTKEY. The choice is made - and changed LIVE (the relay
+     reads doh_wire_targets() on EVERY query: no restart, no
+     engine rebuild) - in the SAME hotkey-'h' menu that has always
+     set the script's own resolver; the menu hint, the
+     hotkeys-hint 'h' line, the hotkey_doh message and the --doh /
+     --doh-url help now SAY that the per-proxy DNS endpoints ride
+     the CHOSEN provider ONLY (default cloudflare). The script's
+     OWN DoH chain (resolve_host of the egress/API hostnames, the
+     v5.x provider penalty / fallback) is UNTOUCHED - the request
+     is about the RELAY.
+
+VERSION 2026-10-31 (v9.0) - PER-PROXY DNS + THE SOCKS5 DEFAULT (the
+  user's two requests; every algorithm NOT listed here is UNTOUCHED).
+
+  1) EVERY PROXY'S DNS RIDES THAT PROXY ONLY - the v8.9 ONE shared
+     round-robin DNS endpoint is REPLACED by the v8.5 per-proxy
+     scheme again (ONE deterministic '<location>|dns' UDP+TCP
+     endpoint per started proxy, BOTH engines, ON by default): a
+     query entering through the DNS port of proxy X is relayed
+     through THE LOCAL LISTENER OF PROXY X and NOTHING else. The
+     DoH TARGET chain still walks (the selected provider first,
+     then the hardcoded cloudflare/google/quad9 trio) inside the
+     SAME DNS_RELAY_BUDGET - but ALWAYS through that one proxy.
+     THE REASON (the user's): a country can block resources BY
+     DNS; with the v8.9 round-robin a query could be answered
+     through ANY other country's exit, so the user who had just
+     switched to another country's proxy could STILL see the old
+     country's DNS block and not understand why. THE QUIET LOG IS
+     PRESERVED (v8.7): ONE dns_line summary after the proxy list
+     (the count + the per-proxy property + WHO needs the
+     endpoint), and every proxy_line now shows the DNS port of
+     ITS proxy (' DNS:<port>', only when the endpoint actually
+     bound - the v8.9 'the port must be visible' rule applied to
+     the per-proxy scheme); dns_port_busy is PER PROXY again (the
+     {label} is restored). --no-dns-relay is UNCHANGED (binds
+     nothing at all; the proxies and their socks5h remote DNS are
+     NOT affected).
+
+  2) THE DEFAULT LOCAL PROXY TYPE IS NOW 'socks5' (was 'http'
+     since v8.5) - RFC 1928 CONNECT-only with REMOTE DNS (the curl
+     socks5h/socks5a semantics: a DOMAIN request address is
+     passed through to the egress). COMPATIBILITY (the user's
+     question, verified online 2026-10-31 against the curl
+     documentation): 'socks5h' is NOT a separate wire protocol -
+     it is curl's name for a SOCKS5 CLIENT that sends the DOMAIN
+     name (ATYP=03) instead of a locally pre-resolved IP
+     (ATYP=01); the SERVER is the same SOCKS5 listener either way,
+     and this listener accepts BOTH request shapes, so every
+     program that 'only supports socks5' works: it resolves
+     locally and sends the IP, which the listener relays to the
+     egress verbatim (the only caveat is client-side: such a
+     program's DNS goes through the LOCAL resolver - use the
+     per-proxy DNS endpoints of item 1 or the app-level socks5h
+     setting when the local DNS is blocked or leaks). The
+     PRECEDENCE is UNCHANGED (an explicit --proxy-type, then the
+     SAVED settings.proxy_type, then the built-in default) and the
+     Ctrl+T menu / the hotkeys / --proxy-type / the sing-box
+     inbound mapping are UNCHANGED - only the never-chosen
+     built-in default flips (a SAVED http choice keeps winning,
+     the v6.9 sticky-settings contract).
+
+VERSION 2026-10-31 (v8.9) - ONE SHARED DNS ENDPOINT (the user's
+  decision after the v8.8 audit Q&A; every algorithm NOT listed here
+  is UNTOUCHED).
+
+  1) THE PER-PROXY DNS PORTS ARE GONE. The v8.5 scheme (one DNS port
+     per local proxy) is replaced by ONE shared UDP+TCP endpoint on a
+     single deterministic port (the 'dns-relay|dns' key of the same
+     port_for_location scheme - it can never collide with the proxy
+     ports). The user was right: the OS resolver holds ONE address,
+     so only one of the N per-proxy endpoints could ever be used -
+     the rest sat idle.
+  2) EVERY QUERY RIDES THE PROXIES ROUND-ROBIN: a query starts at
+     the round-robin pick; when the WHOLE DoH chain through that
+     proxy fails, the rotation walks on to the next proxy INSIDE the
+     SAME DNS_RELAY_BUDGET - the shared endpoint survives the loss
+     of any single proxy (a fixed single-proxy endpoint would not).
+  3) THE PORT IS NOW VISIBLE: dns_line (the ONE summary line after
+     the proxy list, v8.7) now names THE port and says WHO needs it -
+     point the SYSTEM resolver / any plain-DNS app at the address;
+     apps that already send domain names through the proxies
+     (socks5h remote DNS) do not need it. The v8.7 'one line'
+     change had left the ports unprinted entirely (the user's 'how
+     do I use it' question).
+  4) --no-dns-relay (env MOZVPN_DNS_RELAY, default ON, the
+     --system-dns-fallback BooleanOptionalAction shape): does not
+     bind the DNS endpoint at all; the proxies and their socks5h
+     remote DNS are NOT affected. dns_port_busy lost its {label}
+     (there is no per-proxy endpoint anymore).
+
+VERSION 2026-10-31 (v8.8) - THE AUDIT + THE QUAD9 CURRENCY FIX (the
+  user's audit request; every algorithm NOT listed here is UNTOUCHED).
+
+  1) THE FULL IMPLEMENTATION AUDIT (DNS RELAY / DoH / DPI / engines /
+     UI) - result: NO logic bugs found; every implementation is
+     coherent and matches the shapes the analogous projects ship
+     (see the audit report in the chat: foxhole-vpn runs the same
+     'DoH relay inside the tunnel', Zeus-VPN the same 'ClientHello
+     fragmentation + DoH-resolved server addresses + DoH through
+     the tunnel' trio, foxyvpn the same RFC 1928 CONNECT-only
+     remote-DNS SOCKS5). Nothing was rewritten.
+  2) ONE REAL STALENESS BUG FOUND AND FIXED: the Quad9 endpoints.
+     Quad9 RETIRED its JSON-based DNS service on TCP port 5053 on
+     5 May 2025 (their official announcement: 'migrate to DoH on
+     port 443') - verified live on 2026-10-31: dns.quad9.net:443/
+     dns-query answers (RFC 8484 wireformat; the ?name= JSON form
+     is gone), the 5053 JSON endpoint no longer serves JSON. FIXED
+     in all THREE tables: DOH_WIRE_ENDPOINTS['quad9'] -> port 443
+     (the v8.5 RELAY chain keeps quad9 as a WORKING wireformat
+     target), _DOH_IP_BOOTSTRAP quad9 -> port 443 (the emergency /
+     direct-IP JSON walk: the 443 endpoint answers a JSON request
+     with an error status and the loop walks on - fast, no hang),
+     DOH_PROVIDERS['quad9'] -> https://dns.quad9.net/dns-query.
+     The 'quad9' PRESET STAYS in the --doh menu (no user-visible
+     feature removed): as the script's OWN JSON resolver a
+     selected quad9 now fails into the v5.12 provider penalty and
+     the chain answers via cloudflare/google (Quad9 itself no
+     longer offers a JSON API anywhere - only the wireformat DoH
+     the relay speaks); as the RELAY wireformat target quad9 WORKS
+     again on the current port. Cloudflare / Google / NextDNS
+     entries are UNCHANGED (verified current).
+
+VERSION 2026-10-31 (v8.7) - THE QUIET DNS LOG + THE PROTOCOL HIGHLIGHT
+  (the user's live-run feedback; every algorithm NOT listed here is
+  UNTOUCHED).
+
+  1) THE DNS RELAY START IS NOW ONE SUMMARY LINE (was one line PER
+     PROXY - 30+ lines of ports in a real run, the user's report).
+     DnsRelay.start() counts the started DNS endpoints and prints
+     ONE dns_line with the COUNT: 'DNS relay {listen}: {n} DNS
+     endpoints (UDP+TCP; each rides its local proxy -> the egress ->
+     DoH {target})'. dns_port_busy stays PER PORT (a busy port is
+     actionable info, not noise); the relay itself is UNCHANGED.
+     The dns_line tr keys are REWORDED in en+ru (no new keys).
+  2) THE LOCAL PROXY PROTOCOL IS NOW VISIBLE AND HIGHLIGHTED in the
+     console UI: (a) 'socks5' and 'http' joined the proto class of
+     the theme auto-highlighter (_RE_TOKENS) - the local proxy type
+     is painted with the SAME bold color as masque/connect wherever
+     it appears (the engine start line, the Ctrl+T menu, the type
+     switch messages, the hotkeys hint); (b) engine_started now
+     names the ACTIVE local proxy type: '{engine} engine started:
+     {n} local proxies on {listen} ({ptype})' - both engines, on
+     every (re)build. proxy_line's [proto] (the UPSTREAM protocol,
+     masque/connect) is UNCHANGED and keeps its own bracket shape.
+
+VERSION 2026-10-31 (v8.6) - DPI PROTECTION FOR THE DoH ITSELF (the
+  user's clarified request; every algorithm NOT listed here is
+  UNTOUCHED).
+
+  1) THE v8.5 DNS RELAY'S DoH TLS NOW RIDES THE SAME ClientHello
+     FRAGMENTATION as the egress TLS (tls_split() / --tls-split /
+     hotkey 'i' - ON by default): the TLS handshake to the DoH
+     provider inside the proxy tunnel goes out through _FragTLSConn
+     (the v7.0 two-TLS-records + small-TCP-segments combination),
+     so an SNI-matching DPI cannot read the DoH provider SNI from
+     the first segment of the flow (the same class of national
+     filters that cut cloudflare-dns.com by the ClientHello SNI -
+     the technique the DoH-capable DPI-bypass tools ship: SecretDNS
+     'SNI fragmentation', dns-mns --fragment sni, DPIReaper's
+     SNI split). ANY fragmented-handshake failure falls back to a
+     FRESH proxy tunnel + the plain handshake (the v6.1 lesson: a
+     hardening must never break the data path).
+  2) THE SCRIPT'S OWN DoH BOOTSTRAP (the resolver behind
+     resolve_host() that resolves the egress/API hostnames) now
+     contacts the PRESET resolvers by their WELL-KNOWN IPs
+     DIRECTLY (the dnscrypt-proxy shape - a DoH server address is
+     an IP, so the resolver hostname is NEVER resolved with the
+     system resolver): cloudflare/google/quad9 go through
+     _raw_https(frag=True) - the TLS handshake to the resolver is
+     FRAGMENTED like every other script TLS; a direct-IP failure
+     falls back to the exact v8.5 paths (the broken-resolver state
+     -> the v5.36 emergency DoH walk, the healthy state -> the
+     plain urlopen query). _raw_https gains an OPT-IN frag
+     parameter: its OTHER callers (the API direct-IP fallbacks of
+     req_full / the Fastly WAF flow) pass nothing and keep the
+     byte-for-byte v8.5 behavior; _emergency_doh_resolve passes
+     frag=True (it is a DoH path). nextdns / a custom --doh-url
+     endpoint keep the urlopen transport verbatim (their IPs are
+     unknowable without a name resolution).
+  3) VERIFIED ALREADY PRESENT (the user's point 2, NO change): the
+     connections to the fastly/Mozilla VPN egress and the API hosts
+     resolve hostnames over DoH ONLY (resolve_host() strict mode,
+     v5.29 - no silent system-DNS fallback) and the egress TLS
+     already uses the fragmented ClientHello (_tls_connect).
+
+VERSION 2026-10-31 (v8.5) - TWO PROXY TYPES + DNS THROUGH THE LOCAL
+  PROXIES (the user's request; every algorithm NOT listed here is
+  UNTOUCHED).
+
+  1) THE LOCAL PROXY TYPES ARE NOW EXACTLY TWO: http AND socks5. The
+     v8.0 'mixed' single-port auto-detect listener is REMOVED:
+     --proxy-type accepts http/socks5, the Ctrl+T menu rides
+     _PROXY_TYPES (two options), the FoxyProxy exports drop their
+     mixed branch, and a SAVED 'mixed' choice of an older run
+     normalizes to the built-in default like every unknown value.
+  2) THE DEFAULT LOCAL PROXY TYPE IS NOW 'http' (was 'socks5' since
+     v8.0) - the classic HTTP CONNECT listener; the CONNECT target
+     hostname goes to the egress in every request, so the remote-DNS
+     property of the SOCKS5 listener holds for the HTTP listener too
+     (the SOCKS5 option itself is UNCHANGED: RFC 1928 CONNECT-only,
+     ATYP=03 domains passed through, the curl socks5h semantics).
+  3) THE LOCAL DNS ENDPOINTS (BOTH ENGINES, ON BY DEFAULT): every
+     local proxy now also serves a DEDICATED DNS port (the same
+     deterministic 20000..39999 port scheme, key '<location>|dns',
+     one UDP + one TCP listener): a client's plain DNS query (RFC
+     1035/7766) is relayed THROUGH THE LOCAL PROXY LISTENER at
+     127.0.0.1:<proxy port> - the SAME wire path every other client
+     rides (the SOCKS5 CONNECT with the DOMAIN name / the absolute
+     HTTP CONNECT) - so the query leaves through the EGRESS (the
+     remote proxy resolves the DoH provider's name) and is answered
+     by an RFC 8484 DoH wireformat POST (application/dns-message;
+     google's JSON /resolve is NOT a wireformat endpoint -
+     dns.google/dns-query is); the chain tries the SELECTED DoH
+     provider (hotkey 'h' / --doh) first, then the hardcoded
+     cloudflare/google/quad9 trio, bounded by a 10 s budget. The DNS
+     message is NEVER parsed or rewritten - the client's transaction
+     ID and EDNS options go VERBATIM and the answer returns VERBATIM.
+     So the clients' DNS goes local proxy -> remote proxy exactly
+     like their HTTP/SOCKS5 traffic (the user's request). The
+     script's OWN DoH bootstrap (resolving the EGRESS and the API
+     hosts) is UNCHANGED - it must run before any tunnel exists.
+     New tr keys (en+ru): dns_line, dns_port_busy; the ptype_desc_
+     mixed keys are REMOVED; hotkey_proxy_type / hotkeys_hint /
+     --proxy-type now list exactly http / socks5.
+
+VERSION 2026-10-30 (v8.4) - THE Ctrl+T PROXY-TYPE SELECTION MENU (the
+  user's request; every algorithm NOT listed here is UNTOUCHED).
+
+  1) CTRL+T OPENS A CHOICE MENU NOW, NOT A BLIND CYCLE. Since v8.0 the
+     hotkey cycled the LOCAL proxy type socks5 -> http -> mixed ->
+     socks5 - to reach 'http' from 'socks5' the user pressed it twice
+     with two engine rebuilds in between, and there was no way to SEE
+     the running type before switching. Ctrl+T now opens the SAME
+     generic selection menu the 'h' DoH / 'y' language / 'z' files
+     hotkeys ride: every type is listed as 'number - name - short
+     description' (SOCKS5: remote DNS; HTTP CONNECT; mixed: SOCKS5 +
+     HTTP on one port, auto-detected), the RUNNING type is marked
+     [x], the current type is named in the menu hint; type the number
+     and press Enter (Backspace deletes a digit, any other key
+     cancels, the menu exits automatically after applying - the
+     v5.30 auto-exit). Choosing the CURRENT type is an explicit
+     no-op (just the 'selected' line, no needless rebuild); choosing
+     a NEW type runs the EXACT v8.0 cycle apply sequence - set +
+     save settings.proxy_type + stop the engine, and the next
+     watch-loop iteration rebuilds the listeners (both engines read
+     get_proxy_type() at build time). --proxy-type is UNCHANGED,
+     the PAC rules of v8.2/v8.3 are UNCHANGED, the OTHER hotkeys
+     are UNCHANGED. New tr keys (en+ru): ptype_menu_hint,
+     ptype_menu_entry, ptype_desc_socks5, ptype_desc_http,
+     ptype_desc_mixed; hotkey_proxy_type / hotkeys_hint /
+     proxy_type_selected now speak of the menu; two new _EMOJI
+     entries (the wrench).
+
+VERSION 2026-10-30 (v8.3) - THE PAC AUTO-CREATE BUG FIX (the v8.2
+  contract was broken by ONE line; every algorithm NOT listed here
+  is UNTOUCHED).
+
+  1) THE DEFAULT <config dir>/mozvpn.pac WAS STILL WRITTEN ON EVERY
+     ENGINE REBUILD (the user's live report). ROOT CAUSE: the v8.2
+     maybe_pac_export() normalized the --pac-export argument with
+     'str(custom).strip() if custom is not None else ""' - and that
+     normalization ITSELF collapsed argparse's None (the flag was
+     NOT given; default=None) into "" (the BARE-flag opt-in value;
+     const=""), so the branch 'on_demand or custom == ""' matched
+     the NO-FLAG case too and every rebuild re-created the default
+     copy - the exact opposite of the v8.2 promise. THE FIX: the
+     None-vs-"" distinction is preserved (None stays None):
+     NO flag -> the default copy is written by the Ctrl+P hotkey
+     ONLY (nothing at startup, nothing on a rebuild); the BARE
+     --pac-export opt-in -> the default copy on every rebuild (the
+     v8.0 behavior, back by explicit request); an EXPLICIT
+     --pac-export FILE -> the named copy on every rebuild (plus the
+     default copy on Ctrl+P). One line changed, zero other
+     algorithms touched; the rest of the v8.2 delivery was audited
+     and confirmed correct (the digit-hotkey honesty, the
+     hotkey_no_file message, the on_demand plumbing, the Ctrl+P
+     handler, the argparse help).
+
+VERSION 2026-10-30 (v8.2) - THE HONEST DIGIT HOTKEYS + THE PAC FILE
+  ON DEMAND (the user's two requests; every algorithm NOT listed here
+  is UNTOUCHED).
+
+  1) THE DIGIT HOTKEYS STOPPED PROMISING '1-9'. Since v6.0 the
+     editable config is ONE file (config.json), so only '1' opens
+     anything - digits 2-9 used to fail SILENTLY while the hint
+     promised '1-9'. The hotkeys hint now says '1 - open
+     config.json', the 'z' line no longer counts 'files past the
+     ninth', and the files-menu hint describes the REAL token flow
+     (token + Enter, Backspace deletes, any other key cancels). The
+     MECHANISM stays dynamic (config_open_files() decides the list),
+     and an out-of-range digit now SAYS so via the new hotkey_no_file
+     message instead of doing nothing. The 'z' full menu is UNCHANGED
+     (it already handles every listed file).
+
+  2) THE PAC FILE IS NO LONGER AUTO-CREATED. Every engine rebuild
+     used to write <config dir>/mozvpn.pac unconditionally; now the
+     DEFAULT copy is written on demand by the Ctrl+P hotkey ONLY. An
+     explicit --pac-export FILE is still honored on every rebuild
+     (the user named the destination), and a bare --pac-export opts
+     back into the v8.0 auto-write behavior. The PAC CONTENT - the
+     FoxyProxy-style DIRECT bypass list and the fail-over chain - is
+     UNTOUCHED; the useful-by-default options (DoH, the DoH cache,
+     the TLS ClientHello fragmentation) stay ON exactly as before.
+
+VERSION 2026-10-30 (v8.1) - THE CHANNEL NOTE REFINEMENT + THE REAL
+  EMOJI WIDTH TABLE + THE IN-PLACE UI PANEL (the user's three
+  requests; every algorithm NOT listed here is UNTOUCHED).
+
+  1) THE CHANNEL NOTE, ROUND 3 ('it can probably handle more than
+     just TCP, no?'). Re-verified against the Fastly engineering
+     blog ('We built the proxy behind Firefox's new built-in VPN'),
+     the Firefox networking docs ('CONNECT-UDP in Firefox') and the
+     Mozilla Remote Settings server list: the channel TODAY is an
+     HTTP CONNECT tunnel over HTTP/2 - a RAW TCP tunnel, so ANY TCP
+     protocol and ANY destination port rides it (no port whitelist;
+     Fastly: 'anything can run through it. TLS, Web sockets, custom
+     protocols, even other proxies'); UDP/IP is the NEXT step via
+     MASQUE over HTTP/3 (RFC 9298 CONNECT-UDP is already implemented
+     in the Firefox networking stack - HTTP/3-only - and the
+     server list already carries a per-server 'masque' protocol
+     next to 'connect'). channel_limits_note (en+ru) and the
+     startup comment now state exactly that. CODE AUDIT: no code
+     change was needed - the builtin engine and the sing-box
+     configs relay every CONNECT host:port; a destination-port
+     whitelist never existed on our side either. aioquic stays the
+     optional HTTP/3/MASQUE dependency.
+
+  2) THE HOTKEY HINT COLUMN, PART 2 ('the icons are slightly off -
+     their width differs across platforms'). The v6.0 fix PADDED the
+     icons to one column, but _cw() itself still used the blanket
+     'everything in 0x1F300-0x1F64F is 2 cells' rule, and the REAL
+     East Asian Width table says otherwise: U+1F39B (control
+     knobs, the Ctrl+T icon) is NEUTRAL = 1 cell, so that hint line
+     was one column off on every standard-following terminal.
+     _cw() now checks the emoji/symbol planes against the REAL
+     EAW=W table (Unicode 18.0.0 - the wcwidth project's
+     table_wide.py, verbatim 0x2300-0x2BFF + 0x1F000-0x1FBFF
+     ranges), and the narrow-base hint icons were replaced with
+     guaranteed-wide pictures: Ctrl+C now leads with U+26D4 (no
+     entry) instead of U+23F9+VS16 (the VS16 presentation renders
+     1 cell on legacy terminals), Ctrl+T with U+1F527 (wrench)
+     instead of U+1F39B. Every other hint icon was audited against
+     the same table and is genuinely wide.
+
+  3) THE TOKEN REFRESH NO LONGER FLOODS THE LOG ('part of the UI is
+     re-printed on every refresh - redraw the current output
+     instead'). Every ~10-minute refresh used to APPEND the whole
+     per-refresh block: the proxyPass line, the quota, the raw +
+     decoded JWT, the next-refresh countdown, the FULL hotkeys
+     hint, the config-files list and the clear-cache targets - 50+
+     rows per refresh. That block is now a LIVE PANEL redrawn in
+     place (ANSI cursor-up + clear-per-row erase, exact wrapped-row
+     counting), so a refresh costs ZERO new log rows. Any real log
+     line (a warning, a hotkey action, a rebuild message) LIFTS the
+     panel, prints above its old position and DROPS it back below -
+     the log keeps scrolling, the panel stays pinned at the bottom,
+     and the TOTP code line stays a log line (a code lives 30 s; a
+     once-per-refresh panel row would show a dead code). Theme and
+     color switches re-render the panel in the new style. The
+     fallback is the classic append (byte-for-byte the old
+     behavior) whenever in-place redraw is impossible: no tty (a
+     pipe/file), a dumb TERM, or a window too short for the block.
+
+VERSION 2026-10-30 (v8.0) - THE ANALOG-RECON ROUND 4 IMPLEMENTATION (the
+  user's request: implement the round-4 report items - A2, A3, A4,
+  B3, B4, B5, C1, C2, C4 - reusing the VERIFIED open patterns of
+  the mature analogs instead of inventing; every algorithm NOT
+  listed here is UNTOUCHED; every feature is wired to a launch
+  parameter AND a hotkey and activates ON by default wherever it
+  cannot break the data path).
+
+  1) A2: THE ACCOUNT AUTO-ROTATION BY QUOTA (the armanlife
+     'multi-account: when one account's data runs out, the next
+     takes over automatically' / Zeus 'moves to the account with
+     the most data left' pattern). print_quota() now RECORDS the
+     parsed X-Quota numbers: a module-level snapshot (_QUOTA_LAST,
+     the zero flag the watch loop reads) and the per-account
+     bookkeeping in config.json (quota_remaining/quota_limit/
+     quota_reset/quota_seen) - so the rotation planner ranks the
+     OTHER cached accounts by their LAST KNOWN remaining data.
+     The watch-loop trigger: the CURRENT account reports quota
+     zero (remaining <= 0, not unlimited) and auto-rotation is on
+     -> pick_rotation_account() chooses the OTHER cached account
+     with the LARGEST known remaining (unknown counts as a viable
+     candidate, a known-zero account is NEVER a target; accounts
+     without a CACHED session token are skipped - the rotation
+     rides cached sessions, never password logins, exactly the
+     foxyvpn-pool lesson: an FxA 429 login cooldown must never
+     be triggered by the rotation itself) and switches the WHOLE
+     profile with the SAME sequence as the hotkey-'a' selection
+     (args/creds/TOTP provider, cfg_set_current, save_cache,
+     apply_profile_runtime, engine stop -> the next iteration
+     rebuilds the listeners from the NEW profile's filter and
+     configs). --auto-rotate / --no-auto-rotate (default ON - a
+     useful option ships enabled; the switch only GATES the
+     trigger, the quota bookkeeping runs regardless), hotkey
+     Ctrl+R, the choice is SAVED (settings.auto_rotate). When no
+     other account has data left, ONE warning is printed (not one
+     per refresh) and the run continues on the current account.
+
+  2) A3: THE PASSWORDLESS LOGIN FROM A DESKTOP FIREFOX PROFILE
+     (--fxa-profile, a LAUNCH PARAMETER ONLY - no hotkey, per the
+     user's explicit request; the foxhole-vpn AUTH.md pattern:
+     sessionToken read from signedInUser.json, field
+     accountData.sessionToken). --fxa-profile PATH accepts the
+     signedInUser.json file itself OR the profile DIRECTORY; the
+     token rides the SAME grant_type=fxa-credentials flow every
+     password sign-in already rides (oauth_token() below - no new
+     auth code), but with NO password login at all: the Fastly
+     bot wall on third-party password logins and the FxA 429
+     login rate limit never apply, no 2FA is prompted (the
+     profile session is already verified), and the token is
+     RE-READ FRESH on every ensure_session() call, so a
+     Guardian-401 relogin after the user re-signed Firefox picks
+     the new session automatically. Precedence: an explicit
+     --session-token still wins, --fxa-profile beats the CACHED
+     account session. errno 110 on the OAuth mint raises the
+     existing relogin path, which re-reads the profile file and
+     tells the user to sign into Firefox again (the localized
+     messages fxa_profile_* carry the actionable hint).
+
+  3) A4: THE SOCKS5 LOCAL LISTENER + THE SWITCHABLE PROXY TYPE.
+     The builtin engine now serves SOCKS5 (RFC 1928, the CONNECT
+     command only - the same scope as foxyvpn's SOCKS5 and the
+     foxhole SOCKS5/HTTP single-port pattern): the greeting
+     handshake (VER 05, NO AUTHENTICATION REQUIRED), the request
+     parse (ATYP 01 IPv4 / 03 DOMAIN / 04 IPv6), the bounded
+     upstream ride IDENTICAL to the HTTP CONNECT path (the same
+     TLS profile matrix, the same Bearer pass, the same
+     _PassMonitor signals - a rejected pass refreshes the token
+     at once, the same half-close drain window), and REMOTE DNS
+     BY DESIGN: a DOMAIN request address is passed THROUGH to
+     the egress (the curl socks5h/socks5a semantics - the egress
+     resolves the name, the local system DNS is bypassed - the
+     user's requested default). --proxy-type socks5|http|mixed
+     (default socks5), hotkey Ctrl+T (the cycle socks5 -> http ->
+     mixed -> socks5 restarts the engine so the listeners serve
+     the new type at once), the choice is SAVED
+     (settings.proxy_type). 'mixed' auto-detects the protocol of
+     EVERY connection by PEEKING the first byte without consuming
+     it (socket.MSG_PEEK, available on POSIX and Windows alike):
+     0x05 = a SOCKS5 greeting, anything else = an HTTP request
+     line. The sing-box engine maps the type to the OFFICIAL
+     sing-box inbounds (http -> 'http', socks5 -> 'socks', mixed
+     -> 'mixed' - the inbound that serves HTTP and SOCKS on one
+     port). The FoxyProxy exports (f/x, --foxyproxy-export,
+     --foxyproxy-legacy-export) now carry the SERVED type: type
+     'socks5' + proxyDNS true in the FoxyProxy Standard settings
+     (the schema.json enum http/https/socks4/socks5/pac/direct,
+     verified 2026-10-30) and type 3 + proxyDNS true in the
+     FoxyProxy 6/7 legacy entries (PROXY_TYPE_SOCKS5 - verified
+     against the official FoxyProxy Standard 7.5.1 example
+     settings, which use exactly "type": 3, "proxyDNS": true for
+     a SOCKS proxy).
+
+  4) B3: THE PAC EXPORT (the armanlife 'smart routing: local
+     sites open directly' idea, adapted to a terminal proxy).
+     build_pac_script() generates a FindProxyForURL that returns
+     DIRECT for localhost/private ranges (localhost, 127.*,
+     ::1, 10.*/172.16-31.*/192.168.*/169.254.* - the SAME bypass
+     list the FoxyProxy exports carry) and the LOCAL proxy for
+     everything else, with the PAC fallback chain listing EVERY
+     running listener and ending in DIRECT (a dead listener fails
+     over, the browser never hits a dead end). The directive
+     follows the proxy TYPE: SOCKS5 (the remote-DNS PAC entry)
+     or PROXY. The file is written to <config dir>/mozvpn.pac
+     AUTOMATICALLY on EVERY engine rebuild (idempotent, cheap -
+     a useful default ships enabled) plus to --pac-export FILE
+     when given; hotkey Ctrl+P rewrites it on demand.
+
+  5) B4: THE FxA UNBLOCK-CODE FLOW (the errno 125 dead end is
+     gone for interactive runs; the Zeus-VPN 'unblock codes
+     handled in the app' / fxa-js-client signIn pattern,
+     verified 2026-10-30 against the fxa-js-client sources and
+     the fxa-auth-server API: on errno 125 the server has
+     already emailed the 6-digit unblock code; the login is
+     retried with the code riding the payload as 'unblockCode',
+     and an EMPTY prompt input re-sends the letter via POST
+     /v1/account/login/send_unblock_code {email}). Bounded at
+     three prompts; a wrong code re-enters the same flow (the
+     server answers errno 125 again); non-interactive runs keep
+     the v6.6 blocked error VERBATIM.
+
+  6) B5: THE CONFIRMATION-LINK BRANCH of the emailed session
+     verification (the foxyvpn 'email 2FA code verification,
+     falling back to a confirmation-link prompt' / 4q4r 'or the
+     confirmation link, when FxA chooses that method' pattern).
+     The email-code prompt now accepts 'l' (or 'link'): the
+     user is told to open the confirmation LINK from the Mozilla
+     email in a browser, and the script POLLS GET
+     /v1/recovery_email/status (the onepw protocol's own
+     endpoint: 'the client can use /recovery_email/status
+     (requires sessionToken, not verification) until the user
+     clicks the email link and the API reports verification is
+     complete' - verified against the mozilla/fxa-auth-server
+     wiki, fetched 2026-10-30) with the same Bearer + Hawk
+     fallback auth as every other session route, every 10 s,
+     bounded at 300 s; the code path stays as it was and a
+     timeout simply returns to the prompt. The prompt text
+     (en+ru) now says both options exist.
+
+  7) C1: THE HAWK SIGNATURE IS REBUILT ON EVERY RETRY (the
+     foxyvpn rule: 'on Hawk-signed FxA requests, the request
+     signature is rebuilt fresh on every retry'). hawk_session()
+     now returns a _HawkHeaders dict that carries its own
+     rebuild closure, and every retry recursion of req_full()
+     (the 406 solve-and-retry cycles, the body-aware challenge
+     retry, the transient network retry and the emergency
+     direct-IP route) re-signs through _rebuild_hawk() before
+     the request goes out: a fresh ts + nonce every attempt -
+     the server may not verify the MAC today, but the code no
+     longer RELIES on that.
+
+  8) C2: ECH (Encrypted Client Hello) - AUDITED, VERIFIED AND
+     DELIBERATELY NOT ADOPTED (the round-3 watch-item stands):
+     verified online 2026-10-30 - OpenSSL 4.0 shipped the RFC
+     9849 ECH implementation (published March 2026), but the
+     CPython ssl module still does NOT expose it (the open
+     gh-89730 PRs #135435/#160318 are unmerged as of today), so
+     a stdlib-only script cannot send an ECH ClientHello yet.
+     When ssl gains ECH it slots in as ANOTHER transport
+     profile on top of the existing TLS matrix, beside
+     --tls-split; zero code changes now (nothing untestable
+     ships).
+
+  9) C4: THE --doctor ONE-SHOT DIAGNOSTICS (the foxhole-vpn
+     'doctor command' pattern): a READ-ONLY walk of the whole
+     chain the script depends on - the interpreter, the config
+     store + current account, every pip dependency and sing-box
+     (print_dependencies()), the system resolver, the DoH chain
+     (the configured provider, resolve_host()), the FxA API
+     reachability (the public credentials/status endpoint - the
+     Fastly challenge path is exercised implicitly), the server
+     list fetch, a REAL TLS handshake to a live egress
+     (_tls_connect - the full profile matrix), and the OAuth ->
+     Guardian -> quota chain on the CACHED session token ONLY
+     (never a fresh sign-in, never a prompt). Exit code 0/1.
+
+  10) THE NEW HOTKEYS Ctrl+R (auto-rotation), Ctrl+T (proxy
+      type) and Ctrl+P (PAC export) sit in the hotkeys list
+      NEXT TO the Ctrl+O/Ctrl+C block (en+ru, the same icon +
+      bold-key + description style; the control chars 0x12/
+      0x14/0x10 arrive as single bytes in cbreak mode on every
+      platform and the v6.3 _normalize_key() fix passes every
+      control character through unchanged).
+
+VERSION 2026-10-30 (v7.2) - THE SECOND v7.0 SYNTAX REPAIR (the
+  v7.1 file still did not parse: one comment line of the new
+  email-branch explanation lost its leading hash and the parser
+  met a bare date at line 7766). ONE hash restored, zero
+  algorithms touched: every algorithm NOT listed here is
+  UNTOUCHED. The whole file is additionally machine-checked now:
+  a character-level scan of every string / comment / bracket
+  state (no line ends inside an open one-line string, no
+  statement begins with a digit or dangling punctuation, every
+  bracket closes) passes over all lines of this file.
+
+VERSION 2026-10-30 (v7.1) - THE v7.0 SYNTAX REPAIR (the delivered
+  v7.0 did not even parse: one stray quote my side closed the
+  _waf_challenge_body docstring one character early, and the
+  parser stopped at line 5330). ONE character removed, zero
+  algorithms touched: every algorithm NOT listed here is
+  UNTOUCHED - and the v7.0 list below now actually runs.
+
+VERSION 2026-10-30 (v7.0) - THE ANALOG-RECON ROUND 3 (the user's
+  request: diff the current analogs again - their closed bugs,
+  pitfalls, useful features - and verify THEIR code too; every
+  algorithm NOT listed here is UNTOUCHED).
+
+  1) THE EMAILED-CODE SESSION VERIFICATION (the dead end is gone).
+     The Go reference client adopted the email-2fa login on
+     2026-08-22 ('Sync upstream token pool, email-2fa login, and
+     Fastly challenge solver': fxaVerifySession prompts for the
+     6-digit code FxA emails at login and POSTs it to
+     /v1/session/verify_code), and armanlife issue #19 plus
+     Vauth/FoxyVPN PR #46 (2026-10-29/30) confirm the third-party
+     FxA logins now lean on the Fastly bot wall. Verified against
+     the FxA sources (lib/routes/session.js, fetched 2026-10-30):
+     /session/verify_code rides the SAME sessionTokenBearer auth
+     with a sessionToken Hawk fallback as the TOTP route, payload
+     {'code': DIGITS}; a VALID code verifies the session via
+     'email-2fa' but a TOTP account is REFUSED (insufficientAal -
+     the AAL1 guard this file documented in v5.25), so the new
+     path is entered ONLY for accounts the script holds no TOTP
+     provider for and ONLY when a prompt is physically possible;
+     the EMPTY input re-sends the letter via /session/resend_code
+     (a no-op {} for TOTP accounts); non-interactive runs keep
+     the v6.9 reference dead end (the localized instructions)
+     VERBATIM.
+
+  2) THE FASTLY SOLVER ACCEPTANCE PROBE + THE BODY-AWARE CHALLENGE
+     DETECTION. The solver flow (v6.6/v6.7) now ends like the Go
+     fastly.go (fetched 2026-10-30): after 'success' the page is
+     RE-FETCHED through the same cookie jar and a page that still
+     carries the challenge markup means the earned cookie was NOT
+     accepted (the Go errChallengeNotAccepted - e.g. a rotated
+     exit IP) and is NOT latched/cached anymore (up to v6.9 it was
+     cached blindly and the API call had to rediscover the
+     rejection through the 406 re-solve loop). req_full() also
+     recognizes the client-challenge page in a RESPONSE BODY now
+     (the Vauth/FoxyVPN PR #46 report: the challenge arrives not
+     only as the classic empty-body 406 but also as 403/200/503
+     WITH the markup) and runs the same bounded solve-and-retry;
+     the exact empty-406 condition of v6.7 stays FIRST.
+
+  3) THE TLS-RECORD SPLIT AT THE SNI EXTENSION inside the existing
+     --tls-split fragmented handshake. Evidence, not fashion: zapret
+     issue #238 (the tpws TLS-record fragmentation ALONE did not
+     fool a DPI - the two records went in ONE TCP packet and the
+     DPI reassembled them; the ClientHello TCP split was the
+     working technique), and the Xray-core discussion #5969
+     (2026-04: Iran's national DPI now REASSEMBLES the classic
+     TCP-layer fragmentation; 'TLS record-layer fragmentation
+     bypasses DPIs that reassemble at the TCP layer but not at
+     the TLS record layer'). The v7.0 fragmented ClientHello
+     therefore carries BOTH: the single ClientHello record is
+     re-framed into TWO TLS records cut at the server_name
+     extension (the zapret tpws --tlsrec=sniext cut) and THEN
+     each record goes in TLS_SPLIT_CHUNK-byte TCP segments - the
+     DPI must now reassemble BOTH layers to see the SNI. RFC
+     5246 section 6.2.1 permits a handshake message to span
+     multiple records; an unparseable ClientHello keeps the v6.6
+     plain TCP segmentation and ANY fragmented-handshake failure
+     still falls back to the plain profile walk (the v6.6
+     item-12 contract).
+
+  AUDITED, VERIFIED AND DELIBERATELY NOT ADOPTED (the round-3
+  findings that change nothing):
+   * The Go token pool (-session-token as a .txt file, rotation on
+     HTTP 429 / quota-zero / 401-403, a .state file bound to the
+     token file's sha256, a 15-minute quota poll): mozvpn.py stores
+     WHOLE accounts (email + password + TOTP) with the multi-account
+     profile switch and rides the X-Quota headers on every token
+     response with the 429 cooldown - the pool solves a problem this
+     architecture does not have.
+   * The Go in-place session-token update on the proxyPass renewal:
+     already here (both engines' update_token()).
+   * The Go low-MTU H3 fix (InitialPacketSize 1200): quic-go's
+     default 1280 is the QUIC PAYLOAD size (1308 bytes on the wire
+     over a low-MTU link), but aioquic - the library of the MASQUE
+     probe - already defaults to max_datagram_size =
+     SMALLEST_MAX_DATAGRAM_SIZE = 1200 QUIC payload bytes (~1228
+     on the wire), below the 1280 MTU floor: no change needed.
+   * The Go HTTP/2 keepalive PING loop: mozvpn.py's upstream is a
+     per-proxy HTTP/1.1 CONNECT relay, not a pooled H2 session - the
+     adopted pacing is the v6.7 TCP keepalive.
+   * The July aimkiray batch (the explicit -country selection, the
+     verify-exit probe, the systemd health-check/status files):
+     already covered by --countries, the probe_geo exit check and
+     the config persistence.
+   * FoxyVPN's browser PKCE login (a WebView sign-in): needs a GUI
+     browser engine - out of scope for a terminal script whose
+     solver already rides the same control plane.
+
+VERSION 2026-10-30 (v6.9) - THE CHANNEL-NOTE RETRACTION + STICKY
+  USER SETTINGS + THE PROBE-TRAFFIC DEDUP (the user's three
+  requests; every algorithm NOT listed here is UNTOUCHED).
+
+  1) THE 'TCP-ONLY / WEB PORTS ONLY' CHANNEL NOTE WAS WRONG AND IS
+     RETRACTED. The v6.6 startup line claimed the egress 'proxies
+     the WEB ports only (80/443/8080/8443): other ports/protocols
+     are refused'. Re-verified against the operator's own
+     engineering blog (Fastly, 'We built the proxy behind
+     Firefox's new built-in VPN', fetched 2026-10-30): the rollout
+     speaks HTTP CONNECT over HTTP/2 with an evolution toward full
+     MASQUE over HTTP/3, and the CONNECT tunnel is a RAW TCP
+     tunnel - 'anything can run through it. TLS, Web sockets,
+     custom protocols, even other proxies'. NO destination-port
+     whitelist exists in any source: the 80/443/8080/8443 numbers
+     were the EGRESS LISTENER ports of a third-party server list,
+     mistaken for allowed DESTINATION ports; Fastly states it does
+     no deep packet inspection, and Mozilla positions the feature
+     for browser-level web traffic (not full-device tunneling).
+     channel_limits_note (en+ru) and its startup comment now state
+     only the verified facts.
+
+  2) STICKY USER SETTINGS (the user's request: the hotkey choices
+     reset at every restart). The doh/lang precedence - an
+     EXPLICIT argument wins, then the SAVED choice, then the env,
+     then the built-in default - now covers EVERY preference a
+     hotkey can flip: settings.theme (hotkey 'm' / --theme),
+     settings.color (hotkey 'n' / --no-color), settings.doh_cache
+     (hotkey 'k' / --doh-cache - the config-layout docstring has
+     carried this key name since v6.4), settings.tls_split (hotkey
+     'i' / --tls-split) and settings.engine (hotkey 'e' /
+     --local-proxy-engine). Every hotkey saves its state the moment
+     it flips it, the startup mirrors the EFFECTIVE state back into
+     the profile (the same write doh/lang already do), the argparse
+     defaults of the five became None ('not chosen') so a
+     never-written key can never pose as an explicit choice (the
+     v6.8 lesson), and apply_profile_runtime() re-applies the new
+     profile's theme/color/DoH-cache/fragmentation with the same
+     precedence (redrawing the log when the look changed; the saved
+     ENGINE of a profile applies at the next start - a live engine
+     switch stays hotkey 'e', which stops and recreates every
+     listener). DELIBERATELY NOT PERSISTED: --listen (hotkey 'l') -
+     binding 0.0.0.0 exposes every local proxy to the network and
+     must stay an explicit per-run decision; --doh-url and
+     --api-proxy (a custom URL may be secret); and --verbose (a
+     diagnostic that de-redacts the browsing destinations, opt-in
+     by design).
+
+  3) THE PROBE-TRAFFIC DEDUP (the user's report: the protocol
+     support test 'works long'). The probe phase was audited end
+     to end: the upstreams ALREADY run in a 64-thread pool with
+     per-upstream MASQUE/CONNECT overlap, daemon-thread DoH
+     prefill with in-flight dedup and the TCP-failure
+     profile-matrix abort - nothing there is serial. The real
+     waste was DUPLICATE TUNNELS: several locations share one
+     egress (and with --upstream-host EVERY entry points at the
+     same upstream), yet the old loop opened one probe tunnel per
+     ENTRY - N simultaneous TLS+CONNECT handshakes against the
+     same egress, N times the WAF-visible request rate, all to
+     learn the SAME fact. probe_upstreams_parallel() now probes
+     each UNIQUE (host, port, protocol) ONCE and fans the verdict
+     (including the CONNECT-fallback protocol switch of a failed
+     MASQUE probe) out to every entry that points at it - the
+     collect_verified_servers() merge already matched results by
+     (host, port), so the mapping is exact. The analogs agree with
+     the minimal-probe principle: the Go client verifies the exit
+     ONCE after connecting (main.go verifyExit) and Firefox runs
+     NO pre-flight probes at all (its IPPNetworkErrorObserver
+     reacts to failures instead).
+
+VERSION 2026-10-30 (v6.8) - THE DEFAULT-DoH BUG: THE BUILT-IN
+  'cloudflare' DEFAULT WAS UNREACHABLE (the user's live report: 'the
+  default resolver is the SYSTEM DNS, there is no DoH'; every
+  algorithm NOT listed here is UNTOUCHED).
+
+  ROOT CAUSE (found by reading the whole resolver-selection path):
+  load_doh_provider_cache() read settings.doh with a '' DEFAULT, so
+  a key that was NEVER WRITTEN - a fresh install, exactly the
+  do-nothing case the built-in default exists for - came back as '',
+  which the startup honored as 'the saved system-DNS mode'; the
+  'else env / else cloudflare' branch was DEAD CODE, and the startup
+  mirror then SAVED the '' right back into config.json: the bug
+  hardened itself on the very first run and looked like a
+  deliberate user choice forever after. Under the v5.31 doh.json a
+  MISSING FILE meant None and the default worked; the v6.0
+  uber-config rework lost the 'missing' case while this very
+  docstring kept promising 'None when nothing was saved yet'.
+
+  THE FIX (the documented contract is restored, in four places):
+  1) load_doh_provider_cache(): a MISSING key - and any legacy ''
+     the bug wrote - is None again ('never chosen'), so the startup
+     and apply_profile_runtime() fall through to MOZVPN_DOH or the
+     built-in 'cloudflare' default. Only an EXPLICIT marker keeps
+     the system-DNS mode.
+  2) save_doh_provider_cache(): the system-DNS choice is now stored
+     as the EXPLICIT 'off' marker (load maps 'off'/'system' -> ''),
+     so a deliberate hotkey-'h' / --doh off choice stays sticky
+     across restarts while a never-chosen key can never masquerade
+     as one again.
+  3) ONE-TIME HEAL of the poisoned configs: a settings.doh of ''
+     written by the bug is indistinguishable from a deliberate
+     pre-v6.8 choice, but the user's directive is explicit - the
+     DEFAULT IS CLOUDFLARE - so '' is treated as 'never chosen':
+     the next run selects cloudflare and persists it. A user who
+     really wants the system DNS re-picks it once with hotkey 'h'
+     (stored as 'off', survives restarts).
+  4) The legacy doh.json migration now maps a legacy '' to the
+     EXPLICIT 'off' marker: a pre-v6.0 '' was only ever written by a
+     deliberate old-version choice (a missing file produced no
+     entry), so the deliberate choice is preserved.
+
+  THE SECOND RE-CHECK OF EVERY ADOPTED IMPROVEMENT (the user's
+  request 2; all confirmed present and wired): anchored_exp() + all
+  its consumers, the Guardian 403 re-activation retry, the CONNECT
+  response classification (400/401/403 / 502/504 / timeout), the
+  _PassMonitor signal classes and the 1-second sleep poll with the
+  minRotationInterval floor, the half-close drain (the v6.7 fixed
+  semantics), the TCP keepalive on both tunnel sockets, the bounded
+  Fastly solver (3 rounds / 60 s / lock), the 406 re-solve loop
+  (v6.7), the blocked_login 429/errno-114 cooldown on login and
+  2FA, the quota_low <15% warning on every proxyPass refresh,
+  --api-proxy with the opener rebuild (and the v6.7 profile-switch
+  fix), --tls-split ON by default with the plain-TLS fallback,
+  --verbose target redaction, the auto-clear of a broken countries
+  filter, hotkey 'i', and the full en+ru tr/emoji set of the new
+  keys. One STALE hotkey-'i' comment still claiming 'OFF by
+  default' (a leftover of the v6.6 wording) was found by the
+  re-check and corrected.
+
+VERSION 2026-10-30 (v6.7) - THE SECOND PASS: ONE MORE ADOPTED
+  PATTERN, THE DEFAULTS-ON DIRECTIVE, AND THE v6.6 QUALITY AUDIT (the
+  user's three requests; every algorithm NOT listed here is UNTOUCHED -
+  the sign-in chain, the reference-parity auth/scopes/stretching, the
+  Fastly PoW solver core, the probe/engine design, the TLS profile
+  matrix, the strict-DoH contract and the hotkey UX are preserved
+  exactly as v6.6 left them). All the external facts below were
+  re-verified ONLINE on 2026-10-30 against the same analogs:
+  mozilla-firefox/firefox (toolkit/components/ipprotection/*) and
+  UjuiUjuMandan/firefox-vpn-client (fxa.go, http_client.go, tokens.go,
+  guardian.go, serverlist.go, main.go).
+
+  1) THE v6.6 HALF-CLOSE DRAIN BUG - the one place v6.6 really could
+     break the data path, and it did. v6.6 bounded BOTH relay joins of
+     the builtin engine's CONNECT tunnel (_HALF_CLOSE_DRAIN = 120 s
+     per join) and then closed both sockets - so a perfectly HEALTHY
+     tunnel (a long download whose client side stays silent for two
+     minutes) was KILLED after at most 4 minutes of quiet. The audit
+     re-read the Go source: halfCloseDrainTimeout is a DECLARE-ONLY
+     leftover constant in main.go (its tunnel copy path never uses
+     it), and the pre-v6.6 code waited for both relays UNBOUNDED
+     (t1.join(); t2.join()). The corrected semantics: the FIRST relay
+     direction is waited for UNBOUNDED again (that is the tunnel's
+     real lifetime - v5.0 parity, and the v6.6 TCP keepalive already
+     reaps a dead peer at the OS level, so an unbounded wait can no
+     longer pin a thread on a dead path); only the SECOND direction -
+     after the half-close - gets the bounded 120 s drain window, which
+     is exactly what 'drain after half-close' means. A live tunnel is
+     never closed by the clock anymore.
+
+  2) --tls-split IS ON BY DEFAULT NOW (the user's directive: every
+     USEFUL option ships enabled). The ClientHello fragmentation is
+     unconditionally beneficial (a single-packet DPI cannot read the
+     whole SNI from one segment) and CANNOT break the data path by
+     construction: every fragmented-handshake failure falls back to
+     the plain TLS profile matrix of _tls_profiles() on a fresh
+     socket, so the v6.1 lesson now holds by fallback, not by
+     opt-in. --no-tls-split / MOZVPN_TLS_SPLIT=0 restores the old
+     behavior; hotkey 'i' still toggles it live. --verbose stays
+     opt-in BY DESIGN: it de-redacts the CONNECT destinations (the
+     user's browsing history), and both references keep it off (the
+     Go -verbose defaults to false; Firefox gates debug logging
+     behind browser.ipProtection.log) - a diagnostic is not a
+     benefit. --api-proxy takes a URL and cannot have a default.
+
+  3) THE 406 RE-SOLVE LOOP OF THE GO CLIENT IS ADOPTED (fxa.go fxaDo:
+     maxChallengeAttempts = 5). The audit of the v6.6 code found the
+     gap: req_full() retried a 406 exactly ONCE, and when the edge
+     rejected a cookie that was ALREADY in the jar (a rotating
+     control-plane exit re-binds the WAF verdict to the IP), the
+     retry re-sent the SAME rejected cookie and the call died with
+     waf_406. The Go client re-solves the challenge FRESH on EVERY
+     406 of a call, up to 5 attempts. req_full() now does the same:
+     a 406 answered while a cookie was already sent drops the solved
+     latch, purges the stale _fs_ch_cp_* cookie from the jar AND from
+     the config cache, and ensure_fastly_cookie() then solves a NEW
+     challenge (still bounded by the v6.6 solver caps: 3 post-back
+     rounds / 60 s under the solve lock); up to
+     FASTLY_MAX_406_ATTEMPTS (= 5, the Go constant) solve-and-retry
+     cycles per request. The FIRST 406 of a call keeps the exact
+     v5.25 cache-or-solve behavior (reference parity), and the
+     emergency direct-IP route keeps its own single v5.25 retry
+     (that path only exists in the broken-resolver state).
+
+  4) _reset_fastly_session() KEEPS THE --api-proxy OPENER - an
+     integration bug of v6.6 found by the audit: the v5.x sequence
+     rebuilt _OPENER with a bare HTTPCookieProcessor, silently
+     dropping the v6.6 ProxyHandler, so after a profile switch
+     (hotkey 'a', an account delete, a wipe) --api-proxy stopped
+     routing the control plane without a word. The reset now calls
+     _rebuild_opener(), which picks up the fresh COOKIE_JAR and
+     re-applies the ProxyHandler of the moment.
+
+  5) THE CONNECT RESPONSE OVER-READ IS FORWARDED - a small v6.6
+     correctness gap: the builtin engine reads the upstream's CONNECT
+     answer with recv(4096) until the blank line, so the same read
+     may pull the FIRST TUNNEL BYTES past the response head (an
+     eager server, early data). v6.6 parsed the status and silently
+     dropped those bytes; the 200 path now partitions the response
+     and hands the client every byte read past the head before the
+     relays start - no tunnel byte is ever lost.
+
+  THE REST OF THE SECOND ANALOG PASS (the user's request 1; every
+  point verified online 2026-10-30): ALREADY COVERED by earlier
+  versions - the Guardian JWT clock-skew hardening (mozvpn's
+  anchored_exp() receipt anchoring is strictly stronger than the Go
+  detectProxyPassClaimTimeOffset candidate scan, and the Date-header
+  time sync already warns about a skewed local clock), the shared
+  cookie jar of the challenge flow (v5.36), X-Quota-*/Retry-After
+  parsing, quarantined-server skipping (build_city), the exit
+  IP/country verification (probe_geo - the Go -verify-exit), the
+  atomic 0600 config writes (tmp + os.replace), Guardian
+  401 -> relogin / 403 -> re-activate + retry / 429 -> cooldown
+  (v6.6), the bounded per-round solver (v6.6), the browser-style
+  header matrix (BROWSER_HEADERS, deliberately kept: reference
+  parity - the Go MozillaVPN UA is its own reference client's
+  choice, not Firefox's), and the Go token-file hygiene (N/A:
+  mozvpn keeps ONE uber-config, already atomic and 0600). NOT
+  APPLICABLE by design: the Firefox auto-activation/offline
+  observers (an OS-integrated browser service, not a CLI script)
+  and the Go session-token pool rotation (a multi-account farm
+  feature; mozvpn's account switching covers the single-user case).
+  ADOPTED NOW: only item 3 - the one pattern the analogs genuinely
+  had and mozvpn.py lacked.
+
+VERSION 2026-10-29 (v6.6) - THE 14 PRACTICAL PITFALLS (the Firefox-vs-Go
+  comparison the user requested; every algorithm NOT listed here is
+  UNTOUCHED - the sign-in chain, the reference-parity auth/scopes/
+  stretching, the Fastly PoW solver core, the probe/engine design, the
+  TLS profile matrix, the strict-DoH contract, the hotkey UX and the
+  whole feature set are preserved exactly as v6.5 left them). All the
+  external facts below were verified ONLINE on 2026-10-29 against the
+  Firefox IP Protection sources (mozilla-firefox/firefox, toolkit/
+  components/ipprotection: GuardianTypes.sys.mjs, IPPProxyManager.sys.mjs,
+  IPPNetworkErrorObserver.sys.mjs) and the Go reference client
+  (UjuiUjuMandan/firefox-vpn-client, cmd/proxy-demo: main.go, fastly.go).
+
+  1) THE proxyPass EXPIRY IS NOW ANCHORED TO OUR CLOCK AT RECEIPT.
+     Firefox GuardianTypes.ProxyPass does exactly this (verbatim:
+     'Anchor the pass to our clock at receipt: it is valid from now for
+     the token's lifetime. This makes rotation scheduling immune to any
+     drift between Guardian's clock (nbf/exp) and ours'). The old code
+     scheduled the refresh from the JWT's ABSOLUTE 'exp', which a skewed
+     local clock misreads in BOTH directions (a slow clock 'extends'
+     the pass into real expiry - the 'proxy stopped working for a
+     while' window; a fast clock can even see a FRESH pass as already
+     expired). The new anchored_exp() computes receipt + (exp - nbf) -
+     the JWT lifetime measured on OUR clock - and every consumer of the
+     expiry now uses it: the watch loop margin clock, the adaptive
+     refresh retry, the startup display and the one-shot mode. A JWT
+     with no nbf falls back to the raw exp (the pre-v6.6 behavior,
+     preserved exactly). The rotation lead stays --refresh-margin
+     (default 120 s = Firefox's own 'Rotate 2 Minutes from the End
+     Time').
+
+  2) A GUARDIAN 403 ON THE TOKEN FETCH NO LONGER KILLS THE CYCLE:
+     Firefox re-establishes the enrollment and asks again before
+     giving up - guardian_pass() now performs ONE automatic POST
+     /api/v1/fpn/activate (the v5.3 reference-parity re-activation
+     path, reused verbatim) followed by ONE retry of the GET
+     /api/v1/fpn/token; a 403 after the retry raises exactly as
+     before and every other status is untouched.
+
+  3) THE proxyPass REJECTION BY THE EGRESS IS NOW OBSERVED LIVE. The
+     builtin engine parses the status code of EVERY upstream CONNECT
+     response: HTTP 400 ('parsing JWT failed' - the documented
+     Guardian body for a bad/expired pass), 401 and 403 mean THE PASS
+     WAS REJECTED: the client still gets its 502, but the new
+     _PassMonitor flags the event and the watch loop's sleep phase
+     polls the flag EVERY SECOND and breaks the sleep at once -
+     Firefox reacts to a non-2xx CONNECT response of the egress the
+     moment it is observed (IPPNetworkErrorObserver fires
+     'proxy-http-error' on every failed proxy response), not at the
+     next margin tick. The immediate refresh is PACED by the Firefox
+     floors: at least 1 s between rotations (minRotationInterval) plus
+     the 500 ms retry pacing (retryAfter) - never a tight refresh
+     loop.
+
+  4) TWO DISTINCT FAILURE CLASSES (the Go reference design:
+     maxDistinctOpenTimeoutTargets / maxDistinctBadGatewayTargets = 3).
+     (a) TARGET failures - a CONNECT to a destination that never opens
+     (timeout) or that the egress answers with 502/504 - are counted
+     PER DISTINCT TARGET: one flaky destination fails only its own
+     client connection, and only THREE DISTINCT failing targets mean
+     the TUNNEL/SESSION is broken (-> the pass is refreshed at once);
+     (b) the PASS rejection of item 3 is the separate, faster signal.
+     Both classes live in the new thread-safe _PassMonitor (the
+     BUILTIN engine only - the sing-box engine runs as an external
+     process this script cannot instrument; its lifecycle is
+     unchanged).
+
+  5) THE HALF-CLOSE DRAIN WINDOW (the Go halfCloseDrainTimeout = 2
+     minutes): when ONE side of a relayed tunnel half-closed, the peer
+     may legitimately keep sending for a while (a download finishing)
+     - but a tunnel whose second direction NEVER ends must not pin the
+     client thread and the sockets forever. After the 2-minute window
+     BOTH sockets are closed, the relay threads unblock and the
+     connection is reaped (the old join() waited forever on a
+     half-open tunnel).
+
+  6) TCP KEEPALIVE with the Go pacing (upstreamKeepAliveInterval =
+     10 s / the probe timeout of 5 s -> idle 10 s, retry every 5 s,
+     3 probes): a silently-dropped NAT/middlebox path is detected by
+     the OS instead of leaving a half-open tunnel until the
+     application timeouts fire. Purely advisory - every option is
+     applied best-effort (try/except) and every platform keeps
+     working without them.
+
+  7) THE FASTLY CHALLENGE SOLVER IS BOUNDED (the Go fastly.go limits:
+     maxPostBackRounds = 3, fastlySolveTimeout = 60 s). A server that
+     answers a solution submission with ANOTHER challenge list no
+     longer loops the solver forever - the post-back exchange runs at
+     most 3 rounds and the WHOLE solve is capped at 60 s; and the
+     whole check-and-solve sequence of ensure_fastly_cookie() now runs
+     under _FASTLY_SOLVE_LOCK (the Go solve mutex): concurrent callers
+     (the probe threads, a hotkey racing the watch loop) JOIN the one
+     running solve instead of racing it with parallel PoW work and
+     mismatched token/cookie pairs.
+
+  8) THE FxA LOGIN RATE LIMIT (HTTP 429 / errno 114) IS NOW A DISTINCT
+     'blocked_login' ERROR with its own cooldown: a 15-minute wait (the
+     old generic 600 s 'blocked' wait stays for the Guardian-side
+     blocks), and the retry prefers the CACHED session token
+     (ensure_session reuses it automatically - a rate-limited password
+     login never keeps re-prompting). The 2FA 429 gets the same code.
+
+  9) THE QUOTA IS REPORTED ON EVERY proxyPass REFRESH (the ~10-minute
+     cadence - TIGHTER than the Go quotaCheckInterval of 15 min; the
+     X-Quota headers already ride every token response, so no extra
+     request is made), and a NEW warning fires when the remaining
+     monthly allowance drops below 15% of the limit (the reset time is
+     included in both lines).
+
+  10) --api-proxy URL / env MOZVPN_API_PROXY (the Go -api-proxy flag):
+     the CONTROL-plane requests (FxA, Guardian, Remote Settings, the
+     Fastly challenge - everything that goes through the shared
+     _OPENER / req_full / _fastly_http) leave through ONE FIXED
+     HTTP(S) proxy while the proxied browsing traffic keeps rotating
+     through the Mozilla egresses: the Fastly WAF cookie and the
+     Guardian enrollment are BOUND TO THE EGRESS IP, so a rotating
+     control plane can invalidate them mid-session. http:// and
+     https:// proxy URLs only - socks5:// is refused with a clear
+     error (the stdlib ProxyHandler tunnels http/https via CONNECT;
+     this script adds no new dependency). The DoH chain is NOT routed
+     through it (the DoH endpoints are anycast - DNS needs no fixed
+     exit). OFF by default; hotkey-free (a run-start decision).
+
+  11) --verbose / env MOZVPN_VERBOSE: the CONNECT targets of the
+     engine failure logs are REDACTED by default
+     ('<redacted; use --verbose>' - exactly the Go logTarget
+     redaction): the destination of a client request is the user's
+     browsing. The per-host EGRESS names stay visible - they are the
+     script's own servers, not the user's traffic.
+
+  12) --tls-split / hotkey 'i' / env MOZVPN_TLS_SPLIT: the TLS
+     ClientHello of the outer connection (which carries the egress
+     SNI) is sent in SMALL TCP SEGMENTS (64-byte pieces, the first one
+     delayed 30 ms), so a single-packet DPI cannot read the whole SNI
+     from the first segment. Implemented with memory BIOs
+     (ctx.wrap_bio + a hand-driven do_handshake loop - the stdlib
+     technique the Python ssl docs document for non-blocking BIO
+     use); everything after the handshake is pumped through the SAME
+     SSLObject, so the connection stays a normal TLS stream for the
+     peer. STRICTLY OPT-IN, OFF by default (the v6.1 lesson: a
+     transport 'hardening' must never surprise the working data
+     path); ANY fragmented-handshake failure falls back to the plain
+     profile matrix of _tls_profiles() (a fresh socket, the plain
+     wrap_socket) - the data path never breaks.
+
+  13) THE PERSISTENTLY-BROKEN SELECTION SELF-HEALS: when a saved
+     countries filter leaves the engine serving proxies whose egress
+     ALL keep failing (5+ consecutive failures on EVERY served host),
+     the saved filter is CLEARED and ALL proxies are served on the
+     next engine rebuild - the same 'never zero usable proxies'
+     fallback the probe phase has; one localized line says so, and
+     the user can re-apply the selection with 'w' once the egresses
+     recover.
+
+  14) THE Mozilla CHANNEL LIMITS ARE STATED ONCE AT STARTUP (verified
+     2026-10-29: the egress proxies the WEB PORTS ONLY - 80/443/8080/
+     8443 - over TCP; other ports/protocols are refused server-side),
+     so a misdirected non-web client (mail, SSH, games) is diagnosed
+     at a glance instead of as a 'broken proxy'.
+
+  AUDIT-CONFIRMED, NO CODE CHANGE (the v6.2 item-1 style): the DoH
+  DEFAULT is already Cloudflare (the preset https://cloudflare-dns.com/
+  dns-query) and the startup precedence is already argument > the
+  saved 'h'-menu choice > the MOZVPN_DOH env > the built-in
+  'cloudflare' default - the Firefox TRR default is matched exactly,
+  and the v5.29 strict-DoH contract (no silent fallback to a non-DoH
+  resolver) stays intact. The 2-minute rotation lead of item 1 equals
+  Firefox's own. The sing-box engine keeps its own lifecycle (the
+  monitor of items 3-6 is builtin-only, as documented above).
+
 VERSION 2026-10-25 (v6.5) - THE PROFILE-EXCLUSIVE DATA FIX (the user's
   report: 'you made a GLOBAL default fastly_cookie for some reason,
   which makes no sense at all. When a new account is added, a NEW
@@ -1279,8 +2477,10 @@ VERSION 2026-09-28 (v5.13) - binary-on-Android DNS bypass + REAL probe
      system resolver is NOT trustworthy inside a binary. req() now has
      a LAST-RESORT DIRECT-IP path: when the v5.12 single retry fails
      too, _emergency_doh_resolve() asks the well-known DoH resolver
-     IPs DIRECTLY (1.1.1.1 / 8.8.8.8 on 443 / 9.9.9.9 on 5053 - NO
-     name resolution anywhere, the SNI stays the resolver hostname)
+     IPs DIRECTLY (1.1.1.1 / 8.8.8.8 / 9.9.9.9 on 443 - NO
+     name resolution anywhere, the SNI stays the resolver hostname;
+     v8.8: 9.9.9.9 moved 5053 -> 443, Quad9 retired the 5053 JSON
+     service on 2025-05-05)
      and _raw_https() sends the API request straight to the resolved
      IP with the correct Host header + SNI (redirect following and the
      shared cookie jar included). This covers EVERY API call (OAuth,
@@ -2236,15 +3436,29 @@ FXA_CLIENT_ID = "5882386c6d801776"                       # Firefox Desktop (publ
 OAUTH_SCOPES  = ("profile https://identity.mozilla.com/apps/vpn",
                  "profile https://identity.mozilla.com/apps/mozillavpn")
 
+# v8.0: the passwordless sign-in from a DESKTOP FIREFOX PROFILE
+# (--fxa-profile PATH). The file lives at the root of a profile
+# directory (signedInUser.json) and carries the FxA sessionToken in
+# accountData.sessionToken (the foxhole-vpn AUTH.md pattern, verified
+# 2026-10-30 against the Firefox source docs). The token rides the
+# SAME grant_type=fxa-credentials OAuth mint every password sign-in
+# already rides - only the SOURCE of the session changes.
+FXA_PROFILE_FILE = "signedInUser.json"
+
 RS_SERVERLIST = ("https://firefox.settings.services.mozilla.com/v1"
                  "/buckets/main/collections/vpn-serverlist/records")
 
-DEFAULT_FIREFOX_VERSION = "158.0.1"
+# v9.3: 159.0 is the CURRENT stable Firefox (product-details.mozilla.org
+# LATEST_FIREFOX_VERSION, released 2026-10-27; the Go reference client
+# pins 159.0 too) - the value drives the serverlist filter_expression
+# (env.version versionCompare) and the User-Agent, so it must stay a
+# plausible CURRENT Firefox.
+DEFAULT_FIREFOX_VERSION = "159.0"
 
 # Browser-like headers (for steps after login: Guardian, Remote Settings)
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0.1) "
-                  "Gecko/20100101 Firefox/158.0.1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:159.0) "
+                  "Gecko/20100101 Firefox/159.0",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Content-Type": "application/json",
@@ -2352,14 +3566,21 @@ DEFAULT_IP_ECHO_SERVICE = "ipinfo"
 #   cloudflare  https://cloudflare-dns.com/dns-query   (Cloudflare 1.1.1.1)
 #   google      https://dns.google/resolve             (Google Public DNS)
 #   nextdns     https://dns.nextdns.io/dns-query       (NextDNS)
-#   quad9       https://dns.quad9.net:5053/dns-query  (Quad9)
+#   quad9       https://dns.quad9.net/dns-query       (Quad9, 443 - see the
+#                v8.8 note: JSON on 5053 retired 2025-05-05)
 # (A public Nextcloud DoH endpoint could not be verified to exist; use
 #  --doh-url <endpoint> for any custom DoH JSON API.)
 DOH_PROVIDERS = {
     "cloudflare": "https://cloudflare-dns.com/dns-query",
     "google":     "https://dns.google/resolve",
     "nextdns":    "https://dns.nextdns.io/dns-query",
-    "quad9":      "https://dns.quad9.net:5053/dns-query",
+    # v8.8: 5053 -> 443 - Quad9 retired the 5053 JSON service
+    # (5 May 2025, 'migrate to DoH on port 443'); the 443 endpoint
+    # speaks the RFC 8484 WIREFORMAT only (live-checked 2026-10-31),
+    # so the script's own JSON query to it answers an error status
+    # and the v5.12 provider penalty / chain fallback carries the
+    # resolution - a selected quad9 no longer hangs anything.
+    "quad9":      "https://dns.quad9.net/dns-query",
 }
 DOH_TTL = 300            # seconds a DoH answer is cached (cache is OPT-IN)
 DOH_TIMEOUT = 4          # v5.6: was 10 - a dead/slow DoH endpoint must not
@@ -2414,23 +3635,165 @@ def doh_provider() -> str:
 # file of v5.31-v5.36 is migrated and removed on the first run.
 
 def save_doh_provider_cache(name: str):
-    """v5.31 -> v6.0: persist the resolver choice (hotkey 'h') into
-    config.json (settings.doh)."""
+    """v5.31 -> v6.8: persist the resolver choice (hotkey 'h') into
+    config.json (settings.doh). v6.8: the system-DNS mode is stored as
+    the EXPLICIT 'off' marker - DISTINCT from the never-written key,
+    so a deliberate choice survives restarts while a missing (or
+    bug-written legacy '') key keeps falling through to the built-in
+    'cloudflare' default."""
     try:
-        cfg_set(("settings", "doh"), (name or "").strip().lower())
+        cfg_set(("settings", "doh"),
+                "off" if not (name or "").strip()
+                else name.strip().lower())
     except Exception:
         pass                    # a read-only config dir must not crash the run
 
 def load_doh_provider_cache() -> "str | None":
-    """v5.31 -> v6.0: the persisted resolver choice: '' = system DNS
-    (off), a preset name, or None when nothing was saved yet."""
+    """v5.31 -> v6.8: the persisted resolver choice: '' = the EXPLICIT
+    system-DNS choice (the stored 'off' marker), a preset name, or None
+    when NOTHING was saved yet. THE v6.8 BUG FIX: the v6.0 uber-config
+    rework read the key with a '' DEFAULT, so a key that was never
+    written (a fresh install - exactly the case the built-in default
+    exists for) came back as '' and the startup honored it as 'the
+    saved system-DNS mode' - the 'cloudflare' default was UNREACHABLE,
+    and the startup mirror then SAVED the '' right back, hardening the
+    bug into config.json on the very first run. Under the v5.31
+    doh.json a MISSING FILE meant None and the default worked; the
+    rework lost the 'missing' case (this docstring kept promising
+    'None when nothing was saved yet' - the code did not deliver it).
+    Now a missing key - and any legacy '' the bug wrote - is None
+    again ('never chosen' -> the built-in default applies), and only
+    the explicit 'off'/'system' marker keeps the system-DNS mode."""
     try:
-        name = (cfg_get(("settings", "doh"), "") or "").strip().lower()
-        if name in ("", "off"):
-            return ""
+        raw = cfg_get(("settings", "doh"), None)
+        if raw is None:
+            return None          # never chosen -> the default applies
+        name = (str(raw) or "").strip().lower()
+        if not name:
+            return None          # the v6.0-v6.7 bug's empty write
+        if name in ("off", "system"):
+            return ""            # the explicit system-DNS choice
         return name if name in DOH_PRESETS else None
     except Exception:
         return None
+
+# v6.9: STICKY USER SETTINGS (the user's request 2). The doh/lang
+# pattern - an explicit argument wins, then the env, then the SAVED
+# choice, then the built-in default - now covers every preference a
+# hotkey can flip: the theme ('m'), the color ('n'), the DoH answer
+# cache ('k'), the ClientHello fragmentation ('i') and the engine
+# ('e'). The hotkeys save the state the moment they flip it and the
+# startup mirrors the EFFECTIVE state back into the profile exactly
+# like the doh/lang choices already do. The booleans are written as
+# real booleans, and load_bool_setting() treats a MISSING key as
+# 'never chosen' (the v6.8 lesson: a default must never masquerade
+# as a saved choice).
+
+def save_bool_setting(key: str, value: bool):
+    """v6.9: persist a boolean preference as settings.<key>."""
+    try:
+        cfg_set(("settings", key), bool(value))
+    except Exception:
+        pass                    # a read-only config dir must not crash the run
+
+def load_bool_setting(key: str, default: "bool | None") -> "bool | None":
+    """v6.9: the persisted boolean preference, or the given default
+    when the key was never written (or holds an unreadable value)."""
+    try:
+        raw = cfg_get(("settings", key), None)
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            return raw
+        s = str(raw).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+        return default
+    except Exception:
+        return default
+
+def save_str_setting(key: str, value):
+    """v6.9: persist a string preference as settings.<key>."""
+    try:
+        cfg_set(("settings", key), value)
+    except Exception:
+        pass
+
+def load_str_setting(key: str):
+    """v6.9: the persisted string preference ('' -> None: an empty
+    value is 'never chosen', never a disguised default)."""
+    try:
+        raw = cfg_get(("settings", key), None)
+        if raw is None:
+            return None
+        return str(raw).strip() or None
+    except Exception:
+        return None
+
+# v8.0: the AUTO-ROTATION of accounts by quota (settings.auto_rotate).
+# A useful option ships ON; the switch only GATES the rotation trigger -
+# the quota bookkeeping (print_quota -> save_account_quota) runs
+# regardless, so the ranking data is always fresh. An explicit
+# --auto-rotate / --no-auto-rotate beats the saved choice (the argparse
+# default is None = 'not chosen', the v6.8 missing-key lesson).
+_auto_rotate_on = {"v": True}
+
+def set_auto_rotate(enabled: bool):
+    """v8.0: enable/disable the account auto-rotation by quota."""
+    _auto_rotate_on["v"] = bool(enabled)
+
+def auto_rotate_enabled() -> bool:
+    """v8.0: whether the account auto-rotation is active."""
+    return _auto_rotate_on["v"]
+
+# v8.0 -> v8.5 -> v9.0: the local proxy TYPE (settings.proxy_type):
+# 'socks5' (the DEFAULT since v9.0 - RFC 1928 CONNECT-only, REMOTE
+# DNS: the domain name is passed through to the egress, the curl
+# socks5h/socks5a semantics; 'socks5h' is NOT a separate wire
+# protocol - it is curl's name for the CLIENT sending the domain
+# (ATYP=03) instead of a pre-resolved IP (ATYP=01), and this
+# listener accepts BOTH request shapes, so every plain-'socks5'
+# client works too) or 'http' (the DEFAULT from v8.5 to v8.9 - the
+# classic CONNECT listener; the hostname goes to the egress in
+# every CONNECT so the resolution is REMOTE as well).
+# The v8.0 'mixed' single-port auto-detect listener is REMOVED in
+# v8.5: only the two classic protocols remain (the user's request);
+# a SAVED 'mixed' choice of an older run normalizes to the built-in
+# default like every other unknown value. The saved choice survives
+# restarts; an explicit --proxy-type beats it (the same precedence
+# the doh/lang/theme switches use since v6.9).
+_PROXY_TYPES = ("socks5", "http")
+_proxy_type_cur = {"v": "socks5"}
+
+def set_proxy_type(value: str):
+    """v8.0 -> v9.0: select the local proxy type (normalized; unknown
+    -> the built-in default 'socks5')."""
+    v = str(value or "").strip().lower()
+    _proxy_type_cur["v"] = v if v in _PROXY_TYPES else "socks5"
+
+def get_proxy_type() -> str:
+    """v8.0: the currently served local proxy type."""
+    return _proxy_type_cur["v"]
+
+def _proxy_type_of(args) -> str:
+    """v8.0 -> v9.0: resolve the EFFECTIVE local proxy type: an explicit
+    --proxy-type argument, else the SAVED settings.proxy_type, else
+    the built-in default 'socks5' (the v9.0 default - RFC 1928 with
+    remote DNS; the v8.5 'http' default keeps winning only as the
+    SAVED choice of the runs that picked it explicitly)."""
+    explicit = getattr(args, "proxy_type", None)
+    if explicit:
+        v = str(explicit).strip().lower()
+        if v in _PROXY_TYPES:
+            return v
+    saved = load_str_setting("proxy_type")
+    if saved:
+        v = str(saved).strip().lower()
+        if v in _PROXY_TYPES:
+            return v
+    return "socks5"
 
 def set_doh_cache(enabled: bool):
     """v5.1: enable/disable the DoH answer cache (default: disabled)."""
@@ -2506,10 +3869,49 @@ def _resolver_broken() -> bool:
 
 def _doh_query(provider_url: str, host: str) -> "list[str]":
     """One DoH JSON query (RFC 8484 'application/dns-json'):
-    GET <endpoint>?name=<host>&type=A -> the Answer.data IPs."""
+    GET <endpoint>?name=<host>&type=A -> the Answer.data IPs.
+    v8.6: the bootstrap-known PRESET providers ride the direct-IP
+    transport (see the comment below); nextdns / a custom --doh-url
+    endpoint keep the plain urlopen path."""
     url = (provider_url.split("?")[0]
            + ("&" if "?" in provider_url else "?")
            + "name=" + urllib.parse.quote(host) + "&type=A")
+    u = urlparse(url)
+    # v8.6 (user request: DPI protection FOR DoH): the PRESET providers
+    # with a well-known resolver IP (_DOH_IP_BOOTSTRAP) ride the
+    # DIRECT-IP transport ALWAYS - not only in the v5.28 broken-resolver
+    # state: (1) the provider hostname is NEVER resolved with the system
+    # resolver (the dnscrypt-proxy shape - a DoH server address IS an
+    # IP, so no plaintext DNS lookup can reveal or pre-block the
+    # resolver choice); (2) the TLS handshake to the resolver goes out
+    # FRAGMENTED (_raw_https frag=True -> the same tls_split()
+    # ClientHello segmentation the egress TLS uses - see _FragTLSConn),
+    # so an SNI-matching DPI cannot cut the DoH bootstrap by reading
+    # the resolver SNI from the first segment of the flow. Any
+    # direct-IP failure falls back to the exact v8.5 paths below: the
+    # broken state -> the v5.36 emergency DoH walk, the healthy state ->
+    # the plain urlopen query (never worse than v8.5).
+    boot = None
+    for _ip, _sni, _rport, _ in _DOH_IP_BOOTSTRAP:
+        if _sni == u.hostname:
+            boot = (_ip, _sni, u.port or _rport)
+            break
+    if boot is not None:
+        try:
+            code, _h, resp = _raw_https(
+                boot[0], boot[1], boot[2], "GET",
+                (u.path or "/") + (("?" + u.query) if u.query else ""),
+                {"Accept": "application/dns-json",
+                 "User-Agent": "mozvpn/5.28"}, None, DOH_TIMEOUT,
+                frag=True)
+            if code == 200 and resp:
+                data = json.loads(resp.decode("utf-8", "replace"))
+                out = [str(a.get("data")) for a in data.get("Answer") or []
+                       if a.get("type") in (1, 28) and a.get("data")]
+                if out:
+                    return out
+        except Exception:
+            pass                # the v8.5 paths take over below
     # v5.28 (Termux binary fix): when the SYSTEM resolver is flagged BROKEN
     # (a persistent gaierror - the packaged-binary-on-Android case, see
     # req()), a plain urlopen fails for the DoH provider HOSTNAME too
@@ -2519,31 +3921,14 @@ def _doh_query(provider_url: str, host: str) -> "list[str]":
     # the well-known DoH resolver IPs DIRECTLY (the _DOH_IP_BOOTSTRAP
     # table, no name resolution anywhere: the TCP connect goes to the IP
     # literal, the SNI/Host stay the provider hostname).
+    # v5.36: the ANSWER of a DNS query does not depend on which resolver
+    # gives it - resolve the SAME query over the well-known resolver IPs
+    # (the emergency DoH) so a provider that just failed (or a
+    # non-bootstrap provider like nextdns / a custom --doh-url endpoint
+    # in the broken state) does not break the whole chain. v8.6: the
+    # bootstrap-known presets already tried their direct-IP transport
+    # above, so in the broken state ONLY this emergency walk remains.
     if _resolver_broken():
-        u = urlparse(url)
-        for ip, sni, rport, _boot in _DOH_IP_BOOTSTRAP:
-            if sni == u.hostname:
-                try:
-                    code, _h, resp = _raw_https(
-                        ip, sni, u.port or rport, "GET",
-                        (u.path or "/") + (("?" + u.query) if u.query else ""),
-                        {"Accept": "application/dns-json",
-                         "User-Agent": "mozvpn/5.28"})
-                    if code == 200 and resp:
-                        data = json.loads(resp.decode("utf-8", "replace"))
-                        return [str(a.get("data"))
-                                for a in data.get("Answer") or []
-                                if a.get("type") in (1, 28) and a.get("data")]
-                except Exception:
-                    continue
-        # v5.36: the provider is NOT one of the bootstrap hostnames
-        # (nextdns or a custom --doh-url endpoint). The v5.28 code just
-        # gave up here (return []) - the whole chain then failed and the
-        # v5.29 strict mode killed every connection that needed the
-        # hostname. But the ANSWER of a DNS query does not depend on
-        # which resolver gives it: resolve the SAME query over the
-        # well-known resolver IPs (the emergency DoH) so a non-bootstrap
-        # provider no longer breaks the whole chain in the broken state.
         return _emergency_doh_resolve(host) or []
     r = urllib.request.Request(url, headers={
         "Accept": "application/dns-json",
@@ -2560,9 +3945,10 @@ def _doh_query(provider_url: str, host: str) -> "list[str]":
 def _doh_chain() -> list:
     """v5.1 (req. 5, 6): the fallback chain of DoH endpoints - the SELECTED
     provider first, then the remaining presets; every preset speaks DoH
-    only. The SYSTEM resolver is the LAST resort (and the only resolver
-    when DoH is off). A custom --doh-url endpoint is tried first, then the
-    presets follow."""
+    only. The SYSTEM resolver is NOT part of this chain (v5.29 STRICT:
+    it runs only via the explicit --system-dns-fallback opt-in, or when
+    DoH is off - the only resolver then). A custom --doh-url endpoint is
+    tried first, then the presets follow."""
     cur = _doh_provider
     if not cur:
         return []                       # 'off': the system resolver alone
@@ -2612,8 +3998,11 @@ def _doh_query_parallel(host: str) -> "list[str] | None":
 
 def resolve_host(host: str) -> "list[str] | None":
     """Resolve a hostname over DoH ONLY (req. 5): the selected provider,
-    then the remaining DoH presets in the fallback chain; the SYSTEM
-    resolver is the last resort. The long answer cache stays OPT-IN
+    then the remaining DoH presets in the fallback chain. The SYSTEM
+    resolver is NOT a fallback of this function anymore (v5.29 STRICT):
+    it runs only when the user EXPLICITLY opted in
+    (--system-dns-fallback) or when DoH is off. The long answer cache
+    stays OPT-IN
     (req. 4: --doh-cache / hotkey 'k'); v5.6 adds an ALWAYS-ON short
     memo (DOH_MEMO_TTL) plus a provider penalty (DOH_PROVIDER_PENALTY),
     so one probe run never re-resolves the same host 8+ times and never
@@ -2929,6 +4318,15 @@ STR = {
   "totp_rejected_window": "Server rejected the code. Check that the secret matches the authenticator app (2FA may have been re-created after the QR was saved).{clock} Waiting for the next TOTP window ...",
   "totp_rejected_final": "The 2FA code was rejected three times in a row (in different time windows). Verify the TOTP secret against your app: re-run with --qr <fresh QR> - 2FA may have been re-created and qr.png may be stale.",
   "totp_unknown_error": "2FA verification error ({status}): {data} (check sessionToken / account)",
+  # v7.0: the emailed-code session verification (email-2fa)
+  "email_code_prompt": "Enter the 6-digit code from the email Mozilla sent to your address - or 'l' to confirm by the LINK from the letter instead (an EMPTY line re-sends the letter): ",
+  "email_code_resent": "The sign-in letter with the code has been re-sent.",
+  "email_resend_failed": "Could not re-send the code letter (HTTP {status}) - retry or enter the code you already have.",
+  "email_code_confirmed": "The session is verified with the emailed code (email-2fa).",
+  "email_code_rejected": "The code was rejected (wrong or expired) - check the LATEST letter and retry.",
+  "email_code_rejected_final": "The emailed code was rejected three times in a row. Confirm the sign-in manually (the email_confirm_required instructions) and re-run, or enable TOTP.",
+  "email_code_aal_hint": "The account has a server-side TOTP, so an emailed code cannot verify the session (insufficientAal).",
+  "email_code_unknown_error": "Emailed-code verification error ({status}): {data} (check the mailbox / sessionToken).",
   "totp_code_current": "Current TOTP code: {code} (valid for {sec} more s{offset})",
   "totp_code_generated": "Generated TOTP code: {code} (window {period}s, {left}s left)",
   "clock_offset_note": ", clock offset {offset}s",
@@ -3017,7 +4415,7 @@ STR = {
   "doh_cache_state_off": "DoH cache {_e}: DISABLED (default) \u2014 every lookup queries the DoH chain directly (hotkey 'k' or --doh-cache enables).",
   "doh_geo_mismatch": "Geo check: {hp} exits in {geo} ({city}), but the location is {cc} ({cname}). The egress PoP is reached via a wrong route (usually a geo-wrong DNS answer); the IPv6 route may still show the right country.",
   "doh_geo_ok": "Geo check: {hp} exits in {geo} ({city}) \u2014 matches the location {cc}.",
-  "doh_menu_hint": "Choose the DNS resolver {_e} \u2014 type its number/letter and press Enter (Backspace deletes, any other key cancels):",
+  "doh_menu_hint": "Choose the DNS resolver {_e} \u2014 type its number/letter and press Enter (Backspace deletes, any other key cancels). The choice sets the script's OWN resolver AND the DoH target of the per-proxy DNS endpoints (they ride the chosen provider ONLY, no fallback chain; default cloudflare):",
   "lang_menu_hint": "Choose the interface language {_e} \u2014 type its number and press Enter (current: {cur}). Option 0 resets to the DEFAULT language and clears the saved choice. The choice is saved to config.json (settings.lang of the current profile) and survives restarts (Backspace deletes, any other key cancels; the menu exits automatically after applying).",
   "lang_menu_entry": "  {n} - {desc}",
   "lang_default_desc": "DEFAULT language (English) - resets the saved choice",
@@ -3026,7 +4424,7 @@ STR = {
   "doh_menu_entry": "  {n} - {name}{url}",
   "doh_default_desc": "DEFAULT",
   "doh_default_applied": "DNS resolver {_e}: switched to the DEFAULT provider ({provider}). The choice is saved to the config directory (config.json, settings.doh of the current profile) and survives restarts.",
-  "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} \u2014 new upstream connections use it immediately (the sing-box engine resolves on its own).",
+  "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} \u2014 new upstream connections use it immediately (the sing-box engine resolves on its own); the per-proxy DNS endpoints ride it from the next query (the chosen provider ONLY, default cloudflare).",
   "hotkey_doh_cache": "Hotkey 'k': DoH cache {state} (mirrors --doh-cache).",
   "select_hint": "Type the number/letter of an item, then press Enter. Backspace deletes the last character, any other key cancels.",
   "select_buffer": "Your choice: {buf}",
@@ -3084,8 +4482,8 @@ STR = {
   "net_err_conn": "connection failed (refused/reset/unreachable)",
   "locked_note": "Note {_e}: the live vpn-serverlist marks almost every country record 'locked', and Firefox serves them anyway \u2014 locked records are INCLUDED by default since v5.0 (--exclude-locked restores the old filtering).",
   "upstream_override": "Upstream override: all locations use {host}:{port} instead of the per-city hosts.",
-  "engine_started": "{engine} engine started: {n} local proxies on {listen}",
-  "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]",
+  "engine_started": "{engine} engine started: {n} local proxies on {listen} ({ptype})",
+  "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]{dns}",
   "port_busy": "Port {port} is busy - skipping {label} (owned by another process?)",
   "no_free_ports": "No free ports for local proxies (all candidate ports are busy).",
   "no_servers_to_serve": "No upstream servers to serve: the probe dropped everything (use --probe-fail keep) or the server list is empty.",
@@ -3105,7 +4503,7 @@ STR = {
   "unexpected_error": "Unexpected error: {err!r} - retrying in 30s.",
   "next_refresh": "Next refresh {_e} in {sec}s ({at} UTC).",
   "confirm_exit_hint": "Press Ctrl+C to stop.",
-  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \U0001f503 r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache)\n  \U0001f4c2 o - open the config directory (config.json lives there)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f4f7 g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - account menu: switch to another CACHED Mozilla account ('+' adds a NEW one, '-' deletes one) - the WHOLE profile switches with it: the DNS resolver, the language, the proxy selection, the sing-box configs and the Fastly cookie (config.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \U0001f4bf s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme)\n  \U0001f308 n - toggle the colored log output on/off (--no-color)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1-9 - open a config file (the settings of config.json) in the system default editor\n  \U0001f4c6 z - the FULL config-file menu with a hotkey for EVERY file (letters for the files past the ninth)\n  \U0001f50d Ctrl+O - find & remove every leftover of the OLD config format (--clean-old-config)\n  \u23f9\ufe0f Ctrl+C - stop the script (the first press stops immediately; --confirm-exit requires a second press within 5 s)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q - stop.",
+  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \U0001f503 r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine; cached)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS; the per-proxy DNS endpoints ride the CHOSEN provider ONLY - default cloudflare, no fallback chain (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache; cached)\n  \U0001f9e9 i - toggle the TLS ClientHello fragmentation (--tls-split; ON by default: the SNI-carrying ClientHello goes in small TCP segments against single-packet DPI; cached)\n  \U0001f4c2 o - open the config directory (config.json lives there)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f4f7 g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - account menu: switch to another CACHED Mozilla account ('+' adds a NEW one, '-' deletes one) - the WHOLE profile switches with it: the DNS resolver, the language, the proxy selection, the sing-box configs and the Fastly cookie (config.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \U0001f4bf s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme; cached)\n  \U0001f308 n - toggle the colored log output on/off (--no-color; cached)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1 - open config.json (the single settings file) in the system default editor\n  \U0001f4c6 z - the config-file menu (the token list of every editable file)\n  \U0001f50d Ctrl+O - find & remove every leftover of the OLD config format (--clean-old-config)\n  \u26d4 Ctrl+C - stop the script (the first press stops immediately; --confirm-exit requires a second press within 5 s)\n  \U0001F527 Ctrl+T - choose the LOCAL proxy type from the menu: socks5 / http (--proxy-type; the choice is cached)\n  \U0001f501 Ctrl+R - toggle the account auto-rotation by quota on/off (--auto-rotate; the choice is cached)\n  \U0001f4cb Ctrl+P - rewrite the PAC file with the running listeners (--pac-export)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q - stop.",
   "hotkey_relogin": "Hotkey 'r' \u267b\ufe0f: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
   "hotkey_clear": "Hotkey 'c' \U0001f9f9: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
   "hotkey_engine": "Hotkey 'e': switching the engine to {engine} - local proxies will restart with it.",
@@ -3119,7 +4517,8 @@ STR = {
   "hotkey_open_dir_fallback": "Hotkey 'o' \U0001f4c2: the sing-box config directory does not exist yet (it is created when the singbox engine runs) - opened the main config directory instead {_e}: {path}",
   "hotkey_files_hint": "Config files: press the number to open the file in the system default editor.",
   "hotkey_file_entry": "  {n} - {path}",
-  "files_menu_hint": "Config files ({n}) {_e} \u2014 EVERY file has a hotkey: 1-9 open the first nine DIRECTLY; for the rest press the letter token (a, b, ...) and Enter. Backspace deletes, any other key cancels; the menu exits automatically after opening the file.",
+  "files_menu_hint": "Config files ({n}) {_e} \u2014 press the token of the file (a, b, ... for the files past the first) and Enter. Backspace deletes, any other key cancels; the menu exits automatically after opening the file.",
+  "hotkey_no_file": "\U0001f4c4 Hotkey '{k}': no config file No. {n} - since v6.0 the editable config is ONE (config.json, hotkey '1').",
   "hotkey_open": "Opened in the system default editor {_e}: {path}",
   "hotkey_open_dir": "Opened the config directory in the system file manager {_e}: {path}",
   "hotkey_open_fail": "Could not open {path}: {err}",
@@ -3217,6 +4616,75 @@ STR = {
   "masque_probe_error": "{err}",
   "builtin_connect_failed": "Upstream CONNECT failed: {err}",
   "builtin_no_token": "proxyPass token not available yet",
+  "api_proxy_on": "Control plane (FxA/Guardian/Remote Settings + the Fastly challenge) via the FIXED exit {_e}: {url} (--api-proxy)",
+  "api_proxy_off": "Control-plane egress: direct (--api-proxy not set)",
+  "api_proxy_socks_unsupported": "socks5:// is not supported by --api-proxy: the stdlib ProxyHandler tunnels http/https via CONNECT only and this script adds no new dependency - use an http:// or https:// proxy URL",
+  "hotkey_tls_split": "TLS ClientHello fragmentation: {state}",
+  "tls_split_startup": "TLS ClientHello fragmentation: {state} (--tls-split; ON by default)",
+  "fastly_406_stale": "The sent Fastly challenge cookie was rejected (HTTP 406 despite a cookie) - dropping it and solving a FRESH challenge before the retry",
+  "fxa_429_cooldown": "FxA login rate limit - a 15-minute cooldown; the retry prefers the cached session token",
+  "guardian_reactivated": "Guardian: re-activated (HTTP {status}) - retrying the token fetch once",
+  "guardian_reactivate_failed": "Guardian: re-activation failed (HTTP {status}: {detail})",
+  "pass_rejected_refresh": "The egress REJECTED the proxyPass (HTTP 400 'parsing JWT failed' / 401 / 403) - refreshing the pass immediately",
+  "session_fail_refresh": "3+ distinct targets failed through the tunnel - the session looks broken; refreshing the pass now",
+  "connect_rejected": "Egress rejected the CONNECT (HTTP {code}) to {_e}{target}",
+  "connect_target_open_timeout": "CONNECT to {_e}{target} never opened (timeout)",
+  "connect_target_bad_gateway": "Egress answered HTTP {code} for {_e}{target}",
+  "connect_target_doh_unreachable": "The DNS relay's DoH target {target} fails through the tunnel {_e} the per-proxy DNS endpoints ride the CHOSEN provider only (hotkey 'h' / --doh to switch it); relayed DNS queries return nothing until it recovers (the client's resolver retries)",
+  "quota_low": "Quota below 15%: {left} of {limit} left{reset} - the allowance resets monthly",
+  "filter_cleared_broken": "The saved proxy selection kept failing on EVERY served egress - the filter is cleared and ALL proxies will be served on the next rebuild (re-apply it with 'w' once the egresses recover)",
+  "channel_limits_note": "The Mozilla channel today is an HTTP CONNECT tunnel over HTTP/2 - a RAW TCP tunnel: ANY TCP protocol and ANY destination port can run inside it (no port whitelist is published). UDP/IP flows are the next step with MASQUE over HTTP/3 (Firefox already ships the CONNECT-UDP code, and the server list carries a per-server masque protocol). The egress does no deep packet inspection; Mozilla positions the feature for browser web traffic",
+  "proxy_type_selected": "Local proxy type: {type} (Ctrl+T opens the choice menu; SOCKS5 passes domain names to the egress - remote DNS)",
+  "proxy_type_switched": "Local proxy type switched to {type}: rebuilding the listeners",
+  "hotkey_proxy_type": "Ctrl+T - choose the local proxy type from the menu: socks5 / http (--proxy-type; the choice is saved)",
+  "ptype_menu_hint": "Choose the local proxy type {_e} \u2014 type its number and press Enter (current: {cur}; [x] marks the running type). The choice is saved to config.json (settings.proxy_type), rebuilds the listeners at once and survives restarts (Backspace deletes, any other key cancels; the menu exits automatically after applying).",
+  "ptype_menu_entry": "  {n} - {name} - {desc}",
+  "ptype_desc_socks5": "SOCKS5 (RFC 1928): the domain names are resolved by the egress - remote DNS",
+  "ptype_desc_http": "HTTP CONNECT",
+  "dns_line": "DNS relay {_e} {listen}: {n} per-proxy DNS endpoints (UDP+TCP; the DNS port of a proxy rides THAT proxy only -> its egress -> DoH {target}). Point the SYSTEM resolver / any plain-DNS app at the DNS port shown next to the proxy you use; apps that already send domain names through the proxies (socks5h remote DNS) do not need it",
+  "dns_port_busy": "The DNS relay port {port} of {label} is busy - that DNS endpoint is skipped (the proxy keeps working)",
+  "hotkey_auto_rotate": "Ctrl+R - auto-rotation of accounts by quota on/off (the choice is saved)",
+  "hotkey_pac_export": "Ctrl+P - rewrite the PAC file (the local sites bypass list)",
+  "auto_rotate_startup": "Account auto-rotation by quota is ON (Ctrl+R off; --no-auto-rotate)",
+  "auto_rotate_on": "Account auto-rotation by quota is ON",
+  "auto_rotate_off": "Account auto-rotation by quota is OFF",
+  "auto_rotate_switched": "{state} - the choice is saved",
+  "auto_rotate_zero": "Quota exhausted on the current account ({email}) - auto-rotation is looking for the account with the most data left",
+  "auto_rotate_to": "Auto-rotation: switching to account {email} ({left} known left) - cached session, no new login",
+  "auto_rotate_none": "Auto-rotation: every other cached account is exhausted or has no cached session - staying on {email}",
+  "auto_rotate_off_zero": "Quota exhausted on the current account - auto-rotation is OFF (Ctrl+R to enable)",
+  "fxa_profile_read": "Firefox profile session: {path}",
+  "fxa_profile_missing": "Cannot read the Firefox profile file: {path} ({err})",
+  "fxa_profile_no_token": "No sessionToken found in {path} - sign into the Firefox browser first, then restart",
+  "fxa_profile_bad_token": "The sessionToken in {path} is malformed - sign into the Firefox browser again",
+  "fxa_profile_session_invalid": "The Firefox browser session is no longer valid (errno 110) - sign into Firefox again, then press any key to retry",
+  "unblock_prompt": "Mozilla sent a 6-digit unblock code to {email} - enter it (empty input re-sends the letter, 'q' cancels): ",
+  "unblock_resent": "The unblock code letter was re-sent to {email}",
+  "unblock_wrong": "The unblock code was not accepted - try again",
+  "unblock_gave_up": "The unblock code attempts are exhausted - the login stays blocked (wait for a new letter or try later)",
+  "email_link_wait": "Open the confirmation LINK from the Mozilla email in a browser - waiting up to {sec} s (any key returns to the code prompt)",
+  "email_link_verified": "The email confirmation link was accepted - the session is verified",
+  "email_link_timeout": "The link was not confirmed in time - back to the code prompt",
+  "pac_written": "PAC file written: {path} ({directive} entries: {n})",
+  "pac_failed": "PAC file write failed: {path} ({err})",
+  "pac_no_proxies": "No running local proxies - the PAC file is not rewritten",
+  "doctor_title": "Diagnostics (read-only):",
+  "doctor_ok": "ok",
+  "doctor_fail": "FAIL",
+  "doctor_skip": "skip",
+  "doctor_interpreter": "Python {ver} on {plat}",
+  "doctor_config": "Config store at {path} (accounts: {n})",
+  "doctor_deps": "Dependencies: {miss}",
+  "doctor_deps_ok": "all present",
+  "doctor_sysdns": "System DNS: {host} -> {ips}",
+  "doctor_doh": "DoH ({provider}) resolve of {host}: {ips}",
+  "doctor_doh_system": "off by choice - the system resolver (verified by the step above)",
+  "doctor_fxa": "FxA API {url}: HTTP {status}",
+  "doctor_serverlist": "Server list: {n} locations, {m} servers",
+  "doctor_tls": "TLS handshake to {host}:{port} (profile {p}): {ms} ms",
+  "doctor_quota": "Guardian quota on the cached session: {left} of {limit} left",
+  "doctor_no_session": "No cached session token - the Guardian step is skipped (sign in once normally)",
+  "doctor_done": "Diagnostics complete: {ok} ok, {fail} failed",
 },
 "ru": {
   "engine_selected": "\u0414\u0432\u0438\u0436\u043e\u043a \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 {_e}: {engine}",
@@ -3255,6 +4723,15 @@ STR = {
   "totp_rejected_window": "\u0421\u0435\u0440\u0432\u0435\u0440 \u043e\u0442\u043a\u043b\u043e\u043d\u0438\u043b \u043a\u043e\u0434. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435, \u0447\u0442\u043e \u0441\u0435\u043a\u0440\u0435\u0442 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u0441 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435\u043c-\u0430\u0443\u0442\u0435\u043d\u0442\u0438\u0444\u0438\u043a\u0430\u0442\u043e\u0440\u043e\u043c (\u0432 \u0442.\u0447. \u043d\u0435 \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0441\u044f \u043b\u0438 2FA \u043f\u043e\u0441\u043b\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u044f QR).{clock} \u0416\u0434\u0443 \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u043a\u043d\u043e ...",
   "totp_rejected_final": "\u041a\u043e\u0434 2FA \u043d\u0435 \u043f\u043e\u0434\u043e\u0448\u0451\u043b \u0442\u0440\u0438 \u0440\u0430\u0437\u0430 \u043f\u043e\u0434\u0440\u044f\u0434 (\u0432 \u0440\u0430\u0437\u043d\u044b\u0445 \u0432\u0440\u0435\u043c\u0435\u043d\u043d\u044b\u0445 \u043e\u043a\u043d\u0430\u0445). \u0421\u0432\u0435\u0440\u044c\u0442\u0435 TOTP-\u0441\u0435\u043a\u0440\u0435\u0442 \u0441 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435\u043c: \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441 --qr <\u0441\u0432\u0435\u0436\u0438\u0439 QR> \u2014 \u0432\u043e\u0437\u043c\u043e\u0436\u043d\u043e, 2FA \u043f\u0435\u0440\u0435\u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0441\u044f \u0438 qr.png \u0443\u0441\u0442\u0430\u0440\u0435\u043b.",
   "totp_unknown_error": "\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0438 2FA ({status}): {data} (\u043f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 sessionToken / \u0430\u043a\u043a\u0430\u0443\u043d\u0442)",
+  # v7.0: the emailed-code session verification (email-2fa)
+  "email_code_prompt": "Введите 6-значный код из письма Mozilla — или 'l', чтобы подтвердить по ССЫЛКЕ из письма (пустой ввод — выслать письмо повторно): ",
+  "email_code_resent": "\u041f\u0438\u0441\u044c\u043c\u043e \u0441 \u043a\u043e\u0434\u043e\u043c \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u043e.",
+  "email_resend_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u043e \u0432\u044b\u0441\u043b\u0430\u0442\u044c \u043f\u0438\u0441\u044c\u043c\u043e \u0441 \u043a\u043e\u0434\u043e\u043c (HTTP {status}) \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u0432\u0432\u043e\u0434 \u0438\u043b\u0438 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0443\u0436\u0435 \u0438\u043c\u0435\u044e\u0449\u0438\u0439\u0441\u044f \u043a\u043e\u0434.",
+  "email_code_confirmed": "\u0421\u0435\u0441\u0441\u0438\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0430 \u043a\u043e\u0434\u043e\u043c \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 (email-2fa).",
+  "email_code_rejected": "\u041a\u043e\u0434 \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d (\u043d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u0438\u043b\u0438 \u0438\u0441\u0442\u0451\u043a) \u2014 \u0441\u0432\u0435\u0440\u044c\u0442\u0435\u0441\u044c \u0441 \u0441\u0430\u043c\u044b\u043c \u0441\u0432\u0435\u0436\u0438\u043c \u043f\u0438\u0441\u044c\u043c\u043e\u043c \u0438 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435.",
+  "email_code_rejected_final": "\u041a\u043e\u0434 \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d \u0442\u0440\u0438 \u0440\u0430\u0437\u0430 \u043f\u043e\u0434\u0440\u044f\u0434. \u041f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 \u0432\u0445\u043e\u0434 \u0432\u0440\u0443\u0447\u043d\u0443\u044e (\u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u044f \u0432 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0438 email_confirm_required) \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u0441\u043a\u0440\u0438\u043f\u0442, \u043b\u0438\u0431\u043e \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u0435 TOTP.",
+  "email_code_aal_hint": "\u0423 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u0435\u0441\u0442\u044c \u0441\u0435\u0440\u0432\u0435\u0440\u043d\u044b\u0439 TOTP, \u043f\u043e\u044d\u0442\u043e\u043c\u0443 \u043a\u043e\u0434 \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 \u043d\u0435 \u043c\u043e\u0436\u0435\u0442 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044c \u0441\u0435\u0441\u0441\u0438\u044e (insufficientAal).",
+  "email_code_unknown_error": "\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0438 \u043a\u043e\u0434\u0430 \u0438\u0437 \u043f\u0438\u0441\u044c\u043c\u0430 ({status}): {data} (\u043f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u043e\u0447\u0442\u0443 / sessionToken).",
   "totp_code_current": "\u0422\u0435\u043a\u0443\u0449\u0438\u0439 TOTP-\u043a\u043e\u0434: {code} (\u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0435\u0449\u0451 {sec} \u0441{offset})",
   "totp_code_generated": "\u0421\u0433\u0435\u043d\u0435\u0440\u0438\u0440\u043e\u0432\u0430\u043d TOTP-\u043a\u043e\u0434: {code} (\u043e\u043a\u043d\u043e {period} \u0441, \u043e\u0441\u0442\u0430\u043b\u043e\u0441\u044c {left} \u0441)",
   "clock_offset_note": ", \u0441\u043c\u0435\u0449\u0435\u043d\u0438\u0435 \u0447\u0430\u0441\u043e\u0432 {offset} \u0441",
@@ -3343,7 +4820,7 @@ STR = {
   "doh_cache_state_off": "\u041a\u044d\u0448 DoH {_e}: \u0412\u042b\u041a\u041b\u042e\u0427\u0415\u041d (\u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e) \u2014 \u043a\u0430\u0436\u0434\u044b\u0439 \u0437\u0430\u043f\u0440\u043e\u0441 \u0438\u0434\u0451\u0442 \u0432 DoH-\u0446\u0435\u043f\u043e\u0447\u043a\u0443 \u043d\u0430\u043f\u0440\u044f\u043c\u0443\u044e (\u043a\u043b\u0430\u0432\u0438\u0448\u0430 'k' \u0438\u043b\u0438 --doh-cache \u0432\u043a\u043b\u044e\u0447\u0430\u0435\u0442).",
   "doh_geo_mismatch": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}), \u0430 \u043b\u043e\u043a\u0430\u0446\u0438\u044f \u2014 {cc} ({cname}). \u0410\u043f\u0441\u0442\u0440\u0438\u043c \u0434\u043e\u0441\u0442\u0438\u0433\u0430\u0435\u0442\u0441\u044f \u043f\u043e \u043d\u0435\u0432\u0435\u0440\u043d\u043e\u043c\u0443 \u043c\u0430\u0440\u0448\u0440\u0443\u0442\u0443 (\u043e\u0431\u044b\u0447\u043d\u043e \u0438\u0437-\u0437\u0430 \u0433\u0435\u043e-\u043d\u0435\u0432\u0435\u0440\u043d\u043e\u0433\u043e DNS-\u043e\u0442\u0432\u0435\u0442\u0430); \u043c\u0430\u0440\u0448\u0440\u0443\u0442 \u043f\u043e IPv6 \u043c\u043e\u0436\u0435\u0442 \u043f\u0440\u0438 \u044d\u0442\u043e\u043c \u043f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u0442\u044c \u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u0443\u044e \u0441\u0442\u0440\u0430\u043d\u0443.",
   "doh_geo_ok": "\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0433\u0435\u043e: {hp} \u0432\u044b\u0445\u043e\u0434\u0438\u0442 \u0432 {geo} ({city}) \u2014 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442 \u0441 \u043b\u043e\u043a\u0430\u0446\u0438\u0435\u0439 {cc}.",
-  "doh_menu_hint": "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442):",
+  "doh_menu_hint": "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter (Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u043a\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442). \u0412\u044b\u0431\u043e\u0440 \u0437\u0430\u0434\u0430\u0451\u0442 \u0441\u043e\u0431\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u0441\u043a\u0440\u0438\u043f\u0442\u0430 \u0418 DoH-\u0446\u0435\u043b\u044c DNS-\u0442\u043e\u0447\u0435\u043a \u043f\u0440\u043e\u043a\u0441\u0438 (\u0442\u043e\u043b\u044c\u043a\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0439 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440, \u0431\u0435\u0437 \u0446\u0435\u043f\u043e\u0447\u043a\u0438 \u043e\u0442\u043a\u0430\u0442\u043e\u0432; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e cloudflare):",
   "lang_menu_hint": "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u044F\u0437\u044B\u043A \u0438\u043D\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430 {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0435\u0433\u043E \u043D\u043E\u043C\u0435\u0440 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 Enter (\u0442\u0435\u043A\u0443\u0449\u0438\u0439: {cur}). \u041E\u043F\u0446\u0438\u044F 0 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u043D\u0430 \u044F\u0437\u044B\u043A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E \u0438 \u043E\u0447\u0438\u0449\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440. \u0412\u044B\u0431\u043E\u0440 \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u0435\u0442\u0441\u044F \u0432 config.json (settings.lang \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u043F\u043E\u0441\u043B\u0435 \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u043E\u0432 (Backspace \u0443\u0434\u0430\u043B\u044F\u0435\u0442, \u043B\u044E\u0431\u0430\u044F \u0434\u0440\u0443\u0433\u0430\u044F \u043A\u043B\u0430\u0432\u0438\u0448\u0430 \u043E\u0442\u043C\u0435\u043D\u044F\u0435\u0442; \u043F\u043E\u0441\u043B\u0435 \u043F\u0440\u0438\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u043C\u0435\u043D\u044E \u0437\u0430\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438).",
   "lang_menu_entry": "  {n} - {desc}",
   "lang_default_desc": "\u042F\u0417\u042B\u041A \u041F\u041E \u0423\u041C\u041E\u041B\u0427\u0410\u041D\u0418\u042E (\u0430\u043D\u0433\u043B\u0438\u0439\u0441\u043A\u0438\u0439) \u2014 \u0441\u0431\u0440\u0430\u0441\u044B\u0432\u0430\u0435\u0442 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D\u043D\u044B\u0439 \u0432\u044B\u0431\u043E\u0440",
@@ -3352,7 +4829,7 @@ STR = {
   "doh_menu_entry": "  {n} - {name}{url}",
   "doh_default_desc": "\u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e",
   "doh_default_applied": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e ({provider}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 config.json (settings.doh \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u043e\u0432.",
-  "hotkey_doh": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'h': DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 {provider} \u2014 \u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u043c \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e \u0441\u0440\u0430\u0437\u0443 (\u0434\u0432\u0438\u0436\u043e\u043a sing-box \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0441\u0430\u043c).",
+  "hotkey_doh": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'h': DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 {provider} \u2014 \u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u043c \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e \u0441\u0440\u0430\u0437\u0443 (\u0434\u0432\u0438\u0436\u043e\u043a sing-box \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0441\u0430\u043c); DNS-\u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435\u0441\u0443\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u043a \u043d\u0435\u043c\u0443 \u0441\u043e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0433\u043e \u0437\u0430\u043f\u0440\u043e\u0441\u0430 (\u0442\u043e\u043b\u044c\u043a\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0439 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440, \u0431\u0435\u0437 \u0446\u0435\u043f\u043e\u0447\u043a\u0438 \u043e\u0442\u043a\u0430\u0442\u043e\u0432; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e cloudflare).",
   "hotkey_doh_cache": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'k': \u043a\u044d\u0448 DoH {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --doh-cache).",
   "select_hint": "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u043f\u0443\u043d\u043a\u0442\u0430 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 \u0432\u044b\u0431\u043e\u0440.",
   "select_buffer": "\u0412\u0430\u0448 \u0432\u044b\u0431\u043e\u0440: {buf}",
@@ -3410,8 +4887,8 @@ STR = {
   "net_err_conn": "\u0441\u0431\u043e\u0439 \u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f (\u043e\u0442\u043a\u0430\u0437\u0430\u043d\u043e/\u0441\u0431\u0440\u043e\u0441/\u043d\u0435\u0434\u043e\u0441\u0442\u0438\u0436\u0438\u043c\u043e)",
   "locked_note": "\u041f\u0440\u0438\u043c\u0435\u0447\u0430\u043d\u0438\u0435 {_e}: \u0432 \u0436\u0438\u0432\u043e\u0439 \u043a\u043e\u043b\u043b\u0435\u043a\u0446\u0438\u0438 vpn-serverlist \u043f\u043e\u0447\u0442\u0438 \u0432\u0441\u0435 \u0441\u0442\u0440\u0430\u043d\u044b \u043f\u043e\u043c\u0435\u0447\u0435\u043d\u044b 'locked', \u0438 Firefox \u0438\u0445 \u0432\u0441\u0451 \u0440\u0430\u0432\u043d\u043e \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u0435\u0442 \u2014 \u0441 v5.0 \u0437\u0430\u043f\u0438\u0441\u0438 locked \u0432\u043a\u043b\u044e\u0447\u0435\u043d\u044b \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e (--exclude-locked \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0441\u0442\u0430\u0440\u044b\u0439 \u0444\u0438\u043b\u044c\u0442\u0440).",
   "upstream_override": "\u041f\u0435\u0440\u0435\u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0435\u043d\u0438\u0435 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430: \u0432\u0441\u0435 \u043b\u043e\u043a\u0430\u0446\u0438\u0438 \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 {host}:{port} \u0432\u043c\u0435\u0441\u0442\u043e \u0433\u043e\u0440\u043e\u0434\u0441\u043a\u0438\u0445 \u0445\u043e\u0441\u0442\u043e\u0432.",
-  "engine_started": "\u0414\u0432\u0438\u0436\u043e\u043a {engine} \u0437\u0430\u043f\u0443\u0449\u0435\u043d: {n} \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0430 {listen}",
-  "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]",
+  "engine_started": "\u0414\u0432\u0438\u0436\u043e\u043a {engine} \u0437\u0430\u043f\u0443\u0449\u0435\u043d: {n} \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0430 {listen} ({ptype})",
+  "proxy_line": "  {_e}{listen}:{port:<6} {label:<30} -> {host}:{uport} [{proto}]{dns}",
   "port_busy": "\u041f\u043e\u0440\u0442 {port} \u0437\u0430\u043d\u044f\u0442 \u2014 \u043f\u0440\u043e\u043f\u0443\u0441\u043a\u0430\u044e {label} (\u0437\u0430\u043d\u044f\u0442 \u0447\u0443\u0436\u0438\u043c \u043f\u0440\u043e\u0446\u0435\u0441\u0441\u043e\u043c?).",
   "no_free_ports": "\u041d\u0435\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u044b\u0445 \u043f\u043e\u0440\u0442\u043e\u0432 \u0434\u043b\u044f \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0445 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0432\u0441\u0435 \u043f\u043e\u0440\u0442\u044b-\u043a\u0430\u043d\u0434\u0438\u0434\u0430\u0442\u044b \u0437\u0430\u043d\u044f\u0442\u044b).",
   "no_servers_to_serve": "\u041d\u0435\u0442 \u0430\u043f\u0441\u0442\u0440\u0438\u043c-\u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 \u0434\u043b\u044f \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u043d\u0438\u044f: \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043e\u0442\u0441\u0435\u044f\u043b\u0430 \u0432\u0441\u0451 (\u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 --probe-fail keep) \u043b\u0438\u0431\u043e \u0441\u043f\u0438\u0441\u043e\u043a \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 \u043f\u0443\u0441\u0442.",
@@ -3431,7 +4908,7 @@ STR = {
   "unexpected_error": "\u041d\u0435\u043f\u0440\u0435\u0434\u0432\u0438\u0434\u0435\u043d\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {err!r} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u044e \u0447\u0435\u0440\u0435\u0437 30 \u0441.",
   "next_refresh": "\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 {_e} \u0447\u0435\u0440\u0435\u0437 {sec} \u0441 ({at} UTC).",
   "confirm_exit_hint": "Ctrl+C \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438.",
-  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \U0001f503 r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 (\u0442\u0430\u043c \u043b\u0435\u0436\u0438\u0442 config.json)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f4f7 g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043c\u0435\u043d\u044e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 ('+' \u2014 \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u041d\u041e\u0412\u042b\u0419, '-' \u2014 \u0443\u0434\u0430\u043b\u0438\u0442\u044c) \u2014 \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 \u043d\u0438\u043c \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u0412\u0415\u0421\u042c \u043f\u0440\u043e\u0444\u0438\u043b\u044c: DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440, \u044f\u0437\u044b\u043a, \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438, \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 sing-box \u0438 cookie Fastly (config.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \U0001f4bf s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1-9 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u043a\u043e\u043d\u0444\u0438\u0433\u0430 (\u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u0438\u0437 config.json) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u041f\u041e\u041b\u041d\u041e\u0415 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0430\u0446\u0438\u0438: \u0433\u043e\u0440\u044f\u0447\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u0434\u043b\u044f \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0444\u0430\u0439\u043b\u0430 (\u0431\u0443\u043a\u0432\u044b \u0434\u043b\u044f \u0444\u0430\u0439\u043b\u043e\u0432 \u0434\u0430\u043b\u044c\u0448\u0435 \u0434\u0435\u0432\u044f\u0442\u043e\u0433\u043e)\n  \U0001f50d Ctrl+O \u2014 \u043d\u0430\u0439\u0442\u0438 \u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u0442\u043a\u0438 \u0421\u0422\u0410\u0420\u041e\u0413\u041e \u0444\u043e\u0440\u043c\u0430\u0442\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (--clean-old-config)\n  \u23f9\ufe0f Ctrl+C \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043f\u0442 (\u043f\u0435\u0440\u0432\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442 \u0441\u0440\u0430\u0437\u0443; \u0441 --confirm-exit \u043d\u0443\u0436\u043d\u043e \u0432\u0442\u043e\u0440\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
+  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \U0001f503 r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS; DNS-\u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435\u0441\u0443\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u043a \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0443 \u2014 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e cloudflare, \u0431\u0435\u0437 \u0446\u0435\u043f\u043e\u0447\u043a\u0438 \u043e\u0442\u043a\u0430\u0442\u043e\u0432 (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f9e9 i \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0444\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044e ClientHello TLS (--tls-split; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b: \u043d\u0435\u0441\u0443\u0449\u0438\u0439 SNI ClientHello \u0440\u0435\u0436\u0435\u0442\u0441\u044f \u043d\u0430 \u043c\u0430\u043b\u0435\u043d\u044c\u043a\u0438\u0435 TCP-\u0441\u0435\u0433\u043c\u0435\u043d\u0442\u044b \u043f\u0440\u043e\u0442\u0438\u0432 DPI, \u0447\u0438\u0442\u0430\u044e\u0449\u0435\u0433\u043e \u043e\u0434\u0438\u043d \u043f\u0430\u043a\u0435\u0442; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 (\u0442\u0430\u043c \u043b\u0435\u0436\u0438\u0442 config.json)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f4f7 g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043c\u0435\u043d\u044e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 ('+' \u2014 \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u041d\u041e\u0412\u042b\u0419, '-' \u2014 \u0443\u0434\u0430\u043b\u0438\u0442\u044c) \u2014 \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 \u043d\u0438\u043c \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u0412\u0415\u0421\u042c \u043f\u0440\u043e\u0444\u0438\u043b\u044c: DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440, \u044f\u0437\u044b\u043a, \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438, \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 sing-box \u0438 cookie Fastly (config.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \U0001f4bf s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c config.json (\u0435\u0434\u0438\u043d\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (\u0441\u043f\u0438\u0441\u043e\u043a \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0432\u0441\u0435\u0445 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u0443\u0435\u043c\u044b\u0445 \u0444\u0430\u0439\u043b\u043e\u0432)\n  \U0001f50d Ctrl+O \u2014 \u043d\u0430\u0439\u0442\u0438 \u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u0442\u043a\u0438 \u0421\u0422\u0410\u0420\u041e\u0413\u041e \u0444\u043e\u0440\u043c\u0430\u0442\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (--clean-old-config)\n  \u26d4 Ctrl+C \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043f\u0442 (\u043f\u0435\u0440\u0432\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442 \u0441\u0440\u0430\u0437\u0443; \u0441 --confirm-exit \u043d\u0443\u0436\u043d\u043e \u0432\u0442\u043e\u0440\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f)\n  \U0001F527 Ctrl+T — выбрать тип локального прокси в меню: socks5 / http (--proxy-type; выбор кэшируется)\n  \U0001f501 Ctrl+R — авторотация аккаунтов по квоте вкл/выкл (--auto-rotate; выбор кэшируется)\n  \U0001f4cb Ctrl+P — перезаписать PAC-файл с текущими слушателями (--pac-export)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
   "hotkey_relogin": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'r' \u267b\ufe0f: \u041f\u041e\u041b\u041d\u041e\u0415 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435 \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 \u2014 \u043a\u044d\u0448\u0435\u0439, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u043e\u0432, \u043a\u043e\u043d\u0444\u0438\u0433\u043e\u0432 sing-box \u2014 \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434.",
   "hotkey_clear": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'c' \U0001f9f9: \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0443\u0434\u0430\u043b\u0435\u043d\u044b (\u043a\u044d\u0448\u0438, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u044b, \u043a\u043e\u043d\u0444\u0438\u0433\u0438 sing-box) \u2014 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u044e\u0441\u044c \u0441 \u0447\u0438\u0441\u0442\u043e\u0433\u043e \u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u044f.",
   "hotkey_engine": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'e': \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u044e \u0434\u0432\u0438\u0436\u043e\u043a \u043d\u0430 {engine} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
@@ -3445,7 +4922,8 @@ STR = {
   "hotkey_open_dir_fallback": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'o' \U0001f4c2: \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 sing-box \u0435\u0449\u0451 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442 (\u043e\u043d \u0441\u043e\u0437\u0434\u0430\u0451\u0442\u0441\u044f \u043f\u0440\u0438 \u0440\u0430\u0431\u043e\u0442\u0435 \u0434\u0432\u0438\u0436\u043a\u0430 singbox) \u2014 \u0432\u043c\u0435\u0441\u0442\u043e \u043d\u0435\u0433\u043e \u043e\u0442\u043a\u0440\u044b\u0442 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 {_e}: {path}",
   "hotkey_files_hint": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438: \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440, \u0447\u0442\u043e\u0431\u044b \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u0444\u0430\u0439\u043b \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e.",
   "hotkey_file_entry": "  {n} - {path}",
-  "files_menu_hint": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 ({n}) {_e} \u2014 \u0433\u043e\u0440\u044f\u0447\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u0435\u0441\u0442\u044c \u0443 \u041a\u0410\u0416\u0414\u041e\u0413\u041e \u0444\u0430\u0439\u043b\u0430: 1-9 \u043e\u0442\u043a\u0440\u044b\u0432\u0430\u044e\u0442 \u043f\u0435\u0440\u0432\u044b\u0435 \u0434\u0435\u0432\u044f\u0442\u044c \u041d\u0410\u041f\u0420\u042f\u041c\u0423\u042e; \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0445 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0431\u0443\u043a\u0432\u0435\u043d\u043d\u044b\u0439 \u0442\u043e\u043a\u0435\u043d (a, b, ...) \u0438 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442; \u043c\u0435\u043d\u044e \u0437\u0430\u043a\u0440\u044b\u0432\u0430\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u043f\u043e\u0441\u043b\u0435 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f \u0444\u0430\u0439\u043b\u0430.",
+  "files_menu_hint": "\u0424\u0430\u0439\u043b\u044b \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 ({n}) {_e} \u2014 \u0432\u0432\u0435\u0434\u0438\u0442\u0435 \u0442\u043e\u043a\u0435\u043d \u0444\u0430\u0439\u043b\u0430 (\u0434\u043b\u044f \u0444\u0430\u0439\u043b\u043e\u0432 \u043f\u043e\u043c\u0438\u043c\u043e \u043f\u0435\u0440\u0432\u043e\u0433\u043e \u2014 \u0431\u0443\u043a\u0432\u0430) \u0438 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442; \u043c\u0435\u043d\u044e \u0437\u0430\u043a\u0440\u044b\u0432\u0430\u0435\u0442\u0441\u044f \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u043f\u043e\u0441\u043b\u0435 \u043e\u0442\u043a\u0440\u044b\u0442\u0438\u044f \u0444\u0430\u0439\u043b\u0430.",
+  "hotkey_no_file": "\U0001f4c4 \u041a\u043b\u0430\u0432\u0438\u0448\u0430 '{k}': \u0444\u0430\u0439\u043b\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 \u2116 {n} \u043d\u0435\u0442 \u2014 \u0441 v6.0 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u0443\u0435\u043c\u044b\u0439 \u043a\u043e\u043d\u0444\u0438\u0433 \u041e\u0414\u0418\u041d (config.json, \u043a\u043b\u0430\u0432\u0438\u0448\u0430 '1').",
   "hotkey_open": "\u041e\u0442\u043a\u0440\u044b\u043b \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e {_e}: {path}",
   "hotkey_open_dir": "\u041e\u0442\u043a\u0440\u044b\u043b \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0444\u0430\u0439\u043b\u043e\u0432\u043e\u043c \u043c\u0435\u043d\u0435\u0434\u0436\u0435\u0440\u0435 {_e}: {path}",
   "hotkey_open_fail": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043a\u0440\u044b\u0442\u044c {path}: {err}",
@@ -3543,6 +5021,75 @@ STR = {
   "masque_probe_error": "{err}",
   "builtin_connect_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0443: {err}",
   "builtin_no_token": "proxyPass-\u0442\u043e\u043a\u0435\u043d \u0435\u0449\u0451 \u043d\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d",
+  "api_proxy_on": "\u041a\u043e\u043d\u0442\u0440\u043e\u043b\u044c\u043d\u0430\u044f \u043f\u043b\u043e\u0441\u043a\u043e\u0441\u0442\u044c (FxA/Guardian/Remote Settings + challenge Fastly) \u0447\u0435\u0440\u0435\u0437 \u0424\u0418\u041a\u0421\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 \u0432\u044b\u0445\u043e\u0434 {_e}: {url} (--api-proxy)",
+  "api_proxy_off": "\u0412\u044b\u0445\u043e\u0434 \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u044c\u043d\u043e\u0439 \u043f\u043b\u043e\u0441\u043a\u043e\u0441\u0442\u0438: \u043f\u0440\u044f\u043c\u043e\u0439 (--api-proxy \u043d\u0435 \u0437\u0430\u0434\u0430\u043d)",
+  "api_proxy_socks_unsupported": "socks5:// \u043d\u0435 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f (--api-proxy): stdlib ProxyHandler \u0442\u0443\u043d\u043d\u0435\u043b\u0438\u0440\u0443\u0435\u0442 \u0442\u043e\u043b\u044c\u043a\u043e http/https \u0447\u0435\u0440\u0435\u0437 CONNECT; \u0441\u043a\u0440\u0438\u043f\u0442 \u043d\u0435 \u0434\u043e\u0431\u0430\u0432\u043b\u044f\u0435\u0442 \u043d\u043e\u0432\u044b\u0445 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 - \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 http:// \u0438\u043b\u0438 https:// \u043f\u0440\u043e\u043a\u0441\u0438",
+  "hotkey_tls_split": "\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044f ClientHello TLS: {state}",
+  "tls_split_startup": "\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044f ClientHello TLS: {state} (--tls-split; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b)",
+  "fastly_406_stale": "\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u0439 cookie \u0447\u0435\u043b\u043b\u0435\u043d\u0434\u0436\u0430 Fastly \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d (HTTP 406 \u043f\u0440\u0438 \u043d\u0430\u043b\u0438\u0447\u0438\u0438 cookie) - \u0443\u0441\u0442\u0430\u0440\u0435\u0432\u0448\u0438\u0439 cookie \u043e\u0442\u0431\u0440\u0430\u0441\u044b\u0432\u0430\u0435\u0442\u0441\u044f, \u043f\u0435\u0440\u0435\u0434 \u043f\u043e\u0432\u0442\u043e\u0440\u043e\u043c \u0440\u0435\u0448\u0430\u0435\u0442\u0441\u044f \u041d\u041e\u0412\u042b\u0419 \u0447\u0435\u043b\u043b\u0435\u043d\u0434\u0436",
+  "fxa_429_cooldown": "\u041b\u0438\u043c\u0438\u0442 \u0447\u0430\u0441\u0442\u043e\u0442\u044b \u0432\u0445\u043e\u0434\u0430 FxA - \u043f\u0430\u0443\u0437\u0430 15 \u043c\u0438\u043d\u0443\u0442; \u043f\u0440\u0438 \u043f\u043e\u0432\u0442\u043e\u0440\u0435 \u043f\u0440\u0435\u0434\u043f\u043e\u0447\u0442\u0451\u043d \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 session token",
+  "guardian_reactivated": "Guardian: \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u0430\u044f \u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f (HTTP {status}) - \u043e\u0434\u043d\u0430 \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u0430\u044f \u043f\u043e\u043f\u044b\u0442\u043a\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0438\u044f \u0442\u043e\u043a\u0435\u043d\u0430",
+  "guardian_reactivate_failed": "Guardian: \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u0430\u044f \u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f \u043d\u0435 \u0443\u0434\u0430\u043b\u0430\u0441\u044c (HTTP {status}: {detail})",
+  "pass_rejected_refresh": "\u0410\u043f\u0441\u0442\u0440\u0438\u043c \u041e\u0422\u0412\u0415\u0420\u0413 proxyPass (HTTP 400 'parsing JWT failed' / 401 / 403) - pass \u043e\u0431\u043d\u043e\u0432\u043b\u044f\u0435\u0442\u0441\u044f \u043d\u0435\u043c\u0435\u0434\u043b\u0435\u043d\u043d\u043e",
+  "session_fail_refresh": "3+ \u0440\u0430\u0437\u043d\u044b\u0445 \u0446\u0435\u043b\u0435\u0439 \u043d\u0435 \u043e\u0442\u043a\u0440\u044b\u043b\u0438\u0441\u044c \u0447\u0435\u0440\u0435\u0437 \u0442\u0443\u043d\u043d\u0435\u043b\u044c - \u0441\u0435\u0441\u0441\u0438\u044f \u0432\u044b\u0433\u043b\u044f\u0434\u0438\u0442 \u0431\u0438\u0442\u043e\u0439; \u043e\u0431\u043d\u043e\u0432\u043b\u044f\u044e pass \u0441\u0435\u0439\u0447\u0430\u0441",
+  "connect_rejected": "\u0410\u043f\u0441\u0442\u0440\u0438\u043c \u043e\u0442\u0432\u0435\u0440\u0433 CONNECT (HTTP {code}) \u043a {_e}{target}",
+  "connect_target_open_timeout": "CONNECT \u043a {_e}{target} \u043d\u0435 \u043e\u0442\u043a\u0440\u044b\u043b\u0441\u044f (\u0442\u0430\u0439\u043c\u0430\u0443\u0442)",
+  "connect_target_bad_gateway": "\u0410\u043f\u0441\u0442\u0440\u0438\u043c \u043e\u0442\u0432\u0435\u0442\u0438\u043b HTTP {code} \u0434\u043b\u044f {_e}{target}",
+  "connect_target_doh_unreachable": "DoH-\u0446\u0435\u043b\u044c DNS-\u0440\u0435\u0442\u0440\u0430\u043d\u0441\u043b\u044f\u0442\u043e\u0440\u0430 {target} \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 \u0447\u0435\u0440\u0435\u0437 \u0442\u0443\u043d\u043d\u0435\u043b\u044c {_e} DNS-\u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432\u043e\u0437\u044f\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u043a \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0443 (\u043a\u043b\u0430\u0432\u0438\u0448\u0430 'h' / --doh \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c); DNS-\u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0447\u0435\u0440\u0435\u0437 \u0442\u043e\u0447\u043a\u0438 \u043d\u0435 \u043e\u0442\u0432\u0435\u0447\u0430\u044e\u0442, \u043f\u043e\u043a\u0430 \u043e\u043d \u043d\u0435 \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0441\u044f (\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043a\u043b\u0438\u0435\u043d\u0442\u0430 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442 \u0441\u0430\u043c)",
+  "quota_low": "\u041e\u0441\u0442\u0430\u0442\u043e\u043a \u043a\u0432\u043e\u0442\u044b \u043d\u0438\u0436\u0435 15%: {left} \u0438\u0437 {limit}{reset} - \u043a\u0432\u043e\u0442\u0430 \u043e\u0431\u043d\u0443\u043b\u044f\u0435\u0442\u0441\u044f \u0435\u0436\u0435\u043c\u0435\u0441\u044f\u0447\u043d\u043e",
+  "filter_cleared_broken": "\u0421\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0439 \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438 \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e \u043f\u0430\u0434\u0430\u043b \u043d\u0430 \u0412\u0421\u0415\u0425 \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0432\u0430\u0435\u043c\u044b\u0445 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u0445 - \u0444\u0438\u043b\u044c\u0442\u0440 \u043e\u0447\u0438\u0449\u0435\u043d, \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u0441\u0431\u043e\u0440\u043a\u0430 \u0434\u0432\u0438\u0436\u043a\u0430 \u043e\u0431\u0441\u043b\u0443\u0436\u0438\u0442 \u0412\u0421\u0415 \u043f\u0440\u043e\u043a\u0441\u0438 (\u0432\u0435\u0440\u043d\u0438\u0442\u0435 \u0432\u044b\u0431\u043e\u0440 \u043a\u043b\u0430\u0432\u0438\u0448\u0435\u0439 'w', \u043a\u043e\u0433\u0434\u0430 \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u043e\u0432\u044f\u0442\u0441\u044f)",
+  "channel_limits_note": "\u041a\u0430\u043d\u0430\u043b Mozilla \u0441\u0435\u0433\u043e\u0434\u043d\u044f — \u044d\u0442\u043e HTTP CONNECT-\u0442\u0443\u043d\u043d\u0435\u043b\u044c \u043f\u043e\u0432\u0435\u0440\u0445 HTTP/2 (\u0421\u042b\u0420\u041e\u0419 TCP-\u0442\u0443\u043d\u043d\u0435\u043b\u044c: \u0432\u043d\u0443\u0442\u0440\u0438 \u043c\u043e\u0436\u0435\u0442 \u0440\u0430\u0431\u043e\u0442\u0430\u0442\u044c \u041b\u042e\u0411\u041e\u0419 TCP-\u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b \u0438 \u043d\u0430 \u041b\u042e\u0411\u041e\u0419 \u043f\u043e\u0440\u0442 \u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f; \u0431\u0435\u043b\u043e\u0433\u043e \u0441\u043f\u0438\u0441\u043a\u0430 \u043f\u043e\u0440\u0442\u043e\u0432 \u043d\u0435\u0442). UDP/IP-\u043f\u043e\u0442\u043e\u043a\u0438 — \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0439 \u0448\u0430\u0433: MASQUE \u043f\u043e\u0432\u0435\u0440\u0445 HTTP/3 (Firefox \u0443\u0436\u0435 \u043d\u0435\u0441\u0451\u0442 \u043a\u043e\u0434 CONNECT-UDP, \u0430 \u0432 \u0441\u043f\u0438\u0441\u043a\u0435 \u0441\u0435\u0440\u0432\u0435\u0440\u043e\u0432 \u0443\u0436\u0435 \u0435\u0441\u0442\u044c \u043f\u043e\u0441\u0435\u0440\u0432\u0435\u0440\u043d\u044b\u0439 \u043f\u0440\u043e\u0442\u043e\u043a\u043e\u043b masque). \u0413\u043b\u0443\u0431\u043e\u043a\u043e\u0433\u043e \u0430\u043d\u0430\u043b\u0438\u0437\u0430 \u043f\u0430\u043a\u0435\u0442\u043e\u0432 (DPI) \u043d\u0430 \u0432\u044b\u0445\u043e\u0434\u0435 \u043d\u0435\u0442; Mozilla \u043f\u043e\u0437\u0438\u0446\u0438\u043e\u043d\u0438\u0440\u0443\u0435\u0442 \u0444\u0443\u043d\u043a\u0446\u0438\u044e \u0434\u043b\u044f \u0432\u0435\u0431-\u0442\u0440\u0430\u0444\u0438\u043a\u0430 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430",
+  "proxy_type_selected": "Тип локального прокси: {type} (Ctrl+T открывает меню выбора; SOCKS5 передаёт доменные имена апстриму — удалённый DNS)",
+  "proxy_type_switched": "Тип локального прокси переключён на {type}: пересборка слушателей",
+  "hotkey_proxy_type": "Ctrl+T — выбрать тип локального прокси в меню: socks5 / http (--proxy-type; выбор сохраняется)",
+  "ptype_menu_hint": "Выберите тип локального прокси {_e} — введите его номер и нажмите Enter (текущий: {cur}; [x] отмечает работающий тип). Выбор сохраняется в config.json (settings.proxy_type), сразу пересобирает слушатели и действует после перезапусков (Backspace удаляет, любая другая клавиша отменяет; после применения меню закрывается автоматически).",
+  "ptype_menu_entry": "  {n} - {name} - {desc}",
+  "ptype_desc_socks5": "SOCKS5 (RFC 1928): доменные имена резолвит апстрим — удалённый DNS",
+  "ptype_desc_http": "HTTP CONNECT",
+  "dns_line": "DNS-ретрансляция {_e} {listen}: {n} DNS-точек — по одной на прокси (UDP+TCP; DNS-порт прокси возит запросы ТОЛЬКО через этот прокси -> его egress -> DoH {target}). Укажите системному резолверу или любой plain-DNS-программе DNS-порт, показанный рядом с нужным прокси; приложениям, которые уже передают домены через прокси (socks5h, remote DNS), они не нужны",
+  "dns_port_busy": "DNS-порт {port} прокси {label} занят — эта DNS-точка пропущена (сам прокси продолжает работать)",
+  "hotkey_auto_rotate": "Ctrl+R — авторотация аккаунтов по квоте вкл/выкл (выбор сохраняется)",
+  "hotkey_pac_export": "Ctrl+P — перезаписать PAC-файл (обход локальных сайтов)",
+  "auto_rotate_startup": "Авторотация аккаунтов по квоте ВКЛЮЧЕНА (Ctrl+R выключает; --no-auto-rotate)",
+  "auto_rotate_on": "Авторотация аккаунтов по квоте ВКЛЮЧЕНА",
+  "auto_rotate_off": "Авторотация аккаунтов по квоте ВЫКЛЮЧЕНА",
+  "auto_rotate_switched": "{state} — выбор сохранён",
+  "auto_rotate_zero": "Квота исчерпана на текущем аккаунте ({email}) — авторотация ищет аккаунт с максимумом остатка",
+  "auto_rotate_to": "Авторотация: переключение на аккаунт {email} (известный остаток {left}) — кэшированная сессия, без нового входа",
+  "auto_rotate_none": "Авторотация: все остальные кэшированные аккаунты исчерпаны или без кэшированной сессии — остаёмся на {email}",
+  "auto_rotate_off_zero": "Квота исчерпана на текущем аккаунте — авторотация ВЫКЛЮЧЕНА (Ctrl+R включает)",
+  "fxa_profile_read": "Сессия профиля Firefox: {path}",
+  "fxa_profile_missing": "Не удалось прочитать файл профиля Firefox: {path} ({err})",
+  "fxa_profile_no_token": "В {path} нет sessionToken — сначала войдите в браузер Firefox, затем перезапустите",
+  "fxa_profile_bad_token": "sessionToken в {path} повреждён — войдите в браузер Firefox заново",
+  "fxa_profile_session_invalid": "Сессия браузера Firefox больше не валидна (errno 110) — войдите в Firefox заново, затем нажмите любую клавишу для повтора",
+  "unblock_prompt": "Mozilla отправила 6-значный код разблокировки на {email} — введите его (пустой ввод повторно отправляет письмо, 'q' отмена): ",
+  "unblock_resent": "Письмо с кодом разблокировки повторно отправлено на {email}",
+  "unblock_wrong": "Код разблокировки не принят — попробуйте ещё раз",
+  "unblock_gave_up": "Попытки ввода кода разблокировки исчерпаны — вход остаётся заблокированным (дождитесь нового письма или попробуйте позже)",
+  "email_link_wait": "Откройте ссылку-подтверждение из письма Mozilla в браузере — ожидание до {sec} с (любая клавиша вернёт к вводу кода)",
+  "email_link_verified": "Ссылка-подтверждение из письма принята — сессия верифицирована",
+  "email_link_timeout": "Ссылка не подтверждена вовремя — возврат к вводу кода",
+  "pac_written": "PAC-файл записан: {path} ({directive} записей: {n})",
+  "pac_failed": "Не удалось записать PAC-файл: {path} ({err})",
+  "pac_no_proxies": "Нет работающих локальных прокси — PAC-файл не перезаписан",
+  "doctor_title": "Диагностика (только чтение):",
+  "doctor_ok": "ок",
+  "doctor_fail": "СБОЙ",
+  "doctor_skip": "пропуск",
+  "doctor_interpreter": "Python {ver} на {plat}",
+  "doctor_config": "Хранилище конфигурации: {path} (аккаунтов: {n})",
+  "doctor_deps": "Зависимости: {miss}",
+  "doctor_deps_ok": "все на месте",
+  "doctor_sysdns": "Системный DNS: {host} -> {ips}",
+  "doctor_doh": "DoH ({provider}) резолв {host}: {ips}",
+  "doctor_doh_system": "выключен по выбору — системный резолвер (проверен шагом выше)",
+  "doctor_fxa": "FxA API {url}: HTTP {status}",
+  "doctor_serverlist": "Список серверов: {n} локаций, {m} серверов",
+  "doctor_tls": "TLS-хендшейк до {host}:{port} (профиль {p}): {ms} мс",
+  "doctor_quota": "Квота Guardian на кэшированной сессии: осталось {left} из {limit}",
+  "doctor_no_session": "Нет кэшированного session-токена — шаг Guardian пропущен (войдите один раз обычным способом)",
+  "doctor_done": "Диагностика завершена: {ok} ок, {fail} сбоев",
 },
 }
 
@@ -3841,6 +5388,14 @@ _EMOJI = {
     "login_error": "\u274C ",
     "email_unverified": "\u274C ",
     "email_confirm_required": "\u274C ",
+    # v7.0: the emailed-code verification path (email-2fa)
+    "email_code_resent": "\u2705 ",
+    "email_code_confirmed": "\u2705 ",
+    "email_code_rejected": "\u26A0\uFE0F  ",
+    "email_resend_failed": "\u26A0\uFE0F  ",
+    "email_code_aal_hint": "\u2139\uFE0F ",
+    "email_code_rejected_final": "\u274C ",
+    "email_code_unknown_error": "\u274C ",
     "session_unverified": "\u274C ",
     "totp_missing": "\u274C ",
     "totp_rejected_final": "\u274C ",
@@ -3884,6 +5439,24 @@ _EMOJI = {
     "blocked_extra_method": "\U0001F6A8 ",   # police light (WAF block)
     "builtin_connect_failed": "\U0001F6A8 ",
     "builtin_no_token": "\U0001F6A8 ",
+    "api_proxy_on": "\U0001F3AF ",
+    "api_proxy_off": "\U0001F3AF ",
+    "api_proxy_socks_unsupported": "\u274C ",
+    "hotkey_tls_split": "\U0001F9E9 ",
+    "tls_split_startup": "\U0001F9E9 ",
+    "fastly_406_stale": "\U0001F504 ",
+    "fxa_429_cooldown": "\U0001F4E1 ",
+    "guardian_reactivated": "\U0001F6E1uFE0F  ",
+    "guardian_reactivate_failed": "\U0001F6E1uFE0F  ",
+    "pass_rejected_refresh": "\u26A0uFE0F  ",
+    "session_fail_refresh": "\u26A0uFE0F  ",
+    "connect_rejected": "\u274C ",
+    "connect_target_open_timeout": "\u23F3 ",
+    "connect_target_bad_gateway": "\u274C ",
+    "connect_target_doh_unreachable": "\U0001F4E1 ",
+    "quota_low": "\U0001F4CA ",
+    "filter_cleared_broken": "\U0001F30D ",
+    "channel_limits_note": "\U00002139 ",
     "cache_clear_failed": "\u274C ",
     "cache_cleared": "\U0001F9F9 ",          # broom (cache wiped)
     "cache_nothing": "\U0001F937 ",
@@ -3907,6 +5480,55 @@ _EMOJI = {
     "tls_plain_http": "\U000026A0 ",
     "totp_none_reason_nocreds": "\U0001F510 ",
     "totp_none_reason_nosecret": "\U0001F510 ",
+    "proxy_type_selected": "\U0001F50C ",
+    "proxy_type_switched": "\U0001F50C ",
+    "hotkey_proxy_type": "\U0001F527 ",   # wrench (the proxy type menu)
+    "ptype_menu_hint": "\U0001F527 ",     # wrench (the Ctrl+T selection menu)
+    "ptype_menu_entry": "\U0001F527 ",
+    "dns_line": "\U0001F4E1 ",            # satellite antenna (the local DNS relay, v8.5)
+    "dns_port_busy": "\U0001F4E1 ",
+    "hotkey_auto_rotate": "\U0001F501 ",
+    "hotkey_pac_export": "\U0001F4CB ",
+    "auto_rotate_startup": "\U0001F501 ",
+    "auto_rotate_on": "\U0001F501 ",
+    "auto_rotate_off": "\U000023F8 ",
+    "auto_rotate_switched": "\U0001F501 ",
+    "auto_rotate_zero": "\U0001FAAB ",
+    "auto_rotate_to": "\U0001F504 ",
+    "auto_rotate_none": "\U0001F6AB ",
+    "auto_rotate_off_zero": "\U0001FAAB ",
+    "fxa_profile_read": "\U0001F98A ",
+    "fxa_profile_missing": "\U0001F98A ",
+    "fxa_profile_no_token": "\U0001F98A ",
+    "fxa_profile_bad_token": "\U0001F98A ",
+    "fxa_profile_session_invalid": "\U0001F98A ",
+    "unblock_prompt": "\U0001F513 ",
+    "unblock_resent": "\U00002709 ",
+    "unblock_wrong": "\U0000274C ",
+    "unblock_gave_up": "\U000026D4 ",
+    "email_link_wait": "\U0001F517 ",
+    "email_link_verified": "\U0001F517 ",
+    "email_link_timeout": "\U0001F517 ",
+    "pac_written": "\U0001F4CB ",
+    "pac_failed": "\U0001F4CB ",
+    "pac_no_proxies": "\U0001F4CB ",
+    "doctor_title": "\U0001FA7A ",
+    "doctor_ok": "\U00002705 ",
+    "doctor_fail": "\U0000274C ",
+    "doctor_skip": "\U000023ED ",
+    "doctor_interpreter": "\U0001F40D ",
+    "doctor_config": "\U0001F5C3 ",
+    "doctor_deps": "\U0001F4E6 ",
+    "doctor_deps_ok": "\U0001F4E6 ",
+    "doctor_sysdns": "\U0001F310 ",
+    "doctor_doh": "\U0001F50E ",
+    "doctor_doh_system": "\U0001F50E ",
+    "doctor_fxa": "\U0001F98A ",
+    "doctor_serverlist": "\U0001F30D ",
+    "doctor_tls": "\U0001F512 ",
+    "doctor_quota": "\U0001F4F6 ",
+    "doctor_no_session": "\U0001F4F6 ",
+    "doctor_done": "\U0001FA7A ",
 }
 
 def tr(key: str, **kw) -> str:
@@ -3970,6 +5592,59 @@ FLAG_COLS = 6
 # cosmetic fix. The table below is the standard wcwidth algorithm
 # (the Unicode East Asian Width property W/F = 2; Mn/Me/Cf categories
 # and the VS16/ZWJ = 0; everything else printable = 1).
+#
+# v8.1 (req. 2): the emoji/symbol planes are checked against the REAL
+# East Asian Width W table (Unicode 18.0.0 - the wcwidth project's
+# table_wide.py, generated from EastAsianWidth-18.0.0.txt of
+# 2026-06-29; fetched and diffed 2026-10-30) instead of the v6.0
+# blanket 'all of 0x1F300-0x1F64F is 2 cells'. The real W property in
+# the emoji planes is patchy and the blanket was wrong in BOTH
+# directions: it counted NEUTRAL codepoints as 2 cells (U+1F39B
+# CONTROL KNOBS, U+1F54F, U+1F568 DESKTOP COMPUTER ... render 1 cell
+# on every terminal that follows the standard, so a hint line led by
+# one of them was padded one cell short and its key letter sat one
+# column off), and it MISSED the wide symbols outside the blanket
+# (U+2705, U+26A1, U+26D4 ...). The ranges below are the
+# 0x2300-0x2BFF and 0x1F000-0x1FBFF portions of that W table
+# verbatim; the CJK/fullwidth ranges stay in _cw itself.
+_EAW_WIDE = (
+    (0x231A, 0x231B), (0x2329, 0x232A), (0x23E9, 0x23EC), (0x23F0, 0x23F0),
+    (0x23F3, 0x23F3), (0x25FD, 0x25FE), (0x2614, 0x2615), (0x2630, 0x2637),
+    (0x2648, 0x2653), (0x267F, 0x267F), (0x268A, 0x268F), (0x2693, 0x2693),
+    (0x26A1, 0x26A1), (0x26AA, 0x26AB), (0x26BD, 0x26BE), (0x26C4, 0x26C5),
+    (0x26CE, 0x26CE), (0x26D4, 0x26D4), (0x26EA, 0x26EA), (0x26F2, 0x26F3),
+    (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD), (0x2705, 0x2705),
+    (0x270A, 0x270B), (0x2728, 0x2728), (0x274C, 0x274C), (0x274E, 0x274E),
+    (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797), (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55),
+    (0x1F004, 0x1F004), (0x1F0CF, 0x1F0CF), (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A), (0x1F1AE, 0x1F1AE), (0x1F1E6, 0x1F202),
+    (0x1F210, 0x1F23B), (0x1F240, 0x1F248), (0x1F250, 0x1F251),
+    (0x1F260, 0x1F265), (0x1F300, 0x1F320), (0x1F32D, 0x1F335),
+    (0x1F337, 0x1F37C), (0x1F37E, 0x1F393), (0x1F3A0, 0x1F3CA),
+    (0x1F3CF, 0x1F3D3), (0x1F3E0, 0x1F3F0), (0x1F3F4, 0x1F3F4),
+    (0x1F3F8, 0x1F43E), (0x1F440, 0x1F440), (0x1F442, 0x1F4FC),
+    (0x1F4FF, 0x1F53D), (0x1F54B, 0x1F54E), (0x1F550, 0x1F567),
+    (0x1F57A, 0x1F57A), (0x1F595, 0x1F596), (0x1F5A4, 0x1F5A4),
+    (0x1F5FB, 0x1F64F), (0x1F680, 0x1F6C5), (0x1F6CC, 0x1F6CC),
+    (0x1F6D0, 0x1F6D2), (0x1F6D5, 0x1F6D9), (0x1F6DC, 0x1F6DF),
+    (0x1F6EB, 0x1F6EC), (0x1F6F4, 0x1F6FC), (0x1F7DA, 0x1F7DA),
+    (0x1F7E0, 0x1F7EB), (0x1F7F0, 0x1F7F0), (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945), (0x1F947, 0x1F9FF), (0x1FA70, 0x1FA7C),
+    (0x1FA80, 0x1FAC6), (0x1FAC8, 0x1FAC8), (0x1FACC, 0x1FADD),
+    (0x1FADF, 0x1FAEB), (0x1FAEF, 0x1FAFA),
+)
+
+def _eaw_wide(cp: int) -> bool:
+    """Is `cp` East Asian Wide in the emoji/symbol planes? The ranges
+    are sorted by their start, so the scan stops at the first one."""
+    for start, stop in _EAW_WIDE:
+        if cp < start:
+            return False
+        if cp <= stop:
+            return True
+    return False
+
 def _cw(text: str) -> int:
     """Console cell width of `text` (wcwidth-style, no dependencies).
     Follows the Unicode 9 emoji-width model used by every modern
@@ -4012,9 +5687,10 @@ def _cw(text: str) -> int:
             prev_zwj = False
             i += 2
             continue
-        # East Asian Wide & Fullwidth + the emoji blocks (the standard
-        # wcwidth ranges; every default-emoji-presentation codepoint of
-        # the U+1Fxxx pictures is covered)
+        # East Asian Wide & Fullwidth. The CJK/fullwidth blocks are the
+        # standard ones; the emoji/symbol planes go through _eaw_wide()
+        # - the REAL East Asian Width W table (Unicode 18.0.0, see
+        # _EAW_WIDE above), not a blanket emoji-block guess.
         wide = (0x1100 <= cp <= 0x115F or   # Hangul Jamo
                 (0x2E80 <= cp <= 0xA4CF and cp != 0x303F) or
                 0xAC00 <= cp <= 0xD7A3 or    # Hangul syllables
@@ -4022,15 +5698,7 @@ def _cw(text: str) -> int:
                 0xFE30 <= cp <= 0xFE4F or
                 0xFF00 <= cp <= 0xFF60 or    # fullwidth forms
                 0xFFE0 <= cp <= 0xFFE6 or
-                0x1F004 <= cp <= 0x1F0CF or
-                0x1F18E == cp or 0x1F191 <= cp <= 0x1F19A or
-                0x1F200 <= cp <= 0x1F2FF or
-                0x1F300 <= cp <= 0x1F64F or  # emoji pictures
-                0x1F680 <= cp <= 0x1F6FF or
-                0x1F7F0 == cp or
-                0x1F900 <= cp <= 0x1F9FF or
-                0x1FA70 <= cp <= 0x1FAFF or
-                0x1F3F == cp or cp in (0x1F532, 0x1F533))
+                _eaw_wide(cp))
         if prev_zwj:
             # a joined emoji sequence counts as ONE glyph: the ZWJ'd
             # piece adds nothing (family/profession emoji stay 2 cells)
@@ -4359,7 +6027,7 @@ _RE_TOKENS = re.compile(
     r'|(?P<host>\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+'
     r'[A-Za-z]{2,}(?::\d{1,5})?(?![\w.-]))'
     r'|(?P<cc>\b[A-Z]{2}\b)'
-    r'|(?P<proto>\b(?:connect-udp|connect-ip|masque|connect)\b)'
+    r'|(?P<proto>\b(?:connect-udp|connect-ip|masque|connect|socks5|http)\b)'
     r'|(?P<flag>(?<=\s)--[\w][\w-]*)'
     r'|(?P<key>(?<=\')[a-z0-9](?=\')|(?<=\s)[1-9]-[1-9](?=\s[-\u2014]\s)|(?<=\s)Ctrl\+[A-Z](?=\s[-\u2014]\s)|(?<=\s)[a-z0-9](?=\s[-\u2014]\s))'
     r'|(?P<hotdesc>(?<=\s[-\u2014]\s)[^\n]+)'
@@ -4383,7 +6051,7 @@ _RE_DESC_TOKENS = re.compile(r'--[\w][\w-]*'
                             r'|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b'
                             r'|\b(?:masque|connect-udp|connect-ip|connect|builtin|singbox|sing-box)\b')
 
-def _render(level: str, msg: str):
+def _render(level: str, msg: str, end: str = "\n"):
     """Render ONE log line (theme background + level color + word-level
     highlight colors). Does NOT touch the history - used both for live
     output and for the full-log redraw. Inside a matched file path the
@@ -4391,11 +6059,13 @@ def _render(level: str, msg: str):
     e.g. C:\\Users\\...\\mozvpn\\session.json shows session.json distinctly.
     A hotkey DESCRIPTION (the text after " - " in the per-key hint lines)
     gets its own color, with --flags / IPs / protocol names inside it
-    still highlighted separately."""
+    still highlighted separately.
+    v8.1 (req. 3): `end` lets the caller print WITHOUT the trailing
+    newline - the live UI panel paints its rows this way on repaint."""
     if not _USE_COLOR:
         # v5.14: strip embedded ANSI sequences (the pixel-art flags) so
         # the colorless log and the hotkey-'n' redraw stay clean text
-        print(_ANSI_RE.sub("", msg))
+        print(_ANSI_RE.sub("", msg), end=end, flush=True)
         return
     t = _THEMES[_THEME]
     lvl = t[level]
@@ -4449,37 +6119,166 @@ def _render(level: str, msg: str):
         pos = m.end()
     out.append(msg[pos:])
     out.append(C.RESET)
-    print("".join(out))
+    print("".join(out), end=end, flush=True)
 
 def _emit(level: str, msg: str):
     """Print one log line and REMEMBER it in the history (for the full
-    redraw on a theme/color switch)."""
+    redraw on a theme/color switch). v8.1 (req. 3): while the live UI
+    panel is on screen, the line first LIFTS the panel (erase), prints
+    ABOVE its old position and DROPS it back below - the log keeps
+    scrolling and the panel stays pinned at the bottom of the screen."""
+    _panel_lift()
     _LOG_HISTORY.append((level, msg))
     if len(_LOG_HISTORY) > _LOG_HISTORY_MAX:
         del _LOG_HISTORY[:len(_LOG_HISTORY) - _LOG_HISTORY_MAX]
     _render(level, msg)
+    _panel_drop()
 
 def redraw_log():
     """Fully redraw the whole remembered log: clear the screen (and the
     scrollback) and re-render every history line in the CURRENT theme and
     color mode. Used by hotkeys 'm' (theme switch) and 'n' (color toggle)
-    so the entire visible output switches style at once."""
+    so the entire visible output switches style at once. v8.1 (req. 3):
+    the live UI panel is repainted below the redrawn log (its content is
+    NOT part of the history - it would double-print in the fallback
+    mode, and the panel always shows its CURRENT state anyway)."""
+    was_live = _PANEL["rows"] or _PANEL["pending"]
+    _PANEL["rows"] = 0
+    _PANEL["pending"] = False
     print("\033[2J\033[3J\033[H", end="", flush=True)
     for level, msg in list(_LOG_HISTORY):
         _render(level, msg)
+    if was_live and _PANEL["lines"]:
+        _panel_render(_PANEL["lines"])
+
+# v8.1 (req. 3): the LIVE UI PANEL. Every proxyPass refresh used to
+# APPEND the whole per-refresh block to the log - the proxyPass line,
+# the quota, the raw + decoded JWT, the next-refresh countdown, the
+# full hotkeys hint, the config-files list and the clear-cache targets
+# (50+ rows every ~10 minutes of runtime). The panel instead REDRAWS
+# that block in place: the old rows are erased with ANSI cursor
+# control (cursor-up + clear-to-end-of-line per row) and the current
+# block is repainted at the same spot, so a token refresh costs ZERO
+# new log rows. Any real log line emitted while the panel is on
+# screen (a warning, a hotkey action, an engine rebuild message)
+# lifts the panel first, prints above its old position and drops it
+# back below the new line. Everything falls back to the classic
+# append when in-place redraw is impossible: no tty (a pipe/file), a
+# 'dumb' TERM, or a panel taller than the terminal window. The row
+# count follows the REAL wrapped height (a segment longer than the
+# terminal width occupies ceil(cells / columns) rows; every embedded
+# newline starts its own row), so the long raw-JWT row is tracked
+# correctly too.
+_PANEL = {"lines": None, "rows": 0, "pending": False}
+
+def _panel_tty_ok() -> bool:
+    """In-place redraw needs a real terminal with ANSI cursor control
+    (the script already enables VT processing on Windows)."""
+    try:
+        return (sys.stdout.isatty()
+                and os.environ.get("TERM", "") not in ("", "dumb"))
+    except Exception:
+        return False
+
+def _panel_size():
+    """(columns, lines) of the terminal, with safe defaults."""
+    try:
+        sz = os.get_terminal_size()
+        return max(20, sz.columns), max(10, sz.lines)
+    except Exception:
+        return 80, 24
+
+def _panel_rows_of(lines, cols: int) -> int:
+    """The REAL number of terminal rows `lines` will occupy once
+    painted: per embedded-newline segment, ceil(cells / columns)."""
+    rows = 0
+    for _lvl, msg in lines:
+        for seg in _ANSI_RE.sub("", msg).split("\n"):
+            rows += max(1, -(-min(_cw(seg), 4096) // cols))
+    return rows
+
+def _panel_erase():
+    """Lift the painted panel off the screen. The cursor ends on the
+    panel's FIRST row (column 0), so whatever is printed next replaces
+    it; the row count is remembered by the caller when needed."""
+    rows = _PANEL["rows"]
+    _PANEL["rows"] = 0
+    if rows and _panel_tty_ok():
+        # up `rows` -> wipe each row and step down -> back to the top
+        print("\x1b[%dA" % rows
+              + "".join("\r\x1b[K\x1b[1B" for _ in range(rows))
+              + "\r\x1b[%dA" % rows, end="", flush=True)
+
+def _panel_lift():
+    """Erase the on-screen panel before a new log line scrolls in; the
+    CONTENT is remembered and repainted below that line by the paired
+    _panel_drop(). No-op unless the panel is currently painted."""
+    if _PANEL["rows"]:
+        _PANEL["pending"] = True
+        _panel_erase()
+
+def _panel_drop():
+    """Repaint the lifted panel below whatever was printed since the
+    lift (paired with _panel_lift in _emit / the prompt helpers)."""
+    if _PANEL["pending"]:
+        _PANEL["pending"] = False
+        _panel_render(_PANEL["lines"])
+
+def _panel_render(lines):
+    """(Re)paint the live UI panel. `lines` is a list of (level, msg)
+    tuples: level None = a RAW uncolored row (the token line), any
+    other level renders through _render with the theme colors. None
+    erases the panel and forgets its content. When in-place repaint is
+    impossible (no tty / dumb TERM / the panel does not fit the
+    window), every row is emitted the CLASSIC way instead - the log
+    then grows per refresh exactly as it did before v8.1."""
+    prev = _PANEL["rows"]
+    _panel_erase()
+    _PANEL["lines"] = lines
+    if lines is None:
+        _PANEL["pending"] = False
+        return
+    def _classic():
+        for level, msg in lines:
+            if level:
+                _emit(level, msg)
+            else:
+                print(msg)
+    if not _panel_tty_ok():
+        _classic()
+        return
+    cols, nl = _panel_size()
+    need = _panel_rows_of(lines, cols)
+    if need + 1 >= nl:
+        _classic()
+        return
+    for level, msg in lines:
+        if level:
+            _render(level, msg)
+        else:
+            print(msg)
+    _PANEL["rows"] = need
+    if prev > need:
+        # the new panel is SHORTER: remove the leftover blank rows so
+        # the next log line starts right below the panel again
+        print("\x1b[%dM" % (prev - need), end="", flush=True)
 
 # v6.0 (req. 3): the hotkey-hint ICON COLUMN. The hint lines look like
 # "  <icon> <key> - description" and the icons have DIFFERENT display
 # widths: plain emoji pictures are 2 cells, but symbol+VS16 sequences
-# (U+267B U+FE0F, U+23F9 U+FE0F, U+2934 U+FE0F, ...) are 1 cell on
-# terminals that predate the Unicode 9 emoji widths and 2 cells on
-# modern ones - so the gap between an icon and its hotkey letter
-# varied from line to line and from platform to platform. The fix:
-# every icon is padded to the SAME fixed width (ICON_COLS) counting the
-# STANDARD wcwidth-style cells (_cw above), so the key letter starts
-# in the same column on every line - on every terminal that follows
-# the Unicode widths (Windows Terminal, VTE, iTerm2, kitty, Termux all
-# do; verified online 2026-10-25).
+# (U+267B U+FE0F, U+2934 U+FE0F, ...) are 1 cell on terminals that
+# predate the Unicode 9 emoji widths and 2 cells on modern ones - so
+# the gap between an icon and its hotkey letter varied from line to
+# line and from platform to platform. The fix: every icon is padded to
+# the SAME fixed width (ICON_COLS) counting the STANDARD wcwidth-style
+# cells (_cw above), so the key letter starts in the same column on
+# every line - on every terminal that follows the Unicode widths
+# (Windows Terminal, VTE, iTerm2, kitty, Termux all do; verified
+# online 2026-10-25). v8.1 (req. 2) additionally keeps every hint icon
+# a GUARANTEED East Asian Wide PICTURE (the _EAW_WIDE audit above), so
+# the padding itself never has to compensate a 1-cell icon: the hint
+# now leads with U+26D4 (Ctrl+C) and U+1F527 (Ctrl+T) instead of the
+# VS16-dependent U+23F9 and the NEUTRAL U+1F39B.
 ICON_COLS = 2
 
 def _align_icon_line(line: str) -> str:
@@ -4497,17 +6296,23 @@ def _align_icon_line(line: str) -> str:
         return lead + icon + sep + rest
     return lead + icon + " " * (ICON_COLS - w) + sep + rest
 
-def print_hotkeys_hint():
+def print_hotkeys_hint(panel: list = None):
     """Print the hotkey hint with EVERY hotkey on its own line, each line
     as its own _emit call (so the theme background is painted per line -
     a multi-line single print would leave the background striped), the KEY
     on the dedicated hotkey block and the DESCRIPTION in the hotdesc color
     (see _render). v6.0 (req. 3): every line goes through
     _align_icon_line first, so the icon column has the SAME width on
-    every platform and the hotkey letters all start at one column."""
+    every platform and the hotkey letters all start at one column.
+    v8.1 (req. 3): with `panel` given the lines are collected into the
+    live-panel list instead of the scrolling log - the hint is part of
+    the per-refresh UI block that now redraws itself in place."""
     for line in tr("hotkeys_hint").split("\n"):
         if line.strip():
-            info(_align_icon_line(line))
+            if panel is None:
+                info(_align_icon_line(line))
+            else:
+                panel.append(("info", _align_icon_line(line)))
 
 def set_color(enabled: bool):
     global _USE_COLOR
@@ -4605,18 +6410,92 @@ def wait_next_totp_window(period: int):
 # firefox-sync-client / pagpeter/fastly-antibot. The challenge is
 # non-interactive: JS proof-of-work + clientmetrics.
 
-FASTLY_UA   = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+# v9.3 (the full-audit identity fix): the challenge flow rides the SAME
+# pinned Firefox UA as the FxA API requests (BROWSER_HEADERS) - ONE client
+# identity across the *.firefox.com hosts. The Go reference client pinned
+# its solver to the FxA UA on 2026-10-31 with the exact reason ('challenge
+# cookies may be tied to the client identity'); a real Firefox browser
+# sends this UA to accounts.firefox.com too, so the Chrome-macOS UA of the
+# older pagpeter/fastly-antibot-era port is retired.
+FASTLY_UA   = BROWSER_HEADERS["User-Agent"]
 FASTLY_PAGE = "https://accounts.firefox.com/"
 
 COOKIE_JAR = http.cookiejar.CookieJar()
-_OPENER     = urllib.request.build_opener(
-    urllib.request.HTTPCookieProcessor(COOKIE_JAR))
+# v6.6: --api-proxy / env MOZVPN_API_PROXY (the Go reference client's
+# -api-proxy flag). The CONTROL-plane requests (everything that goes
+# through this opener: FxA, Guardian, Remote Settings, the Fastly
+# challenge) leave DIRECT by default; with --api-proxy the opener is
+# REBUILT with a urllib ProxyHandler so the whole control plane keeps
+# ONE FIXED HTTP(S) exit - the Fastly WAF cookie and the Guardian
+# enrollment are BOUND TO THE EGRESS IP, so a rotating control plane
+# can invalidate them mid-session, while the proxied browsing traffic
+# keeps rotating through the Mozilla egresses freely. http:// and
+# https:// proxy URLs only: the stdlib ProxyHandler tunnels HTTPS via
+# CONNECT and this script adds NO new dependency - socks5:// is
+# refused with a clear error at startup. The DoH chain is NOT routed
+# through it (the DoH endpoints are anycast; DNS needs no fixed exit).
+_api_proxy_url = ""
+
+def _rebuild_opener():
+    """(Re)build the shared control-plane opener: a plain cookie-processor
+    opener, or a ProxyHandler opener when --api-proxy is active."""
+    global _OPENER
+    handlers = [urllib.request.HTTPCookieProcessor(COOKIE_JAR)]
+    if _api_proxy_url:
+        handlers.insert(0, urllib.request.ProxyHandler(
+            {"http": _api_proxy_url, "https": _api_proxy_url}))
+    _OPENER = urllib.request.build_opener(*handlers)
+
+def set_api_proxy(url: str):
+    """v6.6: route the control-plane requests through a fixed HTTP(S)
+    proxy ('' = off, the default). Mirrors the Go client's -api-proxy."""
+    global _api_proxy_url
+    _api_proxy_url = (url or "").strip()
+    _rebuild_opener()
+
+def api_proxy() -> str:
+    """v6.6: the current --api-proxy URL ('' = off)."""
+    return _api_proxy_url
+
+_OPENER = None          # materialized by _rebuild_opener() right below
+_rebuild_opener()
 _fastly_state = {"solved": False, "failed": False}
+# v6.6: THE BOUNDED FASTLY SOLVER (the Go reference client's fastly.go
+# limits). FASTLY_MAX_ROUNDS caps the post-back exchange: a server that
+# answers a solution submission with ANOTHER challenge list cannot
+# loop the solver forever (at most 3 rounds of solve + submit);
+# FASTLY_SOLVE_TIMEOUT caps the WHOLE challenge flow (60 s) so a
+# wedged post-back cannot hang the sign-in; _FASTLY_SOLVE_LOCK
+# serializes concurrent solves (the Go solve mutex: parallel PoW work
+# races the token/cookie pairing and wastes the challenge rounds).
+FASTLY_MAX_ROUNDS    = 3
+FASTLY_SOLVE_TIMEOUT = 60
+_FASTLY_SOLVE_LOCK = threading.Lock()
+
+# v6.7 (the Go fxa.go fxaDo loop): the maximum solve-and-retry cycles a
+# SINGLE request runs when the Fastly edge keeps answering 406 (the
+# maxChallengeAttempts = 5 constant of the reference client).
+FASTLY_MAX_406_ATTEMPTS = 5
 
 def _is_firefox_host(url: str) -> bool:
     h = urlparse(url).hostname or ""
     return h == "firefox.com" or h.endswith(".firefox.com")
+
+def _waf_challenge_body(raw) -> bool:
+    """v7.0: True when a *.firefox.com response body is a Fastly
+    client-challenge page. The Vauth/FoxyVPN PR #46 (2026-10-29)
+    reports the NGWAF challenge arriving NOT ONLY as the classic
+    empty-body 406 but also as 403/200/503 WITH the markup - and
+    the Go fastly.go fetchChallengePage detects the page by the
+    same two markers ('/_fs-ch-' + 'Client Challenge'), so BOTH
+    are required here (a lone marker could be a coincidental
+    string in real page content)."""
+    try:
+        return (raw is not None and len(raw) > 0
+                and raw.find(b"/_fs-ch-") >= 0
+                and raw.find(b"Client Challenge") >= 0)
+    except Exception:
+        return False
 
 def _add_cookie(name: str, value: str, domain: str = ".firefox.com"):
     COOKIE_JAR.set_cookie(http.cookiejar.Cookie(
@@ -4626,6 +6505,20 @@ def _add_cookie(name: str, value: str, domain: str = ".firefox.com"):
         path="/", path_specified=True,
         secure=False, expires=None, discard=False,
         comment=None, comment_url=None, rest={}, rfc2109=False))
+
+def _purge_fastly_cookies():
+    """v6.7: drop every _fs_ch_cp_* cookie from the shared jar. A 406 that
+    arrived DESPITE a sent cookie means the WAF rejected THAT cookie - the
+    retry must solve a FRESH challenge, not re-send the stale one (the Go
+    client re-solves on every 406: fxa.go fxaDo). The jar is mutated IN
+    PLACE, so the opener's cookie processor (which captured the jar object)
+    stays in sync."""
+    for c in list(COOKIE_JAR):
+        if c.name.startswith("_fs_ch_cp_"):
+            try:
+                COOKIE_JAR.clear(c.domain, c.path, c.name)
+            except KeyError:
+                pass
 
 def load_fastly_cache() -> bool:
     # v6.0: the cookie lives in config.json (fastly_cookie) - the
@@ -4706,11 +6599,18 @@ def _solve_pow(base: str, target_hex: str) -> str:
     return ""
 
 def _solve_clientmetrics_stub() -> dict:
-    # Minimal values - sufficient per live tests (pypi.org, accounts.firefox.com)
+    # Minimal values - sufficient per live tests (pypi.org,
+    # accounts.firefox.com). v9.3: the field set now matches the Go
+    # reference solver's answer (fastly.go clientMetricsAnswer, the
+    # 2026-08-22 sync) - detector_results {} and v 2 are carried too,
+    # and error_trace is JSON null (the old stub predates both fields
+    # and sent a '""' string).
     return {"ty": "clientmetrics",
             "webdriver": False,
             "bot_detection_result": {"bot_detected": False, "bot_kind": None},
-            "browser_metrics": {"client_data": "{}", "error_trace": '""'}}
+            "browser_metrics": {"client_data": "{}", "error_trace": None},
+            "detector_results": {},
+            "v": 2}
 
 def fastly_solve_challenge(target_url: str = FASTLY_PAGE):
     """The full Fastly challenge flow. Returns (cookie_name, cookie_value)."""
@@ -4743,28 +6643,70 @@ def fastly_solve_challenge(target_url: str = FASTLY_PAGE):
                           "Content-Type": "application/json"})
 
     # 4. init post-back -> challenge list + new token
-    init = _fastly_postback(domain, script_id, referer, token,
-                            [{"ty": "pat", "auth": ""}])
-    token = init.get("tok", token)
+    # v6.6: THE POST-BACK ROUNDS LOOP. The server may answer a solution
+    # submission with ANOTHER challenge list (a new 'tok' + 'ch')
+    # instead of the final success - the reference Go client bounds
+    # this exchange by maxPostBackRounds (fastly.go: 3) and by a
+    # whole-solve timeout (60 s), so a server that keeps issuing
+    # rounds cannot loop the solver forever and a wedged post-back
+    # cannot hang the sign-in.
+    _deadline = time.monotonic() + FASTLY_SOLVE_TIMEOUT
+    current = _fastly_postback(domain, script_id, referer, token,
+                               [{"ty": "pat", "auth": ""}])
+    _round_no = 0
+    while True:
+        _round_no += 1
+        if time.monotonic() > _deadline:
+            raise RuntimeError(
+                f"Fastly challenge solve timed out ({FASTLY_SOLVE_TIMEOUT}s)")
+        token = current.get("tok", token)
 
-    # 5. solve the challenges
-    solutions = []
-    for ch in init.get("ch", []):
-        ty = ch.get("ty")
-        if ty == "pow":
-            d = ch.get("data", {})
-            solutions.append({"ty": "pow", "base": d.get("base"),
-                              "answer": _solve_pow(d.get("base", ""), d.get("hash", "")),
-                              "hmac": d.get("hmac"), "expires": d.get("expires")})
-        elif ty == "clientmetrics":
-            solutions.append(_solve_clientmetrics_stub())
-        else:
-            warn(f"\u26A0\uFE0F  Unknown Fastly challenge type '{ty}' - skipping.")
+        # 5. solve the challenges of THIS round
+        solutions = []
+        for ch in current.get("ch", []):
+            ty = ch.get("ty")
+            if ty == "pow":
+                d = ch.get("data", {})
+                solutions.append({"ty": "pow", "base": d.get("base"),
+                                  "answer": _solve_pow(d.get("base", ""), d.get("hash", "")),
+                                  "hmac": d.get("hmac"), "expires": d.get("expires")})
+            elif ty == "clientmetrics":
+                solutions.append(_solve_clientmetrics_stub())
+            else:
+                warn(f"\u26A0\uFE0F  Unknown Fastly challenge type '{ty}' - skipping.")
 
-    # 6. submit the solutions -> Set-Cookie _fs_ch_cp_*
-    final = _fastly_postback(domain, script_id, referer, token, solutions)
-    if final.get("status") != "success":
-        raise RuntimeError(f"challenge not solved (status={final.get('status')!r})")
+        # 6. submit the solutions -> success (Set-Cookie _fs_ch_cp_*) or
+        # the NEXT challenge list (one more round, bounded by
+        # FASTLY_MAX_ROUNDS / FASTLY_SOLVE_TIMEOUT above)
+        current = _fastly_postback(domain, script_id, referer, token,
+                                   solutions)
+        if current.get("status") == "success":
+            # v7.0: THE ACCEPTANCE PROBE (the Go fastly.go flow, fetched
+            # 2026-10-30: 'Probe before installing the cookie: with
+            # rotating-exit proxies the cookie may be bound to an IP
+            # the API call will not reuse, and the probe catches that
+            # immediately' - errChallengeNotAccepted). The page is
+            # re-fetched THROUGH THE SAME JAR: a page that still
+            # carries the challenge markup means the earned cookie
+            # was NOT accepted (e.g. a rotated exit IP) and must NOT
+            # be latched/cached (up to v6.9 the cookie was cached
+            # blindly and the API call had to rediscover the
+            # rejection through the 406 re-solve loop). The two
+            # markers are the Go fetchChallengePage pair.
+            _, probe_body = _fastly_http("GET", target_url, headers={
+                "Accept": "text/html,application/xhtml+xml,"
+                          "application/xml;q=0.9,*/*;q=0.8"})
+            if (probe_body.find(b"/_fs-ch-") >= 0
+                    and probe_body.find(b"Client Challenge") >= 0):
+                raise RuntimeError(
+                    "challenge cookie not accepted on this exit IP "
+                    "(the Go errChallengeNotAccepted)")
+            break
+        if not current.get("ch") or _round_no >= FASTLY_MAX_ROUNDS:
+            raise RuntimeError(
+                f"challenge not solved (status={current.get('status')!r}, "
+                f"rounds={_round_no})")
+    final = current
 
     for c in COOKIE_JAR:
         if c.name.startswith("_fs_ch_cp_"):
@@ -4772,26 +6714,37 @@ def fastly_solve_challenge(target_url: str = FASTLY_PAGE):
     raise RuntimeError("_fs_ch_cp_* cookie not received after a successful solution")
 
 def ensure_fastly_cookie() -> bool:
-    """Fastly cookie: cache -> challenge solution. True = the cookie is in the jar."""
+    """Fastly cookie: cache -> challenge solution. True = the cookie is in the jar.
+    v6.6: the whole check-and-solve sequence runs under _FASTLY_SOLVE_LOCK
+    (the Go solve mutex): concurrent callers (the probe threads, a hotkey
+    racing the watch loop) JOIN the one running solve instead of racing it
+    with parallel challenge solutions - parallel solves waste the PoW work
+    and can end up with mismatched token/cookie pairs."""
     if _fastly_state["solved"]:
         return True
     if _fastly_state["failed"]:
         return False
-    if load_fastly_cache():
-        _fastly_state["solved"] = True
-        info("\u267B\uFE0F  Using cached Fastly cookie (_fs_ch_cp_*).")
-        return True
-    info("\U0001F6E1\uFE0F  Fastly Bot Management: solving the PoW challenge ...")
-    try:
-        name, value = fastly_solve_challenge()
-        save_fastly_cache(name, value)
-        _fastly_state["solved"] = True
-        ok(f"\u2705 Cookie {name} received (valid ~1 hour).")
-        return True
-    except Exception as e:
-        _fastly_state["failed"] = True
-        err(f"\u274C Failed to solve the Fastly challenge: {e}")
-        return False
+    with _FASTLY_SOLVE_LOCK:
+        # the state may have changed while this caller waited on the lock
+        if _fastly_state["solved"]:
+            return True
+        if _fastly_state["failed"]:
+            return False
+        if load_fastly_cache():
+            _fastly_state["solved"] = True
+            info("\u267B\uFE0F  Using cached Fastly cookie (_fs_ch_cp_*).")
+            return True
+        info("\U0001F6E1\uFE0F  Fastly Bot Management: solving the PoW challenge ...")
+        try:
+            name, value = fastly_solve_challenge()
+            save_fastly_cache(name, value)
+            _fastly_state["solved"] = True
+            ok(f"\u2705 Cookie {name} received (valid ~1 hour).")
+            return True
+        except Exception as e:
+            _fastly_state["failed"] = True
+            err(f"\u274C Failed to solve the Fastly challenge: {e}")
+            return False
 
 # ---------------- crypto: FxA password stretching v1 + v2 ----------------
 # Verified against mozilla/PyFxA (fxa/crypto.py) and mozilla/fxa
@@ -4861,14 +6814,34 @@ def bearer_session(session_token: str) -> dict:
     token_id, _ = derive_session_credentials(session_token)
     return {"Authorization": f"Bearer fxs_{token_id}"}
 
-def hawk_session(session_token: str, method: str, path: str,
-                 payload: bytes, host: str = "api.accounts.firefox.com",
-                 port: int = 443) -> dict:
-    """A full Hawk header (fallback in case the Bearer strategy is not accepted).
-    id=tokenID, key=reqHMACkey - the same derivatives as in the onepw/Hawk era.
-    The current server does not verify the MAC (hawk-fxa-token.js), but for
-    compatibility with an older deployment we sign properly: normalized string
-    + HMAC-SHA256 + body hash."""
+class _HawkHeaders(dict):
+    """v8.0 (C1): the Hawk Authorization header that RE-SIGNS ITSELF on
+    every retry (the foxyvpn rule: 'on Hawk-signed FxA requests, the
+    request signature is rebuilt fresh on every retry'). The dict IS the
+    normal header dict - every existing caller keeps working verbatim -
+    but it also carries its signing inputs, and rebuild() recomputes the
+    ts, the nonce and the MAC through the very same _hawk_header_value()
+    computation. The server may not verify the MAC today (the onepw
+    hawk-fxa-token.js era is over), but the code no longer RELIES on
+    that: a retry can never ride a signature that was minted for the
+    PREVIOUS attempt (an older ts, a reused nonce)."""
+    __slots__ = ("_sign_args",)
+
+    def __init__(self, header: dict, sign_args: tuple):
+        super().__init__(header)
+        self._sign_args = sign_args
+
+    def rebuild(self) -> "_HawkHeaders":
+        st, method, path, payload, host, port = self._sign_args
+        fresh = _hawk_header_value(st, method, path, payload, host, port)
+        out = _HawkHeaders({"Authorization": fresh}, self._sign_args)
+        return out
+
+def _hawk_header_value(session_token: str, method: str, path: str,
+                       payload: bytes, host: str, port: int) -> str:
+    """v8.0: the Hawk signature COMPUTATION extracted verbatim from
+    hawk_session() so _HawkHeaders.rebuild() can re-run it with a FRESH
+    ts + nonce on every retry."""
     token_id, req_hmac_key = derive_session_credentials(session_token)
     ts = str(int(time.time()))
     nonce = base64.b64encode(os.urandom(8)).decode()
@@ -4880,9 +6853,32 @@ def hawk_session(session_token: str, method: str, path: str,
     mac = base64.b64encode(
         hmac.new(req_hmac_key, normalized.encode(), hashlib.sha256).digest()
     ).decode()
-    return {"Authorization":
-            f'Hawk id="{token_id}", ts="{ts}", nonce="{nonce}", '
-            f'hash="{body_hash}", mac="{mac}"'}
+    return (f'Hawk id="{token_id}", ts="{ts}", nonce="{nonce}", '
+            f'hash="{body_hash}", mac="{mac}"')
+
+def hawk_session(session_token: str, method: str, path: str,
+                 payload: bytes, host: str = "api.accounts.firefox.com",
+                 port: int = 443) -> "_HawkHeaders":
+    """A full Hawk header (fallback in case the Bearer strategy is not accepted).
+    id=tokenID, key=reqHMACkey - the same derivatives as in the onepw/Hawk era.
+    The current server does not verify the MAC (hawk-fxa-token.js), but for
+    compatibility with an older deployment we sign properly: normalized string
+    + HMAC-SHA256 + body hash.
+    v8.0 (C1): the returned header is a _HawkHeaders - a plain dict that
+    carries its signing inputs, so every retry of req_full() re-signs it
+    with a fresh ts + nonce through _rebuild_hawk() (the foxyvpn rule)."""
+    sign_args = (session_token, method, path, payload, host, port)
+    return _HawkHeaders({"Authorization":
+                         _hawk_header_value(*sign_args)}, sign_args)
+
+def _rebuild_hawk(headers):
+    """v8.0 (C1): re-sign a Hawk header before a retry. A _HawkHeaders
+    comes back FRESH (new ts + nonce + MAC, the same signing inputs);
+    every plain dict (and None) passes through untouched - non-Hawk
+    callers see no change at all."""
+    if isinstance(headers, _HawkHeaders):
+        return headers.rebuild()
+    return headers
 
 # ---------------- http ----------------
 
@@ -4954,21 +6950,50 @@ _DOH_IP_BOOTSTRAP = (
     # (resolver IP, SNI/Host hostname, port, JSON DoH endpoint)
     ("1.1.1.1", "cloudflare-dns.com", 443,  "/dns-query"),
     ("8.8.8.8", "dns.google",         443,  "/resolve"),
-    ("9.9.9.9", "dns.quad9.net",      5053,  "/dns-query"),
+    # v8.8: Quad9 RETIRED the JSON service on port 5053 (5 May 2025 -
+    # 'migrate to DoH on port 443'); the 443 endpoint answers the
+    # RFC 8484 wireformat, so a JSON request gets an error status and
+    # the emergency walk skips quad9 FAST (the loop walks on to
+    # cloudflare/google; 2026-10-31 live check: 443 is up, the ?name=
+    # JSON form is gone).
+    ("9.9.9.9", "dns.quad9.net",      443,  "/dns-query"),
 )
 
 def _raw_https(ip: str, sni_host: str, port: int, method: str, path: str,
                headers: dict, body: "bytes | None" = None,
-               timeout: int = 10) -> "tuple[int, dict, bytes]":
+               timeout: int = 10,
+               frag: bool = False) -> "tuple[int, dict, bytes]":
     """v5.13: ONE raw HTTPS/1.1 request straight to `ip` - NO system DNS
     anywhere: the TCP connect goes to the IP literal, the TLS SNI and
     the Host header stay `sni_host`. Returns (status_code, header_dict,
-    body_bytes) or raises OSError/socket errors."""
+    body_bytes) or raises OSError/socket errors.
+    v8.6: frag=True (the DoH callers) sends the TLS handshake with the
+    FRAGMENTED ClientHello when tls_split() is on (the same
+    _FragTLSConn segmentation the egress TLS rides); the default
+    frag=False keeps the byte-for-byte v8.5 behavior of the API
+    direct-IP fallback callers. Any fragmented-handshake failure falls
+    back to a FRESH plain connection (the v6.1 lesson: a hardening
+    must never break the data path)."""
     s = socket.create_connection((ip, port), timeout=timeout)
     tls = None
     try:
         s.settimeout(timeout)
-        tls = _ssl_ctx().wrap_socket(s, server_hostname=sni_host)
+        if frag and tls_split():
+            try:
+                tls = _FragTLSConn(s, _ssl_ctx(), sni_host,
+                                   int(timeout) or 10)
+            except Exception:
+                # a fresh socket + the plain handshake (the socket may
+                # be half-consumed by the failed fragmented handshake)
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                s = socket.create_connection((ip, port), timeout=timeout)
+                s.settimeout(timeout)
+                tls = _ssl_ctx().wrap_socket(s, server_hostname=sni_host)
+        else:
+            tls = _ssl_ctx().wrap_socket(s, server_hostname=sni_host)
         # v5.35: the outgoing header set is DEDUPLICATED case-insensitively
         # before the wire (one header line per name, the FIRST occurrence
         # wins). The v5.13 caller could hand this function a dict holding
@@ -5030,9 +7055,9 @@ def _emergency_doh_resolve(host: str) -> "list[str] | None":
             q = (path + ("&" if "?" in path else "?")
                  + "name=" + quote(host, safe="") + "&type=A")
             code, _h, resp = _raw_https(ip, sni, rport, "GET", q,
-                                       {"Accept": "application/dns-json",
-                                        "User-Agent": "mozvpn/5.13"},
-                                       None, DOH_TIMEOUT)
+                                        {"Accept": "application/dns-json",
+                                         "User-Agent": "mozvpn/5.13"},
+                                        None, DOH_TIMEOUT, frag=True)
             if code != 200 or not resp:
                 continue
             data = json.loads(resp.decode("utf-8", "replace"))
@@ -5188,7 +7213,7 @@ def _ip_fallback_full(method: str, url: str, data, headers,
             return code, out_hdrs, {}
 
 def req_full(method: str, url: str, data=None, headers=None, timeout=30,
-             _fastly_retry=False, _net_retry=False):
+             _fastly_attempts=0, _net_retry=False):
     """v5.36: the ROUTED request transport - req() PLUS the response
     headers. Returns (status, headers_dict_lower, json_dict). This is
     the single place where the request algorithm lives, so EVERY caller
@@ -5216,7 +7241,8 @@ def req_full(method: str, url: str, data=None, headers=None, timeout=30,
     # getaddrinfo attempt entirely, go straight to the emergency route.
     if _resolver_broken():
         try:
-            out = _ip_fallback_full(method, url, data, headers, timeout)
+            out = _ip_fallback_full(method, url, data,
+                                    _rebuild_hawk(headers), timeout)
             if out is not None:
                 return out
         except Exception:
@@ -5227,6 +7253,28 @@ def req_full(method: str, url: str, data=None, headers=None, timeout=30,
             _note_server_date(resp.headers)     # time sync for TOTP
             raw = resp.read()
             hdrs = {k.lower(): v for k, v in resp.headers.items()}
+            # v7.0: the client-challenge page can arrive with HTTP 200
+            # as well (the Vauth/FoxyVPN PR #46 report: the challenge
+            # markup shows up at 406/403/200/503) - the same bounded
+            # solve-and-retry as the 406 branch below, including the
+            # stale-cookie purge on the SECOND sighting.
+            if (_waf_challenge_body(raw)
+                    and _fastly_attempts < FASTLY_MAX_406_ATTEMPTS
+                    and _is_firefox_host(url)):
+                if _fastly_attempts >= 1:
+                    _fastly_state["solved"] = False
+                    _fastly_state["failed"] = False
+                    _purge_fastly_cookies()
+                    try:
+                        cfg_set(("fastly_cookie",), None)
+                    except Exception:
+                        pass
+                    warn(tr("fastly_406_stale"))
+                if ensure_fastly_cookie():
+                    return req_full(method, url, data,
+                                    _rebuild_hawk(headers), timeout,
+                                    _fastly_attempts=_fastly_attempts + 1,
+                                    _net_retry=_net_retry)
             if _RESOLVER_STRIKES["n"]:
                 # a request SUCCEEDED -> the system resolver works again
                 # (the earlier failures were a transient blip, not the
@@ -5236,13 +7284,36 @@ def req_full(method: str, url: str, data=None, headers=None, timeout=30,
     except urllib.error.HTTPError as e:
         _note_server_date(e.headers)            # also from error responses
         raw = e.read()
-        # Fastly NGWAF blocks non-browser clients with 406 and an empty body
-        # until a valid _fs_ch_cp_* cookie exists. Solve the challenge,
-        # retry ONCE - the exact reference behavior.
-        if (e.code == 406 and not raw and not _fastly_retry
-                and _is_firefox_host(url) and ensure_fastly_cookie()):
-            return req_full(method, url, data, headers, timeout,
-                            _fastly_retry=True, _net_retry=_net_retry)
+        # Fastly NGWAF blocks non-browser clients with 406 and an empty
+        # body until a valid _fs_ch_cp_* cookie exists. Solve the challenge
+        # and retry; v6.7 adopts the Go fxaDo loop (maxChallengeAttempts =
+        # 5): when a 406 arrives DESPITE a cookie that was already sent,
+        # the WAF rejected THAT cookie - drop the solved latch, purge the
+        # stale cookie (jar + config cache) and solve a FRESH one, up to
+        # FASTLY_MAX_406_ATTEMPTS solve-and-retry cycles per call.
+        # v7.0: BODY-AWARE - the client challenge ALSO arrives as a
+        # challenge PAGE with 403/200/503 (the Vauth/FoxyVPN PR #46
+        # report, 2026-10-29), not only as the classic empty-body
+        # 406, so a body carrying the challenge markup takes the
+        # same bounded solve-and-retry (_waf_challenge_body carries
+        # the Go fetchChallengePage marker pair).
+        if (((e.code == 406 and not raw) or _waf_challenge_body(raw))
+                and _fastly_attempts < FASTLY_MAX_406_ATTEMPTS
+                and _is_firefox_host(url)):
+            if _fastly_attempts >= 1:
+                _fastly_state["solved"] = False
+                _fastly_state["failed"] = False
+                _purge_fastly_cookies()
+                try:
+                    cfg_set(("fastly_cookie",), None)
+                except Exception:
+                    pass
+                warn(tr("fastly_406_stale"))
+            if ensure_fastly_cookie():
+                return req_full(method, url, data,
+                                _rebuild_hawk(headers), timeout,
+                                _fastly_attempts=_fastly_attempts + 1,
+                                _net_retry=_net_retry)
         hdrs = {k.lower(): v for k, v in (e.headers or {}).items()}
         try:    return e.code, hdrs, (json.loads(raw) if raw else {})
         except Exception: return e.code, hdrs, {}
@@ -5262,7 +7333,8 @@ def req_full(method: str, url: str, data=None, headers=None, timeout=30,
                 # straight to the well-known resolver IPs + ONE raw
                 # HTTPS request to the resolved IP (Host + SNI kept).
                 try:
-                    out = _ip_fallback_full(method, url, data, headers,
+                    out = _ip_fallback_full(method, url, data,
+                                            _rebuild_hawk(headers),
                                             timeout)
                     if out is not None:
                         return out
@@ -5270,18 +7342,20 @@ def req_full(method: str, url: str, data=None, headers=None, timeout=30,
                     pass
             elif not _net_retry:
                 time.sleep(1.5)
-                return req_full(method, url, data, headers, timeout,
-                                _fastly_retry=_fastly_retry, _net_retry=True)
+                return req_full(method, url, data,
+                                _rebuild_hawk(headers), timeout,
+                                _fastly_attempts=_fastly_attempts,
+                                _net_retry=True)
         raise
 
 def req(method: str, url: str, data=None, headers=None, timeout=30,
-        _fastly_retry=False, _net_retry=False):
+        _fastly_attempts=0, _net_retry=False):
     """v5.36: req_full() without the headers - the same (status, json)
     shape every existing caller was written against; the request
     algorithm (reference parity + the broken-resolver emergency route)
     lives in req_full() only, so no caller can bypass it anymore."""
     status, _hdrs, d = req_full(method, url, data, headers, timeout,
-                                _fastly_retry=_fastly_retry,
+                                _fastly_attempts=_fastly_attempts,
                                 _net_retry=_net_retry)
     return status, d
 
@@ -5748,10 +7822,14 @@ def _reset_fastly_session():
     latch) so the NEXT profile starts with a CLEAN session - the cookie
     of profile A must never be reused for profile B. The same sequence
     wipe_all_saved_data uses (v5.23)."""
-    global COOKIE_JAR, _OPENER
+    global COOKIE_JAR
     COOKIE_JAR = http.cookiejar.CookieJar()
-    _OPENER = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(COOKIE_JAR))
+    # v6.7 (audit fix of the v6.6 --api-proxy integration): rebuild the
+    # opener through _rebuild_opener() - it reads the FRESH jar just
+    # assigned above AND re-applies the ProxyHandler when --api-proxy is
+    # active. The old bare HTTPCookieProcessor build silently DROPPED the
+    # fixed control-plane exit on every profile switch.
+    _rebuild_opener()
     _fastly_state["solved"] = False
     _fastly_state["failed"] = False
 
@@ -5763,8 +7841,13 @@ def apply_profile_runtime(args):
     exactly the startup one: an EXPLICIT --lang / --doh / --doh-url
     argument of this run still wins; otherwise the SAVED choice of the
     newly selected profile applies, else the MOZVPN_LANG / MOZVPN_DOH
-    environment variable, else the built-in default. The Fastly WAF
-    cookie is PROFILE-EXCLUSIVE data too: the in-memory cookie jar, the
+    environment variable, else the built-in default. v6.9: the STICKY
+    preferences (theme, color, the DoH answer cache, the ClientHello
+    fragmentation) follow the SAME precedence, and the log is redrawn
+    when the theme or the color mode changed; the saved ENGINE of
+    the profile applies at the next start (a live engine switch is
+    hotkey 'e' territory). The Fastly WAF cookie is PROFILE-EXCLUSIVE
+    data too: the in-memory cookie jar, the
     opener and the challenge latch are reset first
     (_reset_fastly_session, the same v5.23 sequence
     wipe_all_saved_data uses), then the cookie of the NEW profile is
@@ -5785,11 +7868,40 @@ def apply_profile_runtime(args):
     if not getattr(args, "doh_url", None) and not getattr(args, "doh", None):
         saved = load_doh_provider_cache()
         if saved is not None:
-            set_doh_provider(saved)      # '' = the saved system-DNS mode
+            set_doh_provider(saved)      # '' = the explicit 'off' choice (v6.8)
         else:
             set_doh_provider(
                 (os.environ.get("MOZVPN_DOH", "cloudflare").strip().lower()
                  or "cloudflare"))
+    # 2b) v6.9: the STICKY display/transport preferences of the
+    #     profile (settings.theme / settings.color /
+    #     settings.doh_cache / settings.tls_split). An EXPLICIT
+    #     --theme / --no-color / --doh-cache / --tls-split argument
+    #     of this run still wins (the _explicit markers were
+    #     recorded at startup, BEFORE the argparse values were
+    #     resolved in place); otherwise the SAVED choice of the
+    #     newly selected profile applies, else the env, else the
+    #     built-in default - the same precedence as the startup
+    #     block. The ENGINE choice is profile-bound too
+    #     (settings.engine), but a LIVE engine switch stops and
+    #     recreates every listener - that is hotkey 'e' territory
+    #     - so the saved engine of the profile takes effect at
+    #     the next start.
+    _theme_before, _color_before = _THEME, _USE_COLOR
+    if not getattr(args, "_theme_explicit", False):
+        saved = load_str_setting("theme")
+        if saved in ("dark", "light"):
+            set_theme(saved)
+    if not getattr(args, "_no_color_explicit", False):
+        saved = load_bool_setting("color", None)
+        if saved is not None:
+            set_color(saved)
+    if not getattr(args, "_doh_cache_explicit", False):
+        set_doh_cache(load_bool_setting(
+            "doh_cache", _env_flag("MOZVPN_DOH_CACHE", False)))
+    if not getattr(args, "_tls_split_explicit", False):
+        set_tls_split(load_bool_setting(
+            "tls_split", _env_flag("MOZVPN_TLS_SPLIT", True)))
     # 3) the Fastly WAF cookie of the profile: reset the in-memory
     #    session first, then load the cookie of the NEW profile
     _reset_fastly_session()
@@ -5799,6 +7911,18 @@ def apply_profile_runtime(args):
     if doh_provider() != "custom":
         save_doh_provider_cache(doh_provider())
     save_lang_cache(_LANG)
+    save_bool_setting("color", _USE_COLOR)
+    save_str_setting("theme", _THEME)
+    save_bool_setting("doh_cache", doh_cache_enabled())
+    save_bool_setting("tls_split", tls_split())
+    if _THEME != _theme_before or _USE_COLOR != _color_before:
+        global _BG_CURRENT
+        if _USE_COLOR:
+            _force_terminal_bg(_THEME)
+        elif _BG_CURRENT is not None:
+            _restore_terminal_bg()
+            _BG_CURRENT = None
+        redraw_log()
     info(tr("profile_applied", email=cfg_current_email() or "-"))
 
 # ---------------------------------------------------------------------------
@@ -5905,8 +8029,13 @@ def migrate_old_config_if_first_run() -> bool:
     # 6) doh.json - the resolver choice (v6.4: into the PROFILE)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "doh.json"))
     if isinstance(data, dict):
+        # v6.8: a legacy '' was only ever written by an EXPLICIT
+        # old-version system-DNS choice (a missing doh.json produced
+        # no entry at all), so it migrates to the EXPLICIT 'off'
+        # marker - NOT to the 'never chosen' state into which the
+        # bug-written '' of v6.0-v6.7 must heal.
         _profile_node().setdefault("settings", {})["doh"] = (
-            data.get("provider") or "").strip().lower()
+            (data.get("provider") or "").strip().lower() or "off")
         moved.append("doh.json")
     # 7) lang.json - the language choice (v6.4: into the PROFILE)
     data = _legacy_read_json(os.path.join(LEGACY_CONF_DIR, "lang.json"))
@@ -6614,6 +8743,27 @@ def jwt_exp(token: str) -> int:
     except Exception:
         return 0
 
+def anchored_exp(token: str, receipt: float = None) -> int:
+    """v6.6: the pass expiry ANCHORED TO OUR CLOCK at receipt (Firefox
+    GuardianTypes.ProxyPass: 'Anchor the pass to our clock at receipt: it
+    is valid from now for the token's lifetime. This makes rotation
+    scheduling immune to any drift between Guardian's clock (nbf/exp)
+    and ours'). Returns receipt + (exp - nbf) - the JWT lifetime
+    measured on OUR clock - so a skewed local clock can no longer
+    'extend' a pass into real expiry or see a fresh pass as expired.
+    A JWT with no nbf (or unparsable) falls back to the raw exp: the
+    pre-v6.6 behavior, preserved exactly."""
+    p = jwt_payload(token)
+    try:
+        nbf = int(p.get("nbf") or 0)
+        exp = int(p.get("exp") or 0)
+    except (TypeError, ValueError):
+        return jwt_exp(token)
+    if nbf and exp and exp > nbf:
+        base = receipt if receipt is not None else time.time()
+        return int(base) + (exp - nbf)
+    return jwt_exp(token)
+
 def _jwt_part(token: str, idx: int) -> dict:
     try:
         part = token.split(".")[idx]
@@ -6622,23 +8772,31 @@ def _jwt_part(token: str, idx: int) -> dict:
     except Exception:
         return {}
 
-def print_jwt_decoded(token: str):
+def print_jwt_decoded(token: str, panel: list = None):
     """Pretty-print the DECODED proxyPass JWT right under the raw token:
     header and payload as formatted JSON, plus exp/iat in human-readable
-    UTC. Printed after every token issue/refresh (req: decoded JWT output)."""
+    UTC. Printed after every token issue/refresh (req: decoded JWT
+    output). v8.1 (req. 3): with `panel` given the rows go to the
+    live-panel line list instead of the scrolling log (the decoded JWT
+    changes every refresh - it belongs to the redrawn block)."""
     header = _jwt_part(token, 0)
     payload = _jwt_part(token, 1)
     if not payload:
         return
-    info(tr("jwt_decoded_header"))
-    hint(tr("jwt_decoded_part", part="header: ",
-            json=json.dumps(header, indent=2, ensure_ascii=False)))
-    hint(tr("jwt_decoded_part", part="payload:",
-            json=json.dumps(payload, indent=2, ensure_ascii=False)))
+    def _row(level, msg):
+        if panel is None:
+            _emit(level, msg)
+        else:
+            panel.append((level, msg))
+    _row("info", tr("jwt_decoded_header"))
+    _row("hint", tr("jwt_decoded_part", part="header: ",
+                    json=json.dumps(header, indent=2, ensure_ascii=False)))
+    _row("hint", tr("jwt_decoded_part", part="payload:",
+                    json=json.dumps(payload, indent=2, ensure_ascii=False)))
     exp = int(payload.get("exp") or 0)
     iat = int(payload.get("iat") or 0)
     if exp:
-        hint(tr("jwt_decoded_exp",
+        _row("hint", tr("jwt_decoded_exp",
                 time=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(exp)),
                 iat=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(iat))))
 
@@ -6681,22 +8839,122 @@ def prompt_line(prompt: str) -> str:
     """v5.24 (Termux fix): an input() that fails with a CLEAR localized
     error instead of the generic 'Unexpected error' retry loop when
     stdin cannot deliver a line (EOFError/OSError - Termux wrappers,
-    packaged-binary runs with a redirected stdin)."""
+    packaged-binary runs with a redirected stdin).
+    v8.1 (req. 3): the prompt first lifts the live UI panel and drops
+    it back below the typed line, so the input row never overlaps the
+    panel and the panel math stays intact."""
+    _panel_lift()
     try:
         return input(prompt)
     except (EOFError, OSError) as e:
         raise MozVpnError(tr("prompt_read_error",
                              err=str(e) or repr(e)))
+    finally:
+        _panel_drop()
 
 def prompt_secret(prompt: str) -> str:
     """v5.24 (Termux fix): getpass with the same clear-error wrapper.
     getpass reads /dev/tty FIRST and stdin second; on Android/Termux
-    wrappers both may fail -> a localized error, not a raw crash."""
+    wrappers both may fail -> a localized error, not a raw crash.
+    v8.1 (req. 3): panel lift/drop, same as prompt_line."""
+    _panel_lift()
     try:
         return getpass.getpass(prompt)
     except (EOFError, OSError) as e:
         raise MozVpnError(tr("prompt_read_error",
                              err=str(e) or repr(e)))
+    finally:
+        _panel_drop()
+
+def read_fxa_profile_session_token(path: str) -> "str | None":
+    """v8.0 (A3): read the FxA sessionToken out of a DESKTOP FIREFOX
+    PROFILE (--fxa-profile PATH): PATH may be the signedInUser.json
+    file itself OR the profile DIRECTORY (FXA_PROFILE_FILE is appended
+    then). The token sits at accountData.sessionToken (64 hex chars) -
+    the foxhole-vpn AUTH.md pattern, verified 2026-10-30 against the
+    Firefox source docs. Returns the token (lowercase), or None with a
+    localized message on every failure (the caller keeps its normal
+    chain, so a bad path can never brick a run)."""
+    p = (path or "").strip()
+    if not p:
+        return None
+    if os.path.isdir(p):
+        p = os.path.join(p, FXA_PROFILE_FILE)
+    if not os.path.isfile(p):
+        warn(tr("fxa_profile_missing", path=path, err="not found"))
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as e:
+        warn(tr("fxa_profile_missing", path=path, err=e))
+        return None
+    tok = ""
+    try:
+        acc = data.get("accountData")
+        tok = str((acc or {}).get("sessionToken") or "").strip()
+    except Exception:
+        tok = ""
+    if not tok:
+        warn(tr("fxa_profile_no_token", path=p))
+        return None
+    if len(tok) != 64 or any(c not in "0123456789abcdef" for c in tok.lower()):
+        warn(tr("fxa_profile_bad_token", path=p))
+        return None
+    info(tr("fxa_profile_read", path=p))
+    return tok.lower()
+
+def fxa_unblock_prompt(email_norm: str) -> "str | None":
+    """v8.0 (B4): ONE round of the FxA UNBLOCK-CODE prompt (the errno 125
+    flow): the server has ALREADY emailed the 6-digit code to the
+    address; an EMPTY input re-sends the letter via
+    POST /v1/account/login/send_unblock_code {'email': ...} and returns
+    the 'resend' sentinel (the fxa-js-client signIn pattern, verified
+    online 2026-10-30); 'q' cancels ('cancel'); a numeric entry returns
+    the code. The bounded retry/resend counters live in the CALLER, so
+    every loop of the login flow stays visible in ONE place."""
+    raw = prompt_line(tr("unblock_prompt", email=email_norm)).strip()
+    if raw.lower() in ("q", "quit"):
+        return "cancel"
+    if not raw:
+        s, _dd = req("POST", FXA_AUTH + "/account/login/send_unblock_code",
+                     {"email": email_norm})
+        if s == 200:
+            info(tr("unblock_resent", email=email_norm))
+        else:
+            warn(tr("email_resend_failed", status=s))
+        return "resend"
+    code = re.sub(r"[\s\-]+", "", raw)   # "226 829" -> "226829"
+    if not code.isdigit():
+        warn(tr("unblock_wrong"))
+        return "cancel"
+    return code
+
+def fxa_wait_email_link(session_token: str, timeout: int = 300) -> bool:
+    """v8.0 (B5): wait for the user to open the CONFIRMATION LINK from
+    the Mozilla email in a browser: poll GET /v1/recovery_email/status
+    (the onepw protocol's own endpoint: 'the client can use
+    /recovery_email/status (requires sessionToken, not verification)
+    until the user clicks the email link and the API reports
+    verification is complete' - verified against the mozilla/
+    fxa-auth-server wiki, fetched 2026-10-30) every 10 s, bounded at
+    300 s. The same Bearer-with-Hawk-fallback auth as every other
+    session route. Accepts BOTH response shapes (verified /
+    emailVerified)."""
+    url = FXA_AUTH + "/recovery_email/status"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(10)
+        s, dd = req("GET", url, None, bearer_session(session_token))
+        if s == 401 and isinstance(dd, dict) and dd.get("errno") == 110:
+            # Bearer not accepted (deployment lag/rollback) -> Hawk fallback
+            s, dd = req("GET", url, None,
+                        hawk_session(session_token, "GET",
+                                     "/v1/recovery_email/status", b""))
+        if s == 200 and isinstance(dd, dict) and (
+                dd.get("verified") or dd.get("emailVerified")):
+            return True
+    return False
 
 def fxa_login(email: str, password: str, totp_provider=None,
               interactive: bool = True, tp=None) -> str:
@@ -6721,11 +8979,27 @@ def fxa_login(email: str, password: str, totp_provider=None,
     else:
         auth_pw = compute_authpw_v1(email_norm, password)
 
-    status, d = req("POST", FXA_AUTH + "/account/login",
-                    {"email": email_norm, "authPW": auth_pw})
-    if status == 406:
-        raise MozVpnError(tr("waf_406"))
-    if status != 200:
+    # v8.0 (B4): the login call is a BOUNDED LOOP now. errno 125 means
+    # the server has ALREADY emailed a 6-digit unblock code to the
+    # address (the fxa-js-client signIn pattern, verified online
+    # 2026-10-30): the login is retried with the code riding the
+    # payload as 'unblockCode', and an EMPTY prompt input re-sends the
+    # letter via POST /v1/account/login/send_unblock_code {'email'}.
+    # errno 127 (incorrectUnblockCode) re-enters the SAME flow with a
+    # warning. Interactive runs get the in-app prompt (the Zeus-VPN
+    # 'unblock codes all handled in the app' feature); non-interactive
+    # runs (no promptable stdin) keep the v6.6 blocked error VERBATIM.
+    # Bounds: 3 code submissions, 3 re-sends - then the localized
+    # gave-up error.
+    login_payload = {"email": email_norm, "authPW": auth_pw}
+    unblock_tries = 0
+    resends = 0
+    while True:
+        status, d = req("POST", FXA_AUTH + "/account/login", login_payload)
+        if status == 406:
+            raise MozVpnError(tr("waf_406"))
+        if status == 200:
+            break
         errno = d.get("errno"); msg = d.get("message", d)
         if errno == 102: raise MozVpnError(tr("account_not_found"))
         if errno == 103: raise MozVpnError(tr("wrong_password"))
@@ -6734,9 +9008,31 @@ def fxa_login(email: str, password: str, totp_provider=None,
         # Both are TEMPORARY blocks (customs/rate-limit); recovery is email
         # sign-in confirmation (see blocked_login_message).
         if status == 429 or errno == 114:
+            # v6.6: the FXA LOGIN rate limit gets its OWN error code so
+            # the watch loop applies the LOGIN cooldown (15 min, the
+            # cached session token preferred on the retry - see the
+            # 'blocked_login' handler there) instead of the generic
+            # blocked wait; the Guardian-side blocks keep 'blocked'.
             raise MozVpnError(blocked_login_message(_retry_after_seconds(d), "login"),
-                              code="blocked")
-        if errno == 125:
+                              code="blocked_login")
+        if errno in (125, 127):
+            if errno == 127:
+                warn(tr("unblock_wrong"))
+            if interactive or _can_prompt():
+                if unblock_tries >= 3 or resends >= 3:
+                    raise MozVpnError(tr("unblock_gave_up"), code="blocked")
+                got = fxa_unblock_prompt(email_norm)
+                if got == "cancel":
+                    vm = d.get("verificationMethod") or ""
+                    extra = tr("blocked_extra_method", method=vm) if vm else ""
+                    raise MozVpnError(blocked_login_message(None, "login") + extra,
+                                      code="blocked")
+                if got == "resend":
+                    resends += 1
+                    continue
+                login_payload["unblockCode"] = got
+                unblock_tries += 1
+                continue
             vm = d.get("verificationMethod") or ""
             extra = tr("blocked_extra_method", method=vm) if vm else ""
             raise MozVpnError(blocked_login_message(None, "login") + extra,
@@ -6815,8 +9111,11 @@ def fxa_login(email: str, password: str, totp_provider=None,
                     break
                 if s2 == 429 or d2.get("errno") in (114, 125):
                     # Too many wrong codes in a row - a temporary block.
+                    # v6.6: same OWN code as the login 429 - the watch
+                    # loop applies the LOGIN cooldown to it as well.
                     raise MozVpnError(
-                        blocked_login_message(_retry_after_seconds(d2), "2FA"))
+                        blocked_login_message(_retry_after_seconds(d2), "2FA"),
+                        code="blocked_login")
                 if s2 == 200:
                     # The server rejected the CODE VALUE. Never resend the same
                     # code in the same 30s window - wait for the next one and
@@ -6840,10 +9139,116 @@ def fxa_login(email: str, password: str, totp_provider=None,
         elif email_verified is False or vr == "signup":
             raise MozVpnError(tr("email_unverified"), code="relogin")
         elif vm.startswith("email") or not vm:
-            # The reference behavior: email confirmation cannot be done by
-            # the script itself -> the localized instructions (confirm the
-            # letter, or --session-token from a browser session).
-            raise MozVpnError(tr("email_confirm_required"), code="relogin")
+            # v7.0: THE EMAILED-CODE SESSION VERIFICATION (the dead end
+            # is gone for accounts the script can prompt for). The
+            # reference Go client (fxa.go, 'Sync upstream token pool,
+            # email-2fa login, and Fastly challenge solver',
+            # 2026-08-22) prompts for the 6-digit code FxA emails at
+            # login time and POSTs it to /v1/session/verify_code
+            # (fxaVerifySession). Verified against the FxA sources
+            # (lib/routes/session.js, fetched 2026-10-30):
+            #   * /session/verify_code rides the SAME sessionTokenBearer
+            #     auth with a sessionToken Hawk fallback as the TOTP
+            #     route above, payload {'code': DIGITS};
+            #   * a VALID code verifies the session via 'email-2fa'
+            #     (AAL1) - but a TOTP account is REFUSED with
+            #     insufficientAal (the AAL1 guard the v5.25 comment
+            #     above documented), so this path is entered ONLY when
+            #     the script holds NO TOTP provider for the account;
+            #   * /session/resend_code re-sends the letter on demand
+            #     (a no-op {} for TOTP accounts, same handler file).
+            # An EMPTY input re-sends the letter; non-interactive runs
+            # (no promptable stdin) keep the v6.9 reference dead end -
+            # the localized instructions - VERBATIM.
+            if totp_provider is not None or not (interactive or _can_prompt()):
+                raise MozVpnError(tr("email_confirm_required"), code="relogin")
+            verify_url = FXA_AUTH + "/session/verify_code"
+            resend_url = FXA_AUTH + "/session/resend_code"
+            session_ok = False
+            wrong = 0
+            while True:
+                raw = prompt_line(tr("email_code_prompt")).strip()
+                if not raw:
+                    # EMPTY input = 're-send the letter'
+                    s3, d3 = req("POST", resend_url, {},
+                                 bearer_session(d["sessionToken"]))
+                    if s3 == 401 and d3.get("errno") == 110:
+                        s3, d3 = req("POST", resend_url, {},
+                                     hawk_session(d["sessionToken"], "POST",
+                                                  "/v1/session/resend_code",
+                                                  b"{}"))
+                    if s3 == 200:
+                        info(tr("email_code_resent"))
+                    else:
+                        warn(tr("email_resend_failed", status=s3))
+                    continue
+                # v8.0 (B5): the CONFIRMATION-LINK branch (the foxyvpn
+                # 'email 2FA code verification, falling back to a
+                # confirmation-link prompt' / 4q4r 'or the confirmation
+                # link, when FxA chooses that method' pattern): 'l'
+                # (or 'link') means the user will confirm via the LINK
+                # in the Mozilla email - the session is then POLLED via
+                # GET /v1/recovery_email/status (the onepw protocol's
+                # own endpoint: requires sessionToken, NOT verification;
+                # verified against the mozilla/fxa-auth-server wiki,
+                # fetched 2026-10-30) every 10 s, bounded at 300 s; a
+                # timeout simply returns to the code prompt and the
+                # code path below stays exactly as it was.
+                if raw.lower() in ("l", "link"):
+                    if fxa_wait_email_link(d["sessionToken"]):
+                        session_ok = True
+                        info(tr("email_link_verified"))
+                        break
+                    warn(tr("email_link_timeout"))
+                    continue
+                code = re.sub(r"[\s\-]+", "", raw)   # "226 829" -> "226829"
+                if not code.isdigit():
+                    wrong += 1
+                    if wrong >= 3:
+                        raise MozVpnError(tr("email_code_rejected_final"),
+                                         code="relogin")
+                    warn(tr("totp_digits_only"))
+                    continue
+                vbody = json.dumps({"code": code}).encode()
+                s4, d4 = req("POST", verify_url, {"code": code},
+                             bearer_session(d["sessionToken"]))
+                if s4 == 401 and d4.get("errno") == 110:
+                    # Bearer not accepted (deployment lag/rollback) -> full Hawk fallback
+                    s4, d4 = req("POST", verify_url, {"code": code},
+                                 hawk_session(d["sessionToken"], "POST",
+                                              "/v1/session/verify_code",
+                                              vbody))
+                if s4 == 200:
+                    session_ok = True
+                    info(tr("email_code_confirmed"))
+                    break
+                if s4 == 400:
+                    # invalidOrExpiredOtpCode (session.js): a wrong or
+                    # expired code - the letter may have been re-sent.
+                    wrong += 1
+                    if wrong >= 3:
+                        raise MozVpnError(tr("email_code_rejected_final"),
+                                         code="relogin")
+                    warn(tr("email_code_rejected"))
+                    continue
+                if s4 == 401:
+                    # insufficientAal: the account HAS a server-side
+                    # TOTP (the AAL1 guard) - an email code can never
+                    # verify this session. The reference dead end.
+                    info(tr("email_code_aal_hint"))
+                    raise MozVpnError(tr("email_confirm_required"),
+                                     code="relogin")
+                if s4 == 429 or d4.get("errno") in (114, 125):
+                    # Too many wrong codes in a row - the same OWN code
+                    # as the TOTP 429 above (the watch loop cooldown).
+                    raise MozVpnError(
+                        blocked_login_message(_retry_after_seconds(d4),
+                                              "email code"),
+                        code="blocked_login")
+                raise MozVpnError(tr("email_code_unknown_error",
+                                     status=s4, data=d4), code="relogin")
+            if not session_ok:
+                raise MozVpnError(tr("email_confirm_required"), code="relogin")
         else:
             raise MozVpnError(tr("session_unverified", method=vm or "unknown",
                                  reason=vr), code="relogin")
@@ -6950,6 +9355,25 @@ def guardian_pass(oauth: str):
     # the answer, as the raw code did.
     status, hdrs, d = req_full("GET", GUARDIAN + "/api/v1/fpn/token",
                               headers=auth, timeout=30)
+    if status == 403:
+        # v6.6: a 403 (no_entitlement) - Firefox re-establishes the
+        # enrollment and asks again before giving up: ONE automatic
+        # POST /api/v1/fpn/activate (the v5.3 reference-parity
+        # re-activation path, reused verbatim) followed by ONE retry
+        # of the token fetch. A stale/absent fpn enrollment (the
+        # OAuth token was minted but the activation did not stick) is
+        # exactly the transient case this heals; a 403 AFTER the
+        # retry raises below exactly as before, and every other
+        # status is untouched.
+        s1b, d1b = req("POST", GUARDIAN + "/api/v1/fpn/activate",
+                       headers=auth)
+        if s1b in (200, 201, 204):
+            ok(tr("guardian_reactivated", status=s1b))
+        else:
+            warn(tr("guardian_reactivate_failed", status=s1b,
+                    detail=str(d1b)[:120]))
+        status, hdrs, d = req_full("GET", GUARDIAN + "/api/v1/fpn/token",
+                                  headers=auth, timeout=30)
 
     if status != 200:
         detail = ""
@@ -6994,20 +9418,131 @@ def human_bytes(n) -> str:
             return f"{major} {unit}"
     return f"{n} B"
 
-def print_quota(hdrs: dict):
-    """Print the quota from the X-Quota-* headers of the Guardian response."""
+_QUOTA_LAST = {"zero": False, "unlimited": False, "seen": False}
+# v8.0 (A2): the ONE-TIME rotation warnings of the watch loop (a dry
+# account must not re-warn on EVERY ~10-min refresh).
+_ROTATE_WARNED = {"none": False, "off": False}
+
+def save_account_quota(email: str, limit, remaining, reset, unlimited=False):
+    """v8.0 (A2): remember the LAST KNOWN quota of an account INSIDE its
+    config entry (quota_remaining / quota_limit / quota_reset /
+    quota_seen / quota_unlimited) - the ranking data
+    pick_rotation_account() reads when the current account runs dry.
+    The bookkeeping runs on EVERY refresh (cheap: the X-Quota headers
+    ride every token response, no extra request), whether or not the
+    auto-rotation itself is enabled."""
+    em = (email or "").strip().lower()
+    if not em:
+        return
+    try:
+        cfg_load()
+        with _CFG_LOCK:
+            acc = (_CFG.get("accounts") or {}).get(em)
+            if not isinstance(acc, dict):
+                return
+            acc["quota_limit"] = limit
+            acc["quota_remaining"] = None if unlimited else remaining
+            acc["quota_reset"] = reset
+            acc["quota_unlimited"] = bool(unlimited)
+            acc["quota_seen"] = int(time.time())
+        cfg_save()
+    except Exception:
+        pass
+
+def pick_rotation_account(current_email: str):
+    """v8.0 (A2): the account the rotation should switch to when the
+    current one runs dry - the Zeus-VPN rule: 'moves to the account
+    with the most data left, without dropping the connection'.
+      * a KNOWN-dry account (remaining <= 0, not unlimited) is NEVER
+        a target;
+      * an account whose quota was never seen counts as a VIABLE
+        candidate (its allowance may be full);
+      * an account WITHOUT a cached session token is skipped: the
+        rotation rides CACHED sessions only and must never trigger a
+        password login (the FxA 429 login rate limit - the
+        foxyvpn-pool lesson);
+      * an unlimited account always wins the ranking.
+    Returns (email, known_remaining_or_None) or (None, None)."""
+    cur = (current_email or "").strip().lower()
+    best_em, best_left, best_score = None, None, -1
+    for em, acc in cfg_accounts().items():
+        if not isinstance(acc, dict) or em == cur:
+            continue
+        if not str(acc.get("session_token") or "").strip():
+            continue
+        if acc.get("quota_unlimited"):
+            return em, None            # unlimited always wins
+        try:
+            left = int(acc.get("quota_remaining"))
+        except (TypeError, ValueError):
+            left = None
+        if left is not None and left <= 0:
+            continue
+        score = left if (left is not None and left > 0) else 0
+        if score > best_score:
+            best_em, best_left, best_score = em, left, score
+    return best_em, best_left
+
+def print_quota(hdrs: dict, panel: list = None):
+    """Print the quota from the X-Quota-* headers of the Guardian response.
+    v8.0 (A2): the parsed numbers are also RECORDED - the module-level
+    _QUOTA_LAST snapshot (the zero flag the watch loop's rotation
+    trigger reads) and the per-account bookkeeping in config.json
+    (save_account_quota) that ranks the other cached accounts when the
+    current one runs dry.
+    v8.1 (req. 3): with `panel` given, the ONE status line is not
+    emitted into the log but APPENDED to the live-panel line list
+    (redrawn in place every refresh); the quota_low warning is a real
+    event and stays a log line in both modes."""
     if not hdrs:
         return
+    _QUOTA_LAST["zero"] = False
+    _QUOTA_LAST["unlimited"] = False
+    _QUOTA_LAST["seen"] = True
     if hdrs.get("x-quota-unlimited", "").lower() == "true":
-        info(tr("quota_unlimited"))
+        _QUOTA_LAST["unlimited"] = True
+        if panel is None:
+            info(tr("quota_unlimited"))
+        else:
+            panel.append(("info", tr("quota_unlimited")))
+        save_account_quota(cfg_current_email(),
+                          hdrs.get("x-quota-limit"), None,
+                          hdrs.get("x-quota-reset"), unlimited=True)
         return
     limit = hdrs.get("x-quota-limit")
     remaining = hdrs.get("x-quota-remaining")
     reset = hdrs.get("x-quota-reset")
     if limit is not None and remaining is not None:
         reset_s = f", reset: {reset}" if reset else ""
-        info(tr("quota_left", left=human_bytes(remaining),
-                limit=human_bytes(limit), reset=reset_s))
+        if panel is None:
+            info(tr("quota_left", left=human_bytes(remaining),
+                    limit=human_bytes(limit), reset=reset_s))
+        else:
+            panel.append(("info", tr("quota_left",
+                                    left=human_bytes(remaining),
+                                    limit=human_bytes(limit),
+                                    reset=reset_s)))
+        # v6.6: the quota is therefore reported on EVERY proxyPass
+        # refresh (the ~10-min cadence - tighter than the Go
+        # quotaCheckInterval of 15 min; the X-Quota headers already
+        # ride every token response, no extra request), and a NEW
+        # warning fires when the remaining monthly allowance drops
+        # below 15% of the limit (the reset time is included).
+        try:
+            rem_i = int(remaining)
+        except (TypeError, ValueError):
+            rem_i = None
+        if rem_i is not None:
+            # v8.0 (A2): the CURRENT account is DRY - the snapshot the
+            # watch loop's auto-rotation trigger reads.
+            _QUOTA_LAST["zero"] = rem_i <= 0
+        try:
+            if int(limit) > 0 and int(remaining) * 100 < int(limit) * 15:
+                warn(tr("quota_low", left=human_bytes(remaining),
+                        limit=human_bytes(limit), reset=reset_s))
+        except (TypeError, ValueError):
+            pass
+        save_account_quota(cfg_current_email(), limit, remaining, reset)
 
 # ---------------- server list (Remote Settings: vpn-serverlist) ----------------
 
@@ -7236,6 +9771,225 @@ def _ssl_ctx() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     return ctx
 
+# ---------------------------------------------------------------------------
+# v6.6: TLS ClientHello FRAGMENTATION (--tls-split / hotkey 'i' / env
+# MOZVPN_TLS_SPLIT). The ClientHello of the outer TLS connection (which
+# carries the egress SNI) is sent in SMALL TCP segments so a middlebox
+# that parses the whole ClientHello from the FIRST packet of the flow
+# cannot see the full SNI in one segment. Implementation: the handshake
+# runs over memory BIOs (ctx.wrap_bio + a hand-driven do_handshake loop
+# - the stdlib technique the Python ssl docs document for non-blocking
+# BIO use); the ClientHello bytes the BIO produces go to the socket in
+# TLS_SPLIT_CHUNK-byte pieces (the first piece gets a short delay so the
+# segments land in separate TCP packets), and everything after the
+# handshake is pumped through the SAME SSLObject, so the connection
+# stays a normal TLS stream for the peer. ON by default since v6.7 (the
+# user's directive: every USEFUL option ships enabled) and SAFE by
+# CONSTRUCTION, not by opt-in: any fragmented-handshake failure falls
+# back to the plain profile matrix of _tls_profiles() on a FRESH socket
+# (see _tls_connect), so the v6.1 lesson (a transport 'hardening' must
+# never surprise the working data path) holds even with the feature
+# enabled; --no-tls-split / MOZVPN_TLS_SPLIT=0 restores the plain
+# ClientHello.
+# ---------------------------------------------------------------------------
+TLS_SPLIT_CHUNK = 64          # bytes per ClientHello TCP segment
+TLS_SPLIT_DELAY = 0.03        # s after the first segment
+_tls_split_on = {"v": False}
+
+def set_tls_split(enabled: bool):
+    """v6.6: enable/disable the ClientHello fragmentation (NEW connections)."""
+    _tls_split_on["v"] = bool(enabled)
+
+def tls_split() -> bool:
+    """v6.6: whether the ClientHello fragmentation is active."""
+    return _tls_split_on["v"]
+
+def _split_clienthello_records(record: bytes) -> "list[bytes] | None":
+    """v7.0: re-frame ONE TLS record (the ClientHello) into TWO
+    records, cutting at the start of the server_name extension
+    (the 'sniext' cut of the zapret tpws --tlsrec option), so the
+    WHOLE SNI extension goes in the second record. Returns None
+    when the buffer is not exactly one ClientHello record or the
+    extension is not found - the caller then keeps the v6.6 plain
+    TCP segmentation.
+    Why the record layer AT ALL: zapret issue #238 shows the TLS-
+    record fragmentation ALONE does not fool a DPI that reads TCP
+    (the two records went in ONE packet), and the Xray-core
+    discussion #5969 (2026-04) reports the Iranian national DPI
+    now REASSEMBLING the classic TCP-layer ClientHello split -
+    but 'TLS record-layer fragmentation bypasses DPIs that
+    reassemble at the TCP layer but not at the TLS record layer'.
+    The COMBINATION (two TLS records, each in small TCP segments)
+    therefore requires the DPI to reassemble BOTH layers to see
+    the SNI. RFC 5246 section 6.2.1 permits a handshake message
+    to be carried across multiple records, and the v6.6 item-12
+    fallback still covers a server that mishandles it."""
+    try:
+        if len(record) < 5 or record[0] != 0x16:
+            return None                      # not a handshake record
+        rec_len = int.from_bytes(record[3:5], "big")
+        if 5 + rec_len != len(record):
+            return None                      # not exactly one record
+        hs = record[5:]
+        if len(hs) < 4 or hs[0] != 0x01:
+            return None                      # not a ClientHello
+        hs_len = int.from_bytes(hs[1:4], "big")
+        if 4 + hs_len != len(hs):
+            return None
+        ch = hs[4:]                          # the ClientHello body
+        # version(2) random(32) session_id(1+n) cipher_suites(2+n)
+        # compression_methods(1+n) extensions(2+n)
+        o = 2 + 32
+        sid_n = ch[o]; o += 1 + sid_n
+        cs_n = int.from_bytes(ch[o:o + 2], "big"); o += 2 + cs_n
+        co_n = ch[o]; o += 1 + co_n
+        if o + 2 > len(ch):
+            return None
+        ext_len = int.from_bytes(ch[o:o + 2], "big")
+        ext_start = o + 2
+        ext_end = ext_start + ext_len
+        if ext_end > len(ch):
+            return None
+        p = ext_start
+        cut = None
+        while p + 4 <= ext_end:
+            etype = int.from_bytes(ch[p:p + 2], "big")
+            elen = int.from_bytes(ch[p + 2:p + 4], "big")
+            if etype == 0:                   # server_name
+                cut = 5 + 4 + p              # record offset of it
+                break
+            p += 4 + elen
+        if cut is None or cut <= 5 or cut >= len(record) - 1:
+            return None
+        def _frame(part: bytes) -> bytes:
+            # re-write the record header with the new payload length
+            return (part[:3] + (len(part) - 5).to_bytes(2, "big")
+                    + part[5:])
+        return [_frame(record[:cut]), _frame(record[cut:])]
+    except Exception:
+        return None
+
+class _FragTLSConn:
+    """v6.6: a socket-like adapter around an ssl.SSLObject that performs
+    the TLS handshake with a FRAGMENTED ClientHello and then pumps the
+    application data. Surface: sendall/recv/settimeout/close/getpeercert -
+    everything the probes and the builtin engine do with a tunnel."""
+
+    def __init__(self, raw: socket.socket, ctx: ssl.SSLContext,
+                 server_hostname: str, timeout: int):
+        self._raw = raw
+        self._bio_in = ssl.MemoryBIO()
+        self._bio_out = ssl.MemoryBIO()
+        self._obj = ctx.wrap_bio(self._bio_in, self._bio_out,
+                                 server_hostname=server_hostname)
+        self._timeout = timeout
+        raw.settimeout(timeout)
+        # 1) drive the handshake; the FIRST thing do_handshake writes
+        #    into bio_out is the ClientHello - send it FRAGMENTED.
+        first_flush = True
+        deadline = time.monotonic() + max(5, int(timeout))
+        while True:
+            try:
+                self._obj.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                if time.monotonic() > deadline:
+                    raise socket.timeout("TLS handshake timed out")
+                if self._bio_out.pending():
+                    self._send_bio_out(fragment=first_flush)
+                    first_flush = False
+                data = raw.recv(65536)
+                if not data:
+                    raise ConnectionResetError(
+                        "peer closed during handshake")
+                self._bio_in.write(data)
+            except ssl.SSLWantWriteError:
+                if time.monotonic() > deadline:
+                    raise socket.timeout("TLS handshake timed out")
+                self._send_bio_out(fragment=first_flush)
+                first_flush = False
+        # the handshake completed - flush what it left in bio_out (the
+        # client Finished); this is small and goes as ONE segment
+        self._send_bio_out(fragment=False)
+
+    def _send_bio_out(self, fragment: bool):
+        """Flush bio_out to the raw socket; with fragment=True the bytes
+        (the ClientHello) go in TLS_SPLIT_CHUNK-byte TCP segments.
+        v7.0: the ClientHello is FIRST re-framed into TWO TLS records
+        cut at the server_name extension (the zapret tpws
+        --tlsrec=sniext cut - see _split_clienthello_records) and
+        THEN each record goes in small TCP segments - a DPI must
+        reassemble BOTH layers (TCP AND the TLS records) to see
+        the SNI. A chunk that is not a single ClientHello record
+        (the Finished, the application data) keeps the v6.6
+        behavior verbatim."""
+        while self._bio_out.pending():
+            chunk = self._bio_out.read()
+            if not chunk:
+                break
+            parts = _split_clienthello_records(chunk) if fragment else None
+            if parts:
+                first = True
+                for part in parts:
+                    off = 0
+                    while off < len(part):
+                        self._raw.sendall(part[off:off + TLS_SPLIT_CHUNK])
+                        if first:
+                            time.sleep(TLS_SPLIT_DELAY)
+                            first = False
+                        off += TLS_SPLIT_CHUNK
+                continue
+            if fragment and len(chunk) > TLS_SPLIT_CHUNK:
+                off = 0
+                first = True
+                while off < len(chunk):
+                    self._raw.sendall(chunk[off:off + TLS_SPLIT_CHUNK])
+                    if first:
+                        time.sleep(TLS_SPLIT_DELAY)
+                        first = False
+                    off += TLS_SPLIT_CHUNK
+            else:
+                self._raw.sendall(chunk)
+
+    # -- the socket-like surface used by the probes / the builtin engine --
+    def settimeout(self, value):
+        self._timeout = value
+        try:
+            self._raw.settimeout(value)
+        except OSError:
+            pass
+
+    def sendall(self, data):
+        # 2) application data: encrypt via the SSLObject, flush whole
+        view = memoryview(data)
+        while view:
+            n = self._obj.write(view)
+            self._send_bio_out(fragment=False)
+            view = view[n:]
+
+    def recv(self, size):
+        while True:
+            try:
+                return self._obj.read(size)
+            except ssl.SSLWantReadError:
+                data = self._raw.recv(65536)
+                if not data:
+                    return b""
+                self._bio_in.write(data)
+            except ssl.SSLWantWriteError:
+                self._send_bio_out(fragment=False)
+            except ssl.SSLZeroReturnError:
+                return b""
+
+    def close(self):
+        try:
+            self._raw.close()
+        except OSError:
+            pass
+
+    def getpeercert(self):
+        return self._obj.getpeercert()
+
 def _tls_profiles() -> list:
     """Ordered list of (name, ssl.SSLContext) profiles tried for the outer
     TLS connection to the Mozilla/Fastly egress. The Fastly proxy port speaks
@@ -7323,6 +10077,23 @@ def _tls_connect(host: str, port: int, timeout: int = 20) -> "ssl.SSLSocket":
             break
         try:
             raw.settimeout(timeout)
+            if tls_split():
+                # v6.6 (item 12): the fragmented-ClientHello handshake.
+                # ANY failure here falls back to the plain profile walk
+                # (a fresh socket + the plain wrap_socket below) - a
+                # 'hardening' must never break the data path (the v6.1
+                # lesson). The raw socket may be half-consumed by the
+                # failed fragmented handshake, so a FRESH one is opened
+                # for the plain attempt.
+                try:
+                    return _FragTLSConn(raw, ctx, host, timeout)
+                except Exception:
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+                    raw = _connect_resolved_ips(ips, host, port, timeout)
+                    raw.settimeout(timeout)
             return ctx.wrap_socket(raw, server_hostname=host)
         except Exception as e:
             # a TLS-HANDSHAKE failure: the next ClientHello profile may
@@ -7887,7 +10658,13 @@ def probe_upstreams_parallel(servers: list, token: str, echo_url: str,
                              echo_name: str, max_workers: int = 64) -> list:
     """Probe all upstreams in parallel (req. 7) and return the list of result
     dicts. Logging is done AFTER all checks complete as grouped summary
-    lines so parallel output does not interleave."""
+    lines so parallel output does not interleave.
+    v6.9 (the user's request 3): each UNIQUE (host, port, protocol)
+    is probed ONCE and the verdict is fanned out to every entry
+    that points at it - several locations share one egress, and
+    with --upstream-host they ALL do, so the old one-tunnel-per-
+    ENTRY loop re-learned the same fact N times (see the dedup
+    block below)."""
     info(tr("proxy_check_started", n=len(servers), service=echo_name, url=echo_url))
     # masque is the PRIORITY protocol; without aioquic it cannot even be
     # probed - state the reason once, up front, so the protocol choice in
@@ -7895,15 +10672,54 @@ def probe_upstreams_parallel(servers: list, token: str, echo_url: str,
     if aioquic is None and any(s.get("protocol") == PROTO_MASQUE
                                for s in servers):
         info(tr("proto_masque_no_lib"))
-    results = []
-    with ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(servers)))) as ex:
-        futures = [ex.submit(check_upstream, s, token, echo_url) for s in servers]
-        for f in futures:
+    # v6.9 (the user's request 3): probe each UNIQUE (host, port,
+    # protocol) ONCE. Several locations share one egress - and with
+    # --upstream-host EVERY entry points at the same upstream - but
+    # the old loop opened one probe tunnel PER ENTRY: N duplicate
+    # TLS+CONNECT handshakes against the same egress at once, N
+    # times the WAF-visible request rate, all to learn the SAME
+    # fact. The references agree on the minimal-probe principle:
+    # the Go client verifies the exit ONCE after connecting
+    # (main.go verifyExit) and Firefox runs NO pre-flight probes
+    # at all (its IPPNetworkErrorObserver reacts to failures
+    # instead). The verdict - including the CONNECT-fallback
+    # protocol switch of a failed MASQUE probe - is fanned out to
+    # every entry that points at the probed (host, port,
+    # protocol).
+    by_key = {}
+    key_order = []
+    for s in servers:
+        key = (s.get("protocolHost"), s.get("protocolPort"),
+               s.get("protocol"))
+        if key not in by_key:
+            by_key[key] = s
+            key_order.append(key)
+    res_by_key = {}
+    with ThreadPoolExecutor(
+            max_workers=min(max_workers, max(1, len(by_key)))) as ex:
+        futures = {key: ex.submit(check_upstream, by_key[key],
+                                 token, echo_url)
+                   for key in key_order}
+        for key in key_order:
             try:
-                results.append(f.result())
+                res_by_key[key] = futures[key].result()
             except Exception as e:
-                results.append({"server": None, "protocol": PROTO_CONNECT,
-                                "ok": False, "detail": repr(e)})
+                res_by_key[key] = {"server": None,
+                                   "protocol": PROTO_CONNECT,
+                                   "ok": False, "detail": repr(e)}
+    results = []
+    for s in servers:
+        key = (s.get("protocolHost"), s.get("protocolPort"),
+               s.get("protocol"))
+        r = res_by_key[key]
+        if r.get("server") is by_key[key]:
+            results.append(r)      # the probed representative: as-is
+            continue
+        r2 = dict(r)               # a shared-egress replica
+        rs = r.get("server") or {}
+        r2["server"] = {**s,
+                        "protocol": rs.get("protocol", s.get("protocol"))}
+        results.append(r2)
     # v5.8: the probe result is ONE compact message about ALL upstreams
     # (the live v5.7 run printed one fail line per upstream - 33 lines
     # with raw SSLError reprs - plus two long host-list summary lines).
@@ -7980,14 +10796,23 @@ def _foxyproxy_title(p: dict) -> str:
     return (f"mozvpn {_foxyproxy_cc(p)} "
             f"{p.get('city') or p.get('label') or ''} [{p['port']}]")
 
-def _foxyproxy_v67_entries(proxies: list, listen_host: str) -> list:
+def _foxyproxy_v67_entries(proxies: list, listen_host: str,
+                           proxy_type: str = "http") -> list:
     """v5.7: the FoxyProxy 6/7 proxy entries - [(key, entry), ...] with
     the entry in the exact shape migrate.js convert7() consumes: a
     top-level 'k<id>' key whose value carries {title, type: 1 (http),
     address, port (NUMBER), username, password, cc, color, active,
     proxyDNS, whitePatterns[{title, active, pattern, type: 1 (wildcard),
     protocols: 1 (all)}], blackPatterns[...], index, id}; id == the key
-    (that is how the FoxyProxy 6/7 export names them)."""
+    (that is how the FoxyProxy 6/7 export names them).
+    v8.0 (A4) -> v8.5: the entry carries the SERVED proxy type - type 1
+    (PROXY_TYPE_HTTP) + proxyDNS False for the 'http' listener, type 3
+    (PROXY_TYPE_SOCKS5) + proxyDNS True for 'socks5' (verified
+    2026-10-30 against the official FoxyProxy Standard 7.5.1 example
+    settings, which use exactly "type": 3, "proxyDNS": true for a
+    SOCKS proxy; proxyDNS True = the browser sends the NAME to the
+    proxy - the remote-DNS semantics of the socks5 listener)."""
+    socks = str(proxy_type or "http").strip().lower() in ("socks5",)
     def _pat(pattern: str, title: str) -> dict:
         # convert7() pattern item: type 1 = wildcard, protocols 1 = all
         return {"title": title, "active": True, "pattern": pattern,
@@ -7998,7 +10823,7 @@ def _foxyproxy_v67_entries(proxies: list, listen_host: str) -> list:
         key = f"k{int(hashlib.sha256(name.encode()).hexdigest(), 16) % 10**17}"
         entries.append((key, {
             "title": name,
-            "type": 1,                  # PROXY_TYPE_HTTP (convert7 typeSet)
+            "type": 3 if socks else 1,   # PROXY_TYPE_SOCKS5 / PROXY_TYPE_HTTP
             "address": listen_host,
             "port": int(p["port"]),
             "username": "",
@@ -8006,7 +10831,7 @@ def _foxyproxy_v67_entries(proxies: list, listen_host: str) -> list:
             "cc": _foxyproxy_cc(p),
             "color": FOXYPROXY_COLORS[i % len(FOXYPROXY_COLORS)],
             "active": True,
-            "proxyDNS": False,          # HTTP proxy: DNS stays local
+            "proxyDNS": bool(socks),     # SOCKS: DNS goes through the proxy
             "whitePatterns": [_pat("*", "all")],
             "blackPatterns": [
                 _pat("localhost", "localhost"),
@@ -8021,7 +10846,8 @@ def _foxyproxy_v67_entries(proxies: list, listen_host: str) -> list:
         }))
     return entries
 
-def foxyproxy_settings_json(proxies: list, listen_host: str) -> str:
+def foxyproxy_settings_json(proxies: list, listen_host: str,
+                            proxy_type: str = "http") -> str:
     """v5.7: build the FoxyProxy Standard settings JSON for the top
     'Import' button of the Options page - and, being COMBINED, for ANY
     FoxyProxy import path. Part 1 (current v8+/v9.x pref shape, verified
@@ -8034,13 +10860,18 @@ def foxyproxy_settings_json(proxies: list, listen_host: str) -> str:
     (migrate.js convert7) finds them too - Object.assign(pref, data)
     copies the extra keys harmlessly. 'mode': 'disable' = import without
     surprise traffic rerouting; the user then picks a proxy from the
-    FoxyProxy toolbar popup."""
+    FoxyProxy toolbar popup.
+    v8.0 (A4) -> v8.5: the served type is EXPORTED - 'socks5' +
+    proxyDNS True for the socks5 listener (the schema.json type enum
+    is the STRING 'http'/'https'/'socks4'/'socks5'/'pac'/'direct',
+    verified 2026-10-30), 'http' unchanged."""
+    socks = str(proxy_type or "http").strip().lower() in ("socks5",)
     data = []
     for i, p in enumerate(proxies):
         data.append({
             "active": True,
             "title": _foxyproxy_title(p),
-            "type": "http",
+            "type": "socks5" if socks else "http",
             "hostname": listen_host,
             "port": str(p["port"]),          # schema: port is a STRING
             "username": "",
@@ -8050,7 +10881,7 @@ def foxyproxy_settings_json(proxies: list, listen_host: str) -> str:
             "color": FOXYPROXY_COLORS[i % len(FOXYPROXY_COLORS)],
             "pac": "",
             "pacString": "",
-            "proxyDNS": False,               # HTTP proxy -> DNS stays local
+            "proxyDNS": bool(socks),   # SOCKS proxy -> DNS goes through it
             "include": [],
             "exclude": [
                 {"type": "wildcard", "title": "localhost",
@@ -8076,11 +10907,13 @@ def foxyproxy_settings_json(proxies: list, listen_host: str) -> str:
                 "data": data}
     # Part 2: the same proxies in the FoxyProxy 6/7 shape, top-level -
     # the ONLY place convert7() looks for proxies.
-    for key, entry in _foxyproxy_v67_entries(proxies, listen_host):
+    for key, entry in _foxyproxy_v67_entries(proxies, listen_host,
+                                              proxy_type):
         settings[key] = entry
     return json.dumps(settings, indent=2, ensure_ascii=False)
 
-def foxyproxy_legacy_json(proxies: list, listen_host: str) -> str:
+def foxyproxy_legacy_json(proxies: list, listen_host: str,
+                          proxy_type: str = "http") -> str:
     """v5.7: build the LEGACY FoxyProxy settings JSON - the REAL FoxyProxy
     6/7 'FoxyProxy_YYYY-MM-DD.json' export shape, which is what FoxyProxy
     Standard v8+/9.x ACTUALLY parses on 'Import from older versions'
@@ -8098,7 +10931,8 @@ def foxyproxy_legacy_json(proxies: list, listen_host: str) -> str:
     is auto-enabled on import."""
     settings = {"mode": "disable", "sync": False,
                 "logging": {"active": True, "maxSize": 500}}
-    for key, entry in _foxyproxy_v67_entries(proxies, listen_host):
+    for key, entry in _foxyproxy_v67_entries(proxies, listen_host,
+                                              proxy_type):
         settings[key] = entry
     return json.dumps(settings, indent=2, ensure_ascii=False)
 
@@ -8130,24 +10964,30 @@ def _foxyproxy_save_dialog(default_name: str, ext: str) -> "str | None":
             return None
 
 def export_foxyproxy(args, proxies: list, listen_host: str,
-                    legacy: bool = False) -> "str | None":
+                    legacy: bool = False,
+                    proxy_type: "str | None" = None) -> "str | None":
     """v5.5: write ONE FoxyProxy settings file for the CURRENTLY RUNNING
     local proxies. Destination: the --foxyproxy-out / --foxyproxy-legacy-out
     path when given (NO dialog, req. 3), otherwise the OS save dialog.
-    Returns the written path or None on failure/cancel."""
+    Returns the written path or None on failure/cancel.
+    v8.0 (A4): the exported entries carry the SERVED proxy type
+    (proxy_type argument, else the CURRENT global type) - a socks5
+    listener exports SOCKS entries (proxyDNS true), an http listener
+    exports the classic HTTP entries exactly as before."""
     if not proxies:
         info(tr("foxyproxy_no_proxies"))
         return None
+    ptype = str(proxy_type or get_proxy_type() or "http").strip().lower()
     today = time.strftime("%Y-%m-%d")
     if legacy:
         out_arg = getattr(args, "foxyproxy_legacy_out", None)
         default_name = f"foxyproxy-legacy_{today}.json"
-        content = foxyproxy_legacy_json(proxies, listen_host)
+        content = foxyproxy_legacy_json(proxies, listen_host, ptype)
         fmt = tr("foxyproxy_format_legacy")
     else:
         out_arg = getattr(args, "foxyproxy_out", None)
         default_name = f"FoxyProxy-settings_{today}.json"
-        content = foxyproxy_settings_json(proxies, listen_host)
+        content = foxyproxy_settings_json(proxies, listen_host, ptype)
         fmt = tr("foxyproxy_format_current")
     if out_arg:
         path = out_arg
@@ -8186,6 +11026,244 @@ def maybe_foxyproxy_export(args, engine) -> None:
         export_foxyproxy(args, engine.proxies, engine.listen_host, legacy=True)
 
 # ---------------------------------------------------------------------------
+# v8.0 (B3): the PAC export (the armanlife 'smart routing: local sites
+# open directly' idea, adapted to a terminal proxy): a generated
+# FindProxyForURL that sends localhost/private ranges DIRECT and
+# everything else through the RUNNING local listeners, with a PAC
+# fallback chain of EVERY listener ending in DIRECT (a dead listener
+# fails over, the browser never hits a dead end). The DIRECT list is
+# the SAME bypass list the FoxyProxy exports carry; the directive
+# follows the proxy TYPE (SOCKS5 = the remote-DNS PAC entry, PROXY for
+# the http listener). v8.2: the file is written on DEMAND - the Ctrl+P
+# hotkey rewrites the default copy (plus --pac-export FILE); an automatic
+# rebuild writes ONLY an explicit --pac-export FILE destination (a bare
+# --pac-export opts back into the default copy on every rebuild).
+# ---------------------------------------------------------------------------
+
+def build_pac_script(proxies: list, listen_host: str,
+                     proxy_type: str = "socks5") -> str:
+    """v8.0 (B3): generate the PAC script for the CURRENTLY RUNNING
+    listeners. The bypass list: localhost / 127.* / ::1 / 10.* /
+    172.16-31.* / 192.168.* / 169.254.* (the private/link-local ranges
+    of the FoxyProxy passthrough); the fallback chain lists every
+    listener in order and ends with DIRECT (a stale PAC that points at
+    dead ports silently breaks the browser - the chain avoids exactly
+    that)."""
+    ptype = str(proxy_type or "socks5").strip().lower()
+    directive = "PROXY" if ptype == "http" else "SOCKS5"
+    bypass = (["localhost", "127.*", "::1", "10.*"]
+              + [f"172.{i}.*" for i in range(16, 32)]
+              + ["192.168.*", "169.254.*"])
+    lines = [
+        "// mozvpn.py PAC: local sites DIRECT, everything else via the",
+        "// local proxy listeners (regenerated on every engine rebuild).",
+        "function FindProxyForURL(url, host) {",
+        "  if (isPlainHostName(host)",
+    ]
+    for pat in bypass:
+        lines.append(f'      || shExpMatch(host, "{pat}")')
+    lines.append("     ) {")
+    lines.append('    return "DIRECT";')
+    lines.append("  }")
+    chain = "; ".join(f"{directive} {listen_host}:{int(p['port'])}"
+                      for p in proxies) + "; DIRECT"
+    lines.append(f'  return "{chain}";')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+def _write_pac_file(path: str, proxies: list, listen_host: str,
+                    proxy_type: str) -> "str | None":
+    """v8.0 (B3): write the PAC script to ONE path (best effort, a
+    read-only dir must not crash the run). Returns the path or None."""
+    try:
+        content = build_pac_script(proxies, listen_host, proxy_type)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        return path
+    except Exception as e:
+        warn(tr("pac_failed", path=path, err=e))
+        return None
+
+def maybe_pac_export(args, engine, on_demand: bool = False) -> None:
+    """v8.2 (user request): the PAC file is NO LONGER auto-created on
+    every engine rebuild - a useful default should not litter the config
+    dir until asked for. It is written on DEMAND only:
+      * on_demand=True - the Ctrl+P hotkey: the default copy at
+        <config dir>/mozvpn.pac (plus the --pac-export FILE copy);
+      * an EXPLICIT --pac-export FILE is honored on every rebuild (the
+        user named that destination);
+      * a bare --pac-export (no FILE) opts back into the v8.0 behavior:
+        the default copy on every rebuild.
+    The DIRECT entries are counted per listener for the log line."""
+    if not engine or not getattr(engine, "proxies", None):
+        return
+    listen_host = getattr(engine, "listen_host", "127.0.0.1") or "127.0.0.1"
+    ptype = str(getattr(engine, "proxy_type", None)
+                or get_proxy_type() or "socks5").strip().lower()
+    directive = "PROXY" if ptype == "http" else "SOCKS5"
+    custom = getattr(args, "pac_export", None)
+    # v8.3 (bug fix): None (the flag was NOT given) must STAY None -
+    # the old 'else ""' normalization collapsed argparse's None into
+    # the BARE-flag opt-in value (const=""), so the branch below
+    # matched the no-flag case too and every engine rebuild wrote the
+    # default copy again.
+    custom = str(custom).strip() if custom is not None else None
+    targets = []
+    if custom:
+        targets.append(custom)          # an explicit FILE: always honored
+    if on_demand or custom == "":
+        targets.append(os.path.join(CONF_DIR, "mozvpn.pac"))
+    for path in list(dict.fromkeys(targets)):
+        if _write_pac_file(path, engine.proxies, listen_host, ptype):
+            info(tr("pac_written", path=path, directive=directive,
+                    n=len(engine.proxies)))
+
+# ---------------------------------------------------------------------------
+# v8.0 (C4): the --doctor one-shot diagnostics (the foxhole-vpn
+# 'doctor command' pattern): a READ-ONLY walk of the whole chain the
+# script depends on - the interpreter, the config store, the pip
+# dependencies and sing-box, the system resolver, the DoH chain, the FxA
+# API reachability, the server list fetch, a REAL TLS handshake to a
+# live egress (the full profile matrix) and the OAuth -> Guardian ->
+# quota chain on the CACHED session token ONLY (never a fresh sign-in,
+# never a prompt). Exit code 0/1.
+# ---------------------------------------------------------------------------
+
+def run_doctor(a) -> int:
+    """v8.0 (C4): print the diagnosis and return the exit code."""
+    n_ok = 0
+    n_fail = 0
+
+    def _mark(good: bool):
+        nonlocal n_ok, n_fail
+        if good:
+            n_ok += 1
+        else:
+            n_fail += 1
+        return tr("doctor_ok") if good else tr("doctor_fail")
+
+    info(tr("doctor_title"))
+    # 1. the interpreter
+    info(tr("doctor_interpreter", ver=sys.version.split()[0],
+            plat=sys.platform))
+    # 2. the config store
+    try:
+        n_acc = len(cfg_accounts())
+        info(tr("doctor_config", path=CONFIG_FILE, n=n_acc))
+        _mark(True)
+    except Exception:
+        info(tr("doctor_config", path=CONFIG_FILE, n="?"))
+        _mark(False)
+    # 3. the pip dependencies + sing-box
+    try:
+        missing = print_dependencies()
+        if missing:
+            info(tr("doctor_deps", miss=", ".join(missing)))
+            _mark(False)
+        else:
+            info(tr("doctor_deps", miss=tr("doctor_deps_ok")))
+            _mark(True)
+    except Exception:
+        _mark(False)
+    # 4. the SYSTEM resolver
+    try:
+        ips = socket.getaddrinfo("api.accounts.firefox.com", 443,
+                                 proto=socket.IPPROTO_TCP)
+        hosts = sorted({x[4][0] for x in ips})
+        info(tr("doctor_sysdns", host="api.accounts.firefox.com",
+                ips=", ".join(hosts)))
+        _mark(True)
+    except Exception as e:
+        info(tr("doctor_sysdns", host="api.accounts.firefox.com", ips=str(e)))
+        _mark(False)
+    # 5. the DoH chain (the CONFIGURED provider - no state change).
+    #    v9.3: with DoH 'off' (the SYSTEM resolver choice) resolve_host()
+    #    is a no-op BY DESIGN - the system resolution is already proven
+    #    by step 4, so the step says so and PASSES instead of reporting
+    #    a misleading failure of a mode that works as configured.
+    doh_name = load_doh_provider_cache() or "system"
+    if not doh_provider():
+        info(tr("doctor_doh", provider=doh_name,
+                host="api.accounts.firefox.com",
+                ips=tr("doctor_doh_system")))
+        _mark(True)
+    else:
+        try:
+            ips2 = resolve_host("api.accounts.firefox.com") or []
+            info(tr("doctor_doh", provider=doh_name,
+                    host="api.accounts.firefox.com",
+                    ips=", ".join(ips2) if ips2 else "-"))
+            _mark(bool(ips2))
+        except Exception as e:
+            info(tr("doctor_doh", provider=doh_name,
+                    host="api.accounts.firefox.com", ips=str(e)))
+            _mark(False)
+    # 6. the FxA API reachability (the public credentials/status
+    #    endpoint - the Fastly challenge path is exercised implicitly)
+    try:
+        # v9.3: the REAL route is /account/credentials/status (mozilla/fxa
+        # account.ts, PR #21517 - the same route get_credentials_status()
+        # rides). The underscore form of the pre-v9.3 typo always 404'd
+        # and the pass rule below masked it; a 404 no longer counts.
+        st, _d = req("POST", FXA_AUTH + "/account/credentials/status",
+                     {"email": "doctor@localhost"})
+        info(tr("doctor_fxa", url=FXA_AUTH, status=st))
+        _mark(st in (200, 400, 403))      # a REAL answer of the REAL route
+    except Exception as e:
+        info(tr("doctor_fxa", url=FXA_AUTH, status=str(e)))
+        _mark(False)
+    # 7. the server list fetch (Remote Settings) - kept for step 8
+    locs = []
+    try:
+        locs = fetch_serverlist()
+        n_srv = sum(len(l.get("servers") or []) for l in locs)
+        info(tr("doctor_serverlist", n=len(locs), m=n_srv))
+        _mark(bool(locs))
+    except Exception as e:
+        info(tr("doctor_serverlist", n=str(e), m="-"))
+        _mark(False)
+    # 8. a REAL TLS handshake to a live egress (the full profile matrix)
+    try:
+        srv = None
+        for l in locs:
+            if l.get("servers"):
+                s0 = l["servers"][0]
+                srv = (s0.get("protocolHost"), s0.get("protocolPort"))
+                break
+        if srv and srv[0]:
+            t0 = time.monotonic()
+            _tls_connect(srv[0], int(srv[1] or 443), timeout=15)
+            ms = int((time.monotonic() - t0) * 1000)
+            info(tr("doctor_tls", host=srv[0], port=srv[1], p="matrix", ms=ms))
+            _mark(True)
+        else:
+            _mark(False)
+    except Exception as e:
+        info(tr("doctor_tls", host="egress", port="-", p="matrix", ms=str(e)))
+        _mark(False)
+    # 9. the OAuth -> Guardian -> quota chain on the CACHED session ONLY
+    #    (guardian_pass performs the activate + token fetch itself and
+    #    returns the X-Quota headers - print_quota prints the allowance;
+    #    NEVER a fresh sign-in, never a prompt)
+    try:
+        acc = cfg_current_account()
+        st_tok = (acc.get("session_token") or "").strip()
+        if st_tok:
+            tok = oauth_token(st_tok)
+            _tok, _until, ghdrs = guardian_pass(tok)
+            print_quota(ghdrs)
+            _mark(True)
+        else:
+            # a missing cached session is not a fault - the step is
+            # skipped with a hint instead of counted as a failure
+            info(tr("doctor_no_session"))
+    except Exception as e:
+        err(str(e))
+        _mark(False)
+    info(tr("doctor_done", ok=n_ok, fail=n_fail))
+    return 0 if n_fail == 0 else 1
+
+# ---------------------------------------------------------------------------
 # Local proxy engines (req. 6, 10, 11)
 # ---------------------------------------------------------------------------
 
@@ -8210,6 +11288,213 @@ def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
         return False
     finally:
         s.close()
+
+# ---------------------------------------------------------------------------
+# v6.6: THE PASS-HEALTH MONITOR of the builtin engine (the BUILTIN engine
+# only - the sing-box engine runs as an external process this script
+# cannot instrument; its lifecycle is unchanged). Firefox watches the
+# CONNECT responses of the egress on EVERY request (IPPNetworkError
+# Observer -> the 'proxy-http-error' event -> the pass is replaced
+# immediately), and the Go reference client separates TWO failure
+# classes before concluding that the SESSION (not one target) is broken:
+#   - the PASS WAS REJECTED (HTTP 400 'parsing JWT failed' / 401 / 403):
+#     the proxyPass itself is bad -> the watch loop refreshes it NOW
+#     (paced by the Firefox floors: minRotationInterval 1 s + the 500 ms
+#     retryAfter pacing - never a tight refresh loop);
+#   - TARGET failures (the CONNECT to a destination never opened / the
+#     egress answered 502/504): counted PER DISTINCT TARGET; only THREE
+#     DISTINCT failing targets mean the TUNNEL/SESSION is broken (one
+#     flaky destination or one bad egress moment must not 'flap' the
+#     session; a single failure fails only its own client connection).
+# The CONNECT targets are REDACTED in every log line by default (the Go
+# logTarget redaction: '<redacted; use --verbose>' - a CONNECT
+# destination is the user's browsing); the per-host EGRESS names stay
+# visible (they are the script's own servers, not the user's traffic).
+# v9.2 (the user's report): the TARGET-failure books now carry an
+# EXPIRY (only failures fresher than _PASS_FAIL_WINDOW count toward
+# the three-distinct-targets threshold) and are DROPPED for an egress
+# the moment it serves a successful CONNECT (Firefox: a working
+# connection resets the error history) - the v6.6 books grew forever,
+# so three unrelated one-off dead-site failures tripped a spurious
+# 'session looks broken' pass refresh. The DNS relay's own DoH wire
+# target is exempted from the target-failure classes entirely (see
+# _is_doh_wire_target); the PASS-REJECTION classes stay counted.
+# ---------------------------------------------------------------------------
+
+_VERBOSE_TARGETS = {"v": False}
+
+def set_verbose_targets(enabled: bool):
+    """v6.6: --verbose - reveal the CONNECT targets in the engine logs."""
+    _VERBOSE_TARGETS["v"] = bool(enabled)
+
+def verbose_targets() -> bool:
+    """v6.6: whether the CONNECT targets are visible in the engine logs."""
+    return _VERBOSE_TARGETS["v"]
+
+def _redact_target(target: str) -> str:
+    """v6.6: the CONNECT destination of a client request is the user's
+    browsing - it never reaches the log unless --verbose was given."""
+    return target if _VERBOSE_TARGETS["v"] else "<redacted; use --verbose>"
+
+# v9.2: how long a per-target CONNECT failure stays countable toward
+# the '3+ distinct targets' session-break threshold of the pass
+# monitor (the books of the v6.6 design grew forever; Firefox
+# escalates only REPEATED failures - a real broken session bursts
+# through three distinct targets in seconds, while one-off failures
+# spread minutes or hours apart are just the ordinary 'this site is
+# dead from the exit country' noise, which became visible at the
+# EGRESS with 502 after the v9.0 socks5 remote-DNS default).
+_PASS_FAIL_WINDOW = 60        # seconds
+
+# v9.2: the DNS relay's OWN DoH wire target (the engine sees its
+# CONNECT like any client's): its failures are NOT user browsing and
+# NOT a session-health signal - with the v9.1 'the chosen provider
+# ONLY' contract a blocked/unreachable provider fails EVERY relayed
+# DNS query, which must not spam the 'Egress answered HTTP 502' line
+# per query nor feed the pass-health books; ONE calm line per run per
+# target (the hotkey-'h' / --doh choice switches the provider).
+_DOH_TARGET_WARNED = set()
+
+def _is_doh_wire_target(target: str) -> bool:
+    """v9.2: True when host:port is the CURRENT DoH wire endpoint of
+    the DNS relay (doh_wire_targets() - exactly one entry since v9.1;
+    an IPv6 target may come bracketed)."""
+    try:
+        host, port = target.rsplit(":", 1)
+    except ValueError:
+        return False
+    host = host.strip("[]")
+    try:
+        pnum = int(port)
+    except ValueError:
+        return False
+    for h, p, _path, _tag in doh_wire_targets():
+        if host == h and pnum == p:
+            return True
+    return False
+
+def _warn_doh_target_unreachable(target: str):
+    """v9.2: the ONE per-run warning for a failing DoH wire target of
+    the DNS relay (see _is_doh_wire_target); the relayed queries
+    simply return nothing until the provider is reachable again (the
+    client's resolver retries - the relay's own failure semantics)."""
+    if target not in _DOH_TARGET_WARNED:
+        _DOH_TARGET_WARNED.add(target)
+        warn(tr("connect_target_doh_unreachable", target=target))
+
+class _PassMonitor:
+    """v6.6: thread-safe registry of the pass-health signals raised by
+    the builtin engine; the watch loop polls the events every second of
+    its sleep phase and reacts immediately (a rejected pass is
+    refreshed at once instead of waiting for the margin clock)."""
+
+    rejected     = threading.Event()   # the pass was rejected -> refresh NOW
+    session_fail = threading.Event()   # 3+ distinct targets failed -> refresh
+    _lock        = threading.Lock()
+    _open_timeout = {}                 # distinct CONNECT target -> (ts, egress)
+    _bad_gateway  = {}                 # distinct CONNECT target -> (ts, egress)
+    _host_fails   = {}                 # egress host -> consecutive failures
+    _last_refresh = 0.0
+
+    @classmethod
+    def note_pass_rejected(cls, host: str):
+        with cls._lock:
+            cls._host_fails[host] = cls._host_fails.get(host, 0) + 1
+            cls.rejected.set()
+
+    @classmethod
+    def note_target_failure(cls, kind: str, target: str, host: str):
+        with cls._lock:
+            cls._host_fails[host] = cls._host_fails.get(host, 0) + 1
+            book = (cls._open_timeout if kind == "open_timeout"
+                    else cls._bad_gateway)
+            # v9.2 (the user's report): a failure only counts while it
+            # is FRESH. The books used to grow FOREVER - three ONE-OFF
+            # failures of three DIFFERENT targets, however far apart,
+            # spuriously tripped the '3+ distinct targets - the session
+            # looks broken' refresh while the tunnel was serving
+            # successful CONNECTs the whole time (dead/blocked sites
+            # became far more visible after the v9.0 socks5 default:
+            # with remote DNS such destinations now fail AT THE EGRESS
+            # with 502 instead of dying in the local resolver).
+            # Firefox escalates only REPEATED failures - so entries
+            # older than _PASS_FAIL_WINDOW are pruned before counting.
+            now = time.time()
+            for t in [t for t, v in book.items()
+                      if v[0] < now - _PASS_FAIL_WINDOW]:
+                del book[t]
+            book[target] = (now, host)
+            if len(book) >= 3:
+                # THREE DISTINCT targets failed the same way - the
+                # session/tunnel is the common factor (the Go
+                # maxDistinctOpenTimeoutTargets / maxDistinctBadGateway
+                # thresholds of 3). Reset the book so the NEXT session
+                # failure needs three fresh targets again and wake the
+                # watch loop.
+                book.clear()
+                cls.session_fail.set()
+
+    @classmethod
+    def note_success(cls, host: str):
+        with cls._lock:
+            cls._host_fails.pop(host, None)
+            # v9.2 (the user's report): a successful CONNECT through
+            # THIS egress is direct evidence the tunnel/session is
+            # alive - its recorded per-target failures were per-target
+            # issues (dead sites), so they are dropped (Firefox resets
+            # the connection/error history when the connection works
+            # again). The OTHER egresses keep their own entries.
+            for book in (cls._open_timeout, cls._bad_gateway):
+                for t in [t for t, v in book.items() if v[1] == host]:
+                    del book[t]
+
+    @classmethod
+    def host_failures(cls, host: str) -> int:
+        with cls._lock:
+            return cls._host_fails.get(host, 0)
+
+    @classmethod
+    def mark_refresh(cls):
+        with cls._lock:
+            cls._last_refresh = time.time()
+            # v9.2: the pass rotated - the recorded per-target
+            # failures belong to the OLD pass, drop them (a fresh pass
+            # starts from a clean slate; the books refill from FRESH
+            # failures if the new pass is broken too).
+            cls._open_timeout.clear()
+            cls._bad_gateway.clear()
+
+    @classmethod
+    def since_refresh(cls) -> float:
+        with cls._lock:
+            return time.time() - cls._last_refresh
+
+# v6.6 (item 5): the half-close drain window of a relayed tunnel (the Go
+# halfCloseDrainTimeout = 2 minutes) - see the join() logic in
+# BuiltinProxyEngine._handle_client.
+_HALF_CLOSE_DRAIN = 120
+
+def _tcp_keepalive(sock):
+    """v6.6 (item 6): best-effort TCP keepalive with the Go reference
+    pacing (upstreamKeepAliveInterval 10 s / the probe timeout of 5 s ->
+    idle 10 s, retry every 5 s, 3 probes): a silently-dropped NAT or
+    middlebox path is detected by the OS instead of leaving a half-open
+    tunnel until the application timeouts fire. Purely advisory - every
+    option is applied best-effort and every platform keeps working
+    without them (Windows exposes TCP_KEEPIDLE etc. only from recent
+    builds; the plain SO_KEEPALIVE alone is already the useful part)."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        return
+    for opt, val in ((getattr(socket, "TCP_KEEPIDLE", None), 10),
+                     (getattr(socket, "TCP_KEEPINTVL", None), 5),
+                     (getattr(socket, "TCP_KEEPCNT", None), 3)):
+        try:
+            if opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+        except Exception:
+            pass
 
 class TokenHolder:
     """Thread-safe holder of the current proxyPass. The builtin engine reads
@@ -8274,17 +11559,542 @@ def _read_http_head(conn) -> "tuple[str, dict, bytes]":
             headers[k.strip().lower()] = v.strip()
     return first_line, headers, leftover
 
+def _recv_exact(conn, n: int) -> bytes:
+    """v8.0 (A4): read EXACTLY n bytes from a socket - the SOCKS5
+    handshake fields are length-prefixed, so a partial recv would
+    corrupt the whole parse. Returns fewer bytes only on EOF."""
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+def _socks5_reply(conn, rep: int, bind_host: str = "0.0.0.0",
+                 bind_port: int = 0):
+    """v8.0 (A4): send ONE RFC 1928 SOCKS5 reply -
+    VER(05) REP RSV(00) ATYP(01) BND.ADDR BND.PORT - the wire shape
+    every SOCKS5 server answers with (RFC 1928 section 6; the bound
+    address/port fields are cosmetic for a CONNECT-only relay, the
+    client ignores them). REP codes used: 00 succeeded, 01 general
+    SOCKS-server failure, 04 host unreachable, 07 command not
+    supported, 08 address type not supported."""
+    try:
+        conn.sendall(bytes([0x05, rep, 0x00, 0x01])
+                     + socket.inet_aton(bind_host)
+                     + int(bind_port).to_bytes(2, "big"))
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# v8.5 (user request): THE LOCAL DNS RELAY - a plain-DNS endpoint per
+# local proxy (BOTH engines, ON by default). A client sends an ordinary
+# DNS query (UDP, or TCP with the RFC 1035 section 4.2.2 two-byte
+# length framing) to the proxy's DEDICATED DNS port; the relay rides
+# the LOCAL PROXY LISTENER at 127.0.0.1:<proxy port> - the exact wire
+# path every other client of the local proxies rides (the SOCKS5
+# CONNECT with the DOMAIN name for 'socks5' / the absolute HTTP CONNECT
+# for 'http') - so the query leaves through the EGRESS (the REMOTE
+# proxy resolves the DoH provider's hostname - remote DNS) and is
+# answered by the DoH provider over the RFC 8484 wireformat (POST
+# application/dns-message, the same media type for the request and the
+# response; the message is at most 65535 bytes). The DNS message itself
+# is NEVER parsed or rewritten: the client's transaction ID, EDNS
+# options and flags go to the provider VERBATIM and the answer comes
+# back VERBATIM - the relay is a pure byte pipe (the shape of the
+# mature DoH relays: the NextDNS CLI family, github.com/nextdns/nextdns).
+# v8.6 (user request: DPI protection FOR DoH): the TLS handshake of
+# every relayed DoH connection rides the FRAGMENTED ClientHello
+# (tls_split() / _FragTLSConn - the same DPI protection the egress
+# TLS uses), with a fresh-tunnel + plain-handshake fallback on any
+# fragmented failure; the script's OWN DoH bootstrap (the preset
+# resolvers contacted by their well-known resolver IPs) is fragmented
+# the same way - see _doh_query / _raw_https(frag=True).
+# ---------------------------------------------------------------------------
+
+# provider name -> (SNI/Host hostname, port, RFC 8484 wireformat path).
+# The PRESET URLs of DOH_PROVIDERS above serve the script's OWN JSON
+# DoH chain (?name=&type=A); the relay needs the WIREFORMAT endpoints:
+# the de-facto DoH URL shape is https://<host>/dns-query (RFC 8484,
+# documented by all four providers), and Google's JSON API /resolve is
+# NOT a wireformat endpoint - dns.google/dns-query is.
+DOH_WIRE_ENDPOINTS = {
+    "cloudflare": ("cloudflare-dns.com", 443, "/dns-query"),
+    "google":     ("dns.google",         443, "/dns-query"),
+    "nextdns":    ("dns.nextdns.io",     443, "/dns-query"),
+    # v8.8: 5053 -> 443 - Quad9 retired the 5053 JSON service
+    # (5 May 2025) and points DoH clients at port 443; the 443
+    # endpoint was live-checked on 2026-10-31 and answers the
+    # RFC 8484 wireformat POST the relay sends.
+    "quad9":      ("dns.quad9.net",     443, "/dns-query"),
+}
+# v9.1 (the user's request): NO fallback trio anymore - the relay
+# rides EXACTLY the provider the USER chose (the hotkey-'h' / --doh
+# choice, read per query so a hotkey change applies LIVE); the
+# built-in default 'cloudflare' applies when nothing is chosen or
+# the choice is 'off' (the relay speaks DoH by design).
+DNS_RELAY_TIMEOUT = 5      # seconds for the ONE DoH target (TLS + POST + answer)
+DNS_RELAY_BUDGET = 10      # total seconds per query (the single attempt)
+
+def doh_wire_targets() -> "list[tuple[str, int, str, str]]":
+    """v8.5 -> v9.1 (the user's request): the RFC 8484 wireformat
+    target of the DNS relay as [(hostname, port, path, tag)] -
+    EXACTLY ONE entry: the SELECTED DoH provider (the hotkey-'h' /
+    --doh choice, read per query so a hotkey change applies LIVE),
+    or the built-in DEFAULT 'cloudflare' when nothing is chosen /
+    the choice is 'off' (the relay speaks DoH by design and cannot
+    query a system resolver through the egress). A custom
+    --doh-url endpoint stays the USER's choice too (parsed
+    best-effort from its URL, exactly as before); a dead or
+    JSON-only custom endpoint simply fails THAT query - the
+    client's resolver retries, like any plain DNS - the relay
+    NEVER silently answers through a provider the user did not
+    pick."""
+    cur = doh_provider()
+    if cur in DOH_WIRE_ENDPOINTS:
+        h, p, path = DOH_WIRE_ENDPOINTS[cur]
+        return [(h, p, path, cur)]
+    if cur:
+        # a custom endpoint URL (--doh-url -> DOH_PROVIDERS["custom"])
+        url = DOH_PROVIDERS.get(cur,
+                                cur if "://" in cur else "https://" + cur)
+        try:
+            u = urlparse(url)
+            if u.hostname:
+                return [(u.hostname, u.port or 443,
+                         u.path or "/dns-query", "custom")]
+        except Exception:
+            pass
+    # nothing chosen / 'off' / an unparseable custom URL -> the
+    # built-in default (v6.8: the default IS cloudflare)
+    h, p, path = DOH_WIRE_ENDPOINTS["cloudflare"]
+    return [(h, p, path, "cloudflare")]
+
+def _http_decode_chunked(body: bytes, tls) -> bytes:
+    """v8.5 (the DNS relay): decode an HTTP/1.1 chunked response body
+    (the chunked transfer coding of RFC 9110 section 7.1) - the stable
+    size-line/chunk/CRLF loop until the 0-size terminator (the same
+    algorithm Python http.client _read_chunked implements). Raises
+    OSError on a truncated stream so the relayed query fails cleanly
+    (nothing is sent; the client's resolver retries)."""
+    out = b""
+    while True:
+        while b"\r\n" not in body:
+            chunk = tls.recv(65536)
+            if not chunk:
+                raise OSError("doh: truncated chunked body")
+            body += chunk
+        line, _, body = body.partition(b"\r\n")
+        try:
+            size = int(line.split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            raise OSError("doh: bad chunk size line")
+        while len(body) < size + 2:
+            chunk = tls.recv(65536)
+            if not chunk:
+                raise OSError("doh: truncated chunk")
+            body += chunk
+        if size:
+            out += body[:size]
+        body = body[size + 2:]
+        if size == 0:
+            return out
+
+class DnsRelay:
+    """v8.5 -> v9.0 (the user's decision): the local DNS endpoints -
+    ONE per started proxy (shared by BOTH engines - the relay rides
+    the engines' LOCAL listeners at 127.0.0.1, so the engine that
+    serves the proxies automatically carries the DNS endpoints too;
+    with the sing-box engine the relay is a client of the sing-box
+    inbound exactly like any other application). One UDP and one TCP
+    listener PER PROXY on that proxy's deterministic '<location>|dns'
+    port; every query is served by a daemon thread and rides THAT
+    proxy ONLY: local proxy -> egress -> DoH (the doh_wire_targets
+    chain). The DNS message is never parsed.
+    v8.6: every relayed DoH TLS handshake rides the fragmented
+    ClientHello when tls_split() is on (see _doh_via_local).
+    v9.0 (the user's decision, reversing v8.9): NO shared
+    round-robin endpoint anymore - a query entering through the DNS
+    port of proxy X is relayed through THE LOCAL LISTENER OF PROXY X
+    and nothing else, so the answer is always the answer of THAT
+    proxy's exit country (a country that blocks resources BY DNS
+    must not leak its block into another country's endpoint through
+    the rotation back door - the user's exact scenario: switching to
+    another country's proxy and still seeing the old block).
+    v9.1 (the user's request): the DoH TARGET is exactly ONE too -
+    the provider the USER chose (hotkey 'h' / --doh, default
+    cloudflare); NO fallback chain walks on anymore (a dead target
+    fails THAT query - the client's resolver retries, like any
+    plain DNS)."""
+
+    def __init__(self, listen_host: str):
+        self.listen_host = listen_host or "127.0.0.1"
+        self._udp = []          # [(socket, proxy), ...]
+        self._tcp = []          # [(listener, proxy), ...]
+        self._threads = []
+        self._stopping = threading.Event()
+
+    def bind(self, proxies: list) -> int:
+        """Bind ONE UDP + ONE TCP listener on EVERY started proxy's
+        deterministic DNS port (p['dns_port'] - the '<location>|dns'
+        key of the same port_for_location scheme, so it can never
+        collide with the proxy ports) and serve them with daemon
+        threads - the same start/stop shape as the engines' own
+        listeners (a busy port warns and is skipped, the proxy
+        itself keeps running). Returns the number of BOUND
+        endpoints; the ONE summary dns_line is printed by announce()
+        AFTER the engines printed their proxy lines (v8.7: the quiet
+        DNS log - one line, never one per proxy)."""
+        self._stopping.clear()
+        bound = 0
+        for p in proxies:
+            dp = p.get("dns_port")
+            if not dp:
+                continue
+            u = t = None
+            try:
+                u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                u.bind((self.listen_host, dp))
+                t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                t.bind((self.listen_host, dp))
+                t.listen(16)
+            except OSError:
+                warn(tr("dns_port_busy", port=dp,
+                        label=p.get("label", "?")))
+                for s in (u, t):
+                    if s is not None:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                continue
+            p["dns_bound"] = True
+            self._udp.append((u, p))
+            self._tcp.append((t, p))
+            th = threading.Thread(target=self._serve_udp, args=(u, p),
+                                  daemon=True,
+                                  name=f"mozvpn-dns-u{dp}")
+            th.start()
+            self._threads.append(th)
+            th = threading.Thread(target=self._serve_tcp, args=(t, p),
+                                  daemon=True,
+                                  name=f"mozvpn-dns-t{dp}")
+            th.start()
+            self._threads.append(th)
+            bound += 1
+        return bound
+
+    def announce(self, bound: int):
+        """v8.7 -> v9.0: the ONE summary line after the engines' proxy
+        list (never one line per proxy - the user's v8.7 report); the
+        v9.0 line names the COUNT and the per-proxy property (every
+        endpoint rides ITS OWN proxy only) and says WHO needs the
+        endpoints (the user's v8.9 'how do I use it' question: the
+        DNS port of each proxy is shown next to that proxy's line)."""
+        if bound:
+            targets = doh_wire_targets()
+            info(tr("dns_line", listen=self.listen_host, n=bound,
+                    target=targets[0][0]))
+
+    def stop(self):
+        """Close every DNS socket (the daemon serve loops unblock on
+        the close and exit); called from the engines' stop_all."""
+        self._stopping.set()
+        for s, _ in self._udp + self._tcp:
+            try:
+                s.close()
+            except Exception:
+                pass
+        for _, p in self._udp:
+            try:
+                p["dns_bound"] = False
+            except Exception:
+                pass
+        self._udp.clear()
+        self._tcp.clear()
+        self._threads.clear()
+
+    def _serve_udp(self, sock, proxy):
+        while not self._stopping.is_set():
+            try:
+                data, addr = sock.recvfrom(65535)
+            except OSError:
+                break
+            if data:
+                threading.Thread(target=self._answer_udp,
+                                 args=(sock, data, addr, proxy),
+                                 daemon=True).start()
+
+    def _answer_udp(self, sock, query, addr, proxy):
+        """One UDP query -> the chain through THIS endpoint's proxy ->
+        sendto the answer (on total failure NOTHING is sent: the
+        client's resolver retries with the next server / again, like
+        any plain DNS)."""
+        ans = self._relay_query(query, proxy)
+        if ans:
+            try:
+                sock.sendto(ans, addr)
+            except OSError:
+                pass
+
+    def _serve_tcp(self, listener, proxy):
+        while not self._stopping.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                break
+            threading.Thread(target=self._handle_tcp,
+                             args=(conn, proxy),
+                             daemon=True).start()
+
+    def _handle_tcp(self, conn, proxy):
+        """DNS over TCP (the RFC 1035 section 4.2.2 two-byte length
+        framing): possibly SEVERAL pipelined queries per connection,
+        one relayed answer per query - every one through THIS
+        endpoint's proxy."""
+        try:
+            conn.settimeout(30)
+            while not self._stopping.is_set():
+                hdr = _recv_exact(conn, 2)
+                if len(hdr) < 2:
+                    break
+                ln = int.from_bytes(hdr, "big")
+                if not ln or ln > 65535:
+                    break
+                query = _recv_exact(conn, ln)
+                if len(query) < ln:
+                    break
+                ans = self._relay_query(query, proxy)
+                if not ans:
+                    break
+                try:
+                    conn.sendall(len(ans).to_bytes(2, "big") + ans)
+                except OSError:
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _relay_query(self, query: bytes, proxy: dict) -> "bytes | None":
+        """One DNS query -> the ONE user-chosen DoH target through THE
+        ONE PROXY the endpoint belongs to -> the raw answer (or None).
+        The attempt is bounded by DNS_RELAY_TIMEOUT and the
+        DNS_RELAY_BUDGET cap: a stalled DoH endpoint must not hold the
+        client's query thread forever.
+        v9.0 (the user's decision, reversing v8.9): NO rotation over
+        the other proxies anymore - a query that entered through the
+        DNS port of proxy X rides proxy X and NOTHING else, so the
+        answer is always the answer of THAT proxy's exit country (the
+        v8.9 round-robin could answer through any other country and
+        re-import the DNS block the user had just switched away
+        from). A fully dead proxy simply fails its own DNS endpoint
+        (nothing is sent, the client's resolver retries, like any
+        plain DNS).
+        v9.1 (the user's request): NO target-chain walk either - the
+        query goes to EXACTLY the DoH provider the USER chose
+        (hotkey 'h' / --doh, default cloudflare; doh_wire_targets()
+        is read per query, so a hotkey change applies LIVE). A dead
+        or JSON-only custom endpoint fails THAT query instead of
+        silently answering through a provider the user did not pick."""
+        host, port, path, tag = doh_wire_targets()[0]
+        deadline = time.time() + DNS_RELAY_BUDGET
+        try:
+            return self._doh_via_local(proxy, host, port, path,
+                                       query, deadline)
+        except Exception:
+            return None
+
+    def _doh_via_local(self, proxy: dict, host: str, port: int,
+                       path: str, query: bytes, deadline: float) -> bytes:
+        """ONE RFC 8484 POST through the LOCAL PROXY LISTENER:
+        127.0.0.1:<proxy port> - the SOCKS5 CONNECT with the DOMAIN
+        name / the absolute HTTP CONNECT of the served type - then TLS
+        inside the tunnel (SNI = the DoH hostname; the EGRESS resolved
+        that name - remote DNS) and ONE POST application/dns-message;
+        the response body IS the DNS answer message (verbatim).
+        v8.6 (user request: DPI protection FOR DoH): the TLS handshake
+        rides the FRAGMENTED ClientHello (tls_split() / _FragTLSConn -
+        the same segmentation the egress TLS uses) with a fresh-tunnel
+        + plain-handshake fallback on any fragmented failure."""
+        timeout = max(1, min(DNS_RELAY_TIMEOUT,
+                            int(deadline - time.time())))
+
+        def _tunnel() -> socket.socket:
+            """ONE CONNECT tunnel through the local proxy listener -
+            the exact wire path every other client of the local proxies
+            rides (the SOCKS5 domain CONNECT / the absolute HTTP
+            CONNECT of the served type)."""
+            sk = socket.create_connection(("127.0.0.1", proxy["port"]),
+                                          timeout=timeout)
+            sk.settimeout(timeout)
+            if get_proxy_type() == "socks5":
+                # the client side of RFC 1928: method negotiation, then
+                # CONNECT with the DOMAIN name (ATYP=03 - the name goes
+                # to the egress, remote DNS; the same request shape the
+                # engine's own listener parses)
+                sk.sendall(b"\x05\x01\x00")          # NO AUTHENTICATION
+                r = _recv_exact(sk, 2)
+                if len(r) < 2 or r[0] != 0x05 or r[1] != 0x00:
+                    raise OSError("socks5: method negotiation failed")
+                dn = host.encode("latin-1")
+                if not dn or len(dn) > 255:
+                    raise OSError("socks5: bad domain")
+                sk.sendall(b"\x05\x01\x00\x03" + bytes([len(dn)]) + dn
+                           + port.to_bytes(2, "big"))
+                r = _recv_exact(sk, 4)
+                if len(r) < 4 or r[1] != 0x00:
+                    raise OSError("socks5: connect refused")
+                atyp = r[3]
+                if atyp == 0x01:
+                    _recv_exact(sk, 4)
+                elif atyp == 0x03:
+                    nb = _recv_exact(sk, 1)
+                    _recv_exact(sk, nb[0] if nb else 0)
+                elif atyp == 0x04:
+                    _recv_exact(sk, 16)
+                else:
+                    raise OSError("socks5: bad reply ATYP")
+                _recv_exact(sk, 2)
+            else:
+                # the classic absolute HTTP CONNECT (the listener
+                # serves it on the same port when the http type is
+                # selected - the built-in default is socks5 since
+                # v9.0, and _tunnel rides whatever type is served)
+                req = (f"CONNECT {host}:{port} HTTP/1.1\r\n"
+                       f"Host: {host}:{port}\r\n\r\n").encode(
+                           "latin-1", "replace")
+                sk.sendall(req)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = sk.recv(4096)
+                    if not chunk:
+                        raise OSError("http: no CONNECT answer")
+                    resp += chunk
+                m = re.match(rb"HTTP/[\d.]+\s+(\d{3})", resp)
+                if not m or int(m.group(1)) != 200:
+                    raise OSError("http: CONNECT refused")
+            return sk
+
+        s = _tunnel()
+        tls = None
+        try:
+            # v8.6: TLS INSIDE the tunnel (the egress resolved the
+            # name) - with the fragmented ClientHello when tls_split()
+            # is on, so an SNI-matching DPI cannot read the DoH
+            # provider SNI from the first segment of the flow; ANY
+            # fragmented failure falls back to a FRESH tunnel + the
+            # plain handshake (the failed handshake may have
+            # half-consumed the tunnel socket - the v6.1 lesson).
+            if tls_split():
+                try:
+                    tls = _FragTLSConn(s, _ssl_ctx(), host, timeout)
+                except Exception:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    s = _tunnel()
+                    tls = _ssl_ctx().wrap_socket(s, server_hostname=host)
+            else:
+                tls = _ssl_ctx().wrap_socket(s, server_hostname=host)
+            tls.settimeout(timeout)
+            head = (f"POST {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    "Content-Type: application/dns-message\r\n"
+                    "Accept: application/dns-message\r\n"
+                    f"Content-Length: {len(query)}\r\n"
+                    "Connection: close\r\n\r\n").encode("latin-1",
+                                                        "replace")
+            tls.sendall(head + query)
+            # the response: status line + headers, then the body -
+            # Content-Length bounded, or chunked (RFC 9110 section
+            # 7.1), or read to the TLS EOF of the Connection: close
+            # pipe - every branch returns the EXACT answer bytes
+            buf = b""
+            head_end = -1
+            while head_end < 0:
+                chunk = tls.recv(65536)
+                if not chunk:
+                    raise OSError("doh: no answer")
+                buf += chunk
+                head_end = buf.find(b"\r\n\r\n")
+            head_b = buf[:head_end].decode("latin-1", "replace")
+            body = buf[head_end + 4:]
+            status = 0
+            m = re.match(r"HTTP/[\d.]+\s+(\d{3})", head_b)
+            if m:
+                status = int(m.group(1))
+            headers = {}
+            for line in head_b.split("\r\n")[1:]:
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    headers[k.strip().lower()] = v.strip()
+            if "chunked" in headers.get("transfer-encoding", "").lower():
+                body = _http_decode_chunked(body, tls)
+            else:
+                need = -1
+                if "content-length" in headers:
+                    try:
+                        need = int(headers["content-length"])
+                    except ValueError:
+                        need = -1
+                while need < 0 or len(body) < need:
+                    chunk = tls.recv(65536)
+                    if not chunk:
+                        break
+                    body += chunk
+                if need >= 0:
+                    body = body[:need]
+            if status != 200 or not body:
+                raise OSError(f"doh: HTTP {status}")
+            return body
+        finally:
+            for sock in (tls, s):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+
 class BuiltinProxyEngine:
-    """Threaded in-process HTTP proxy: one listening port per location.
+    """Threaded in-process local proxy: one listening port per location.
     Upstream: TLS + HTTP CONNECT with Proxy-Authorization: Bearer <proxyPass>.
-    Also serves plain (non-CONNECT) HTTP requests by forwarding them with the
-    absolute request-URI to the upstream, like proxy.py's HttpProxyHandler."""
+    v8.0 (A4) -> v8.5 -> v9.0: the LOCAL side serves the SELECTED
+    proxy type (settings.proxy_type / --proxy-type / hotkey Ctrl+T) -
+    exactly TWO protocols since v8.5 (the user's request; the v8.0
+    'mixed' single-port auto-detect listener is REMOVED):
+      * 'socks5' - the DEFAULT since v9.0 (was 'http' from v8.5 to
+        v8.9): RFC 1928, CONNECT only, NO AUTHENTICATION REQUIRED,
+        REMOTE DNS (a DOMAIN request address is passed through to
+        the egress - the curl socks5h/socks5a semantics; a plain-
+        'socks5' client that pre-resolves locally and sends the IP
+        (ATYP=01) is served verbatim too - 'socks5h' is a CLIENT-
+        side convention, not a separate wire protocol);
+      * 'http' - the classic HTTP CONNECT
+        listener (also serves plain absolute-URI HTTP requests by
+        forwarding them upstream, like proxy.py's
+        HttpProxyHandler); the CONNECT target hostname goes to the
+        egress - remote DNS;"""
 
     def __init__(self, args, token_holder: TokenHolder):
         self.args = args
         self.token_holder = token_holder
         # --listen: bind address of the local listeners (127.0.0.1 or 0.0.0.0)
         self.listen_host = getattr(args, "listen", "127.0.0.1") or "127.0.0.1"
+        # v8.0 (A4): the type the listeners SERVE (resolved from
+        # --proxy-type / the saved settings.proxy_type at build time)
+        self.proxy_type = get_proxy_type()
+        # v8.5: the per-proxy local DNS endpoints - the relay rides the
+        # listeners below (127.0.0.1), so it starts/stops with them
+        self.dns = DnsRelay(self.listen_host)
         self.proxies = []       # [{port, label, host, upstreamPort, protocol, ...}]
         self._sockets = []
         self._threads = []
@@ -8302,6 +12112,13 @@ class BuiltinProxyEngine:
             key = (f"{srv['countryCode']}|{srv.get('cityCode') or ''}"
                    f"|{srv.get('serverIndex') or 0}")
             port = port_for_location(key, used)
+            # v9.0 (the user's decision, reversing v8.9): the
+            # per-proxy DNS endpoint is BACK - the SAME deterministic
+            # port_for_location scheme, key '<location>|dns' (it can
+            # never collide with the proxy ports or another DNS
+            # port): every proxy again owns a DEDICATED DNS port whose
+            # queries ride THAT proxy ONLY (never another one)
+            dns_port = port_for_location(key + "|dns", used)
             label = f"{srv['countryName']}/{srv['cityName']}"
             proxies.append({"port": port,
                             "country": srv["countryName"],
@@ -8311,6 +12128,7 @@ class BuiltinProxyEngine:
                             "host": srv["protocolHost"],
                             "upstreamPort": srv["protocolPort"],
                             "protocol": srv["protocol"],
+                            "dns_port": dns_port,
                             "label": label})
             if max_p and len(proxies) >= max_p:
                 return proxies
@@ -8336,18 +12154,34 @@ class BuiltinProxyEngine:
             t.start()
             self._threads.append(t)
             started.append(p)
+        # v9.0: bind the PER-PROXY DNS endpoints BEFORE the proxy
+        # lines are printed - each proxy_line shows the DNS port of
+        # ITS proxy when that endpoint actually bound (the v8.9 'the
+        # port must be visible' rule applied to the per-proxy scheme),
+        # and the ONE summary line is announced AFTER the list (v8.7:
+        # the quiet DNS log - one line, never one per proxy). The
+        # endpoints relay a plain DNS query through THEIR OWN proxy
+        # only -> the egress/DoH (the same lifecycle as the listeners
+        # themselves; --no-dns-relay skips them, the proxies and
+        # their socks5h remote DNS are NOT affected).
+        dns_bound = 0
+        if getattr(self.args, "dns_relay", True) and started:
+            dns_bound = self.dns.bind(started)
         for p in started:
             # v5.13: the electric-plug emoji is replaced with the NATIONAL
             # FLAG of the proxy's country (REC/unknown keep the plug)
             info(tr("proxy_line", port=p["port"], label=p["label"].ljust(_proxy_label_width(self.proxies)),
                     host=p["host"], uport=p["upstreamPort"], proto=p["protocol"],
                     listen=self.listen_host,
+                    dns=(f" DNS:{p['dns_port']}" if p.get("dns_bound") else ""),
                     _e=country_flag(p.get("countryCode"))))
+        if dns_bound:
+            self.dns.announce(dns_bound)
         if not started:
             raise MozVpnError(tr("no_free_ports"))
         # Same log shape as the sing-box engine (only the engine name differs)
         ok(tr("engine_started", engine=tr("engine_builtin"), n=len(started),
-              listen=self.listen_host))
+              listen=self.listen_host, ptype=get_proxy_type()))
 
     def _serve_listener(self, listener, proxy):
         while not self._stopping.is_set():
@@ -8359,12 +12193,231 @@ class BuiltinProxyEngine:
                                  daemon=True)
             t.start()
 
+    def _handle_client(self, conn, proxy):
+        """v8.0 (A4) -> v8.5: the PROTOCOL DISPATCHER of the local
+        listener. 'socks5' serves every connection as SOCKS5; 'http'
+        goes straight to the classic HTTP path (no extra syscall). The
+        v8.0 'mixed' MSG_PEEK auto-detect branch is REMOVED in v8.5 -
+        only the two classic protocols remain (the user's request)."""
+        ptype = get_proxy_type()
+        if ptype == "socks5":
+            self._handle_client_socks(conn, proxy)
+            return
+        self._handle_client_http(conn, proxy)
+
     def _open_upstream(self, proxy) -> "ssl.SSLSocket":
         """TCP + TLS to the Mozilla/Fastly egress (same profile matrix as the
         probe, so the probe result predicts what the engine can do)."""
         return _tls_connect(proxy["host"], proxy["upstreamPort"], timeout=20)
 
-    def _handle_client(self, conn, proxy):
+    def _handle_client_socks(self, conn, proxy):
+        """v8.0 (A4): ONE client connection over SOCKS5 (RFC 1928, the
+        CONNECT command only - the same scope as the mature analogs'
+        SOCKS5 listeners). REMOTE DNS BY DESIGN: an ATYP=03 DOMAIN
+        request address is passed THROUGH to the egress (the curl
+        socks5h/socks5a semantics - the EGRESS resolves the name, the
+        local system resolver is bypassed entirely). The upstream ride
+        is IDENTICAL to the HTTP CONNECT path: the same TLS profile
+        matrix (_open_upstream), the same Bearer pass, the same
+        response classification (400/401/403 -> _PassMonitor, the watch
+        loop refreshes the pass at once), the same early-data forward
+        and the same half-close drain window."""
+        try:
+            conn.settimeout(60)
+            # ---- method negotiation (RFC 1928 section 3) ----
+            hdr = _recv_exact(conn, 2)
+            if len(hdr) < 2 or hdr[0] != 0x05:
+                conn.close()
+                return
+            nmethods = hdr[1]
+            if nmethods < 1 or nmethods > 16:
+                conn.close()
+                return
+            methods = _recv_exact(conn, nmethods)
+            if 0x00 not in methods:
+                # NO ACCEPTABLE METHODS: the script rides the pass at
+                # the UPSTREAM; the LOCAL listener stays no-auth by
+                # design, like every standard local proxy.
+                try:
+                    conn.sendall(b"\x05\xff")
+                except OSError:
+                    pass
+                conn.close()
+                return
+            try:
+                conn.sendall(b"\x05\x00")   # NO AUTHENTICATION REQUIRED
+            except OSError:
+                conn.close()
+                return
+            # ---- request: VER CMD RSV ATYP DST.ADDR DST.PORT ----
+            r = _recv_exact(conn, 4)
+            if len(r) < 4 or r[0] != 0x05 or r[2] != 0x00:
+                _socks5_reply(conn, 0x01)
+                conn.close()
+                return
+            if r[1] != 0x01:
+                # BIND / UDP ASSOCIATE are not served: the Mozilla
+                # egress itself is a TCP CONNECT tunnel.
+                _socks5_reply(conn, 0x07)   # command not supported
+                conn.close()
+                return
+            atyp = r[3]
+            target = ""
+            if atyp == 0x01:
+                addr_b = _recv_exact(conn, 4)
+                if len(addr_b) < 4:
+                    conn.close()
+                    return
+                target = socket.inet_ntoa(addr_b)
+            elif atyp == 0x03:
+                ln_b = _recv_exact(conn, 1)
+                if not ln_b:
+                    conn.close()
+                    return
+                domain = _recv_exact(conn, ln_b[0]).decode("latin-1",
+                                                           "replace")
+                target = domain          # REMOTE DNS: the name goes to the egress
+            elif atyp == 0x04:
+                addr_b = _recv_exact(conn, 16)
+                if len(addr_b) < 16:
+                    conn.close()
+                    return
+                target = socket.inet_ntop(socket.AF_INET6, addr_b)
+            else:
+                _socks5_reply(conn, 0x08)   # address type not supported
+                conn.close()
+                return
+            port_b = _recv_exact(conn, 2)
+            if len(port_b) < 2 or not target:
+                _socks5_reply(conn, 0x01)
+                conn.close()
+                return
+            dst_port = int.from_bytes(port_b, "big")
+            host_part = f"[{target}]" if ":" in target else target
+            target_full = f"{host_part}:{dst_port}"
+            token = self.token_holder.get()
+            if not token:
+                _socks5_reply(conn, 0x01)
+                conn.close()
+                return
+            try:
+                upstream = self._open_upstream(proxy)
+            except Exception:
+                # the egress is down / unreachable
+                _socks5_reply(conn, 0x04)
+                conn.close()
+                return
+            # v6.6 (item 6): TCP keepalive on BOTH sockets of the tunnel
+            _tcp_keepalive(conn)
+            _tcp_keepalive(upstream)
+            try:
+                req = (f"CONNECT {target_full} HTTP/1.1\r\n"
+                       f"Host: {target_full}\r\n"
+                       f"Proxy-Authorization: Bearer {token}\r\n"
+                       "Proxy-Connection: keep-alive\r\n\r\n")
+                upstream.sendall(req.encode())
+                resp = b""
+                try:
+                    while b"\r\n\r\n" not in resp:
+                        chunk = upstream.recv(4096)
+                        if not chunk:
+                            break
+                        resp += chunk
+                except socket.timeout:
+                    # the CONNECT never got an answer from the egress -
+                    # the SAME classification as the HTTP path (the Go
+                    # reference client counts these PER DISTINCT TARGET).
+                    if _is_doh_wire_target(target_full):
+                        # v9.2: the DNS relay's OWN DoH target - ONE
+                        # calm line per run, NOT a session signal (see
+                        # _is_doh_wire_target).
+                        _warn_doh_target_unreachable(target_full)
+                    else:
+                        warn(tr("connect_target_open_timeout",
+                                target=_redact_target(target_full)))
+                        _PassMonitor.note_target_failure(
+                            "open_timeout", target_full, proxy["host"])
+                    _socks5_reply(conn, 0x01)
+                    conn.close()
+                    upstream.close()
+                    return
+                # v6.6 (item 3): parse the CONNECT response status -
+                # 400 ('parsing JWT failed') / 401 / 403 mean THE PASS
+                # WAS REJECTED (the watch loop refreshes it at once).
+                m = re.match(rb"HTTP/[\d.]+\s+(\d{3})", resp)
+                code_num = int(m.group(1)) if m else 0
+                if code_num in (400, 401, 403):
+                    warn(tr("connect_rejected", code=code_num,
+                            target=_redact_target(target_full)))
+                    _PassMonitor.note_pass_rejected(proxy["host"])
+                    _socks5_reply(conn, 0x01)
+                    conn.close()
+                    upstream.close()
+                    return
+                if code_num in (502, 504):
+                    if _is_doh_wire_target(target_full):
+                        # v9.2: the DNS relay's OWN DoH target - ONE
+                        # calm line per run, NOT a session signal (see
+                        # _is_doh_wire_target); the PASS-REJECTION
+                        # classes above stay counted for it.
+                        _warn_doh_target_unreachable(target_full)
+                    else:
+                        warn(tr("connect_target_bad_gateway",
+                                code=code_num,
+                                target=_redact_target(target_full)))
+                        _PassMonitor.note_target_failure(
+                            "bad_gateway", target_full, proxy["host"])
+                    _socks5_reply(conn, 0x04)
+                    conn.close()
+                    upstream.close()
+                    return
+                if code_num != 200:
+                    _socks5_reply(conn, 0x01)
+                    conn.close()
+                    upstream.close()
+                    return
+                _PassMonitor.note_success(proxy["host"])
+                _socks5_reply(conn, 0x00)      # succeeded
+                # v6.7 (audit fix): the status read above may have
+                # pulled the FIRST TUNNEL BYTES past the response head
+                # (an eager server / early data) - hand them to the
+                # client BEFORE the relays start, no tunnel byte lost.
+                _head, _sep, _early = resp.partition(b"\r\n\r\n")
+                if _early:
+                    conn.sendall(_early)
+                t1 = threading.Thread(target=_relay, args=(conn, upstream),
+                                      daemon=True)
+                t2 = threading.Thread(target=_relay, args=(upstream, conn),
+                                      daemon=True)
+                t1.start(); t2.start()
+                # the SAME half-close drain semantics as the HTTP path
+                # (the v6.6/v6.7 audit contract: the FIRST direction is
+                # waited for UNBOUNDED, only the second gets the window).
+                t1.join()
+                t2.join(_HALF_CLOSE_DRAIN)
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                t1.join(1)
+                t2.join(1)
+            finally:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except OSError:
+            pass
+
+    def _handle_client_http(self, conn, proxy):
         """One client connection: parse the request, connect to the upstream,
         sign with the current Bearer token, then blind-relay the tunnel."""
         try:
@@ -8392,6 +12445,12 @@ class BuiltinProxyEngine:
                              + tr("builtin_connect_failed", err=e).encode())
                 conn.close()
                 return
+            # v6.6 (item 6): TCP keepalive on BOTH sockets of the tunnel
+            # (the Go pacing: idle 10 s, retry every 5 s, 3 probes) - a
+            # silently-dropped NAT/middlebox path is detected by the OS
+            # instead of leaving a half-open tunnel. Best-effort.
+            _tcp_keepalive(conn)
+            _tcp_keepalive(upstream)
             try:
                 if method.upper() == "CONNECT":
                     # CONNECT host:port -> sign with Bearer -> relay blindly
@@ -8401,27 +12460,122 @@ class BuiltinProxyEngine:
                            "Proxy-Connection: keep-alive\r\n\r\n")
                     upstream.sendall(req.encode())
                     resp = b""
-                    while b"\r\n\r\n" not in resp:
-                        chunk = upstream.recv(4096)
-                        if not chunk:
-                            break
-                        resp += chunk
-                    status_line = resp.split(b"\r\n", 1)[0]
-                    if b" 200" not in status_line:
-                        # Upstream refused (e.g. token expired mid-connection):
-                        # fail the client; it will retry with a fresh token.
+                    try:
+                        while b"\r\n\r\n" not in resp:
+                            chunk = upstream.recv(4096)
+                            if not chunk:
+                                break
+                            resp += chunk
+                    except socket.timeout:
+                        # v6.6 (item 4a): the CONNECT never got an answer
+                        # from the egress (the tunnel-open timeout) - the
+                        # Go reference client counts these PER DISTINCT
+                        # TARGET: one timeout fails only THIS client
+                        # connection; only THREE DISTINCT targets mean
+                        # the session is broken (see _PassMonitor). The
+                        # target is REDACTED unless --verbose (the Go
+                        # logTarget redaction: a CONNECT destination is
+                        # the user's browsing).
+                        if _is_doh_wire_target(target):
+                            # v9.2: the DNS relay's OWN DoH target - ONE
+                            # calm line per run, NOT a session signal
+                            # (see _is_doh_wire_target).
+                            _warn_doh_target_unreachable(target)
+                        else:
+                            warn(tr("connect_target_open_timeout",
+                                    target=_redact_target(target)))
+                            _PassMonitor.note_target_failure(
+                                "open_timeout", target, proxy["host"])
+                        conn.sendall(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+                        conn.close()
+                        upstream.close()
+                        return
+                    # v6.6 (item 3): parse the CONNECT response status -
+                    # 400 ('parsing JWT failed') / 401 / 403 mean THE PASS
+                    # WAS REJECTED (the watch loop refreshes it at once);
+                    # 502/504 are TARGET failures; only a real 200 relays.
+                    m = re.match(rb"HTTP/[\d.]+\s+(\d{3})", resp)
+                    code_num = int(m.group(1)) if m else 0
+                    if code_num in (400, 401, 403):
+                        warn(tr("connect_rejected", code=code_num,
+                                target=_redact_target(target)))
+                        _PassMonitor.note_pass_rejected(proxy["host"])
                         conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                         conn.close()
                         upstream.close()
                         return
+                    if code_num in (502, 504):
+                        if _is_doh_wire_target(target):
+                            # v9.2: the DNS relay's OWN DoH target - ONE
+                            # calm line per run, NOT a session signal (see
+                            # _is_doh_wire_target); the PASS-REJECTION
+                            # classes above stay counted for it.
+                            _warn_doh_target_unreachable(target)
+                        else:
+                            warn(tr("connect_target_bad_gateway",
+                                    code=code_num,
+                                    target=_redact_target(target)))
+                            _PassMonitor.note_target_failure(
+                                "bad_gateway", target, proxy["host"])
+                        conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                        conn.close()
+                        upstream.close()
+                        return
+                    if code_num != 200:
+                        # Upstream refused (an unclassified status, e.g. a
+                        # momentarily rate-limited egress): fail the client;
+                        # it will retry with a fresh token (the preserved
+                        # pre-v6.6 behavior).
+                        conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                        conn.close()
+                        upstream.close()
+                        return
+                    _PassMonitor.note_success(proxy["host"])
                     conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    # v6.7 (audit fix): the status read above reads with
+                    # recv(4096) until the blank line, so the SAME read may
+                    # have pulled the FIRST TUNNEL BYTES past the response
+                    # head (an eager server / early data). Hand them to
+                    # the client BEFORE the relays start - no tunnel byte
+                    # is ever lost.
+                    _head, _sep, _early = resp.partition(b"\r\n\r\n")
+                    if _early:
+                        conn.sendall(_early)
                     # Any bytes the client sent past its head go to the tunnel
                     if leftover:
                         upstream.sendall(leftover)
                     t1 = threading.Thread(target=_relay, args=(conn, upstream), daemon=True)
                     t2 = threading.Thread(target=_relay, args=(upstream, conn), daemon=True)
                     t1.start(); t2.start()
-                    t1.join(); t2.join()
+                    # v6.6 (item 5) + the v6.7 audit fix: THE HALF-CLOSE
+                    # DRAIN WINDOW (the Go halfCloseDrainTimeout = 2
+                    # minutes). The v6.6 code bounded BOTH joins - and
+                    # that closed a HEALTHY tunnel (a long download whose
+                    # client side stays silent) after 2-4 minutes: the
+                    # worst kind of regression (the v6.1 lesson). The
+                    # audited semantics: the FIRST relay direction is
+                    # waited for UNBOUNDED (the tunnel's real lifetime,
+                    # the pre-v6.6 behavior - and a dead peer can no
+                    # longer pin the thread: the v6.6 TCP keepalive reaps
+                    # it at the OS level); only the SECOND direction,
+                    # after the half-close, gets the bounded window -
+                    # the peer may legitimately keep sending for a while
+                    # (a download finishing), but a direction that NEVER
+                    # ends must not pin the sockets forever: after the
+                    # window BOTH sockets are closed, the relay threads
+                    # unblock and the connection is reaped.
+                    t1.join()
+                    t2.join(_HALF_CLOSE_DRAIN)
+                    try:
+                        upstream.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    t1.join(1)
+                    t2.join(1)
                 else:
                     # Plain HTTP proxying: forward the absolute-URI request,
                     # no keep-alive to the upstream (the token rotates ~10 min).
@@ -8451,8 +12605,18 @@ class BuiltinProxyEngine:
         ok(tr("token_updated_builtin"))
 
     def check_running(self):
-        """Restart dead listeners (defensive; threads are daemon and robust)."""
-        alive_ports = {s.getsockname()[1] for s in self._sockets}
+        """Restart dead listeners (defensive; threads are daemon and robust).
+        v9.3: the port of every listener is read BEST-EFFORT - a socket
+        that already died (getsockname raises OSError) must not crash
+        this DEFENSIVE method itself: the crash surfaced in the watch
+        loop as an 'Unexpected error' retry instead of restarting the
+        one dead listener the method exists to heal."""
+        alive_ports = set()
+        for s in list(self._sockets):
+            try:
+                alive_ports.add(s.getsockname()[1])
+            except OSError:
+                pass
         for p in self.proxies:
             if p["port"] not in alive_ports and not self._stopping.is_set():
                 warn(f"Listener on {p['port']} died - restarting")
@@ -8471,6 +12635,8 @@ class BuiltinProxyEngine:
 
     def stop_all(self):
         self._stopping.set()
+        # v8.5: the DNS endpoints close with the listeners
+        self.dns.stop()
         for s in self._sockets:
             try:
                 s.close()
@@ -8484,16 +12650,36 @@ class BuiltinProxyEngine:
 # mozvpn.py reference implementation (kept for users who prefer sing-box).
 # ---------------------------------------------------------------------------
 
+def singbox_inbound_of(proxy_type: str) -> str:
+    """v8.0 (A4) -> v8.5: map the script's local proxy TYPE to the
+    OFFICIAL sing-box inbound type: http -> 'http', socks5 -> 'socks'.
+    The v8.0 'mixed' mapping is REMOVED in v8.5 (only the two classic
+    protocols remain); both are first-class sing-box inbounds, and
+    'socks' carries remote DNS by design in sing-box."""
+    v = str(proxy_type or "").strip().lower()
+    if v == "socks5":
+        return "socks"
+    return "http"           # http (and unknown values; the script's
+                            # own built-in default is socks5 since v9.0,
+                            # so an unknown value never reaches here -
+                            # set_proxy_type normalizes it first)
+
 def singbox_config(local_port: int, upstream_host: str, upstream_port: int,
-                   token: str, listen_host: str = "127.0.0.1") -> dict:
-    """sing-box config: http inbound on <listen_host>:<local_port> ->
+                   token: str, listen_host: str = "127.0.0.1",
+                   inbound: str = "http") -> dict:
+    """sing-box config: <inbound> on <listen_host>:<local_port> ->
     http outbound to the Mozilla egress with Proxy-Authorization
     (fields server/server_port/headers/tls of the official sing-box
-    http outbound, sing-box.sagernet.org/configuration/outbound/http/)."""
+    http outbound, sing-box.sagernet.org/configuration/outbound/http/).
+    v8.0 (A4) -> v8.5 -> v9.0: the inbound TYPE follows the selected
+    local proxy type (singbox_inbound_of) - 'http' (the classic
+    CONNECT listener; the built-in default is socks5 since v9.0) or
+    'socks' (RFC 1928 with remote DNS); the v8.0 'mixed'
+    mapping is REMOVED in v8.5."""
     return {
         "log": {"disabled": True},
         "inbounds": [
-            {"type": "http", "tag": "http-in",
+            {"type": inbound, "tag": "http-in",
              "listen": listen_host, "listen_port": local_port}
         ],
         "outbounds": [
@@ -8513,6 +12699,13 @@ class SingBoxEngine:
         self.token_holder = token_holder
         # --listen: bind address written into every sing-box inbound config
         self.listen_host = getattr(args, "listen", "127.0.0.1") or "127.0.0.1"
+        # v8.0 (A4): the local type the inbounds SERVE ('socks' /
+        # 'http' via singbox_inbound_of at build time)
+        self.proxy_type = get_proxy_type()
+        # v8.5: the per-proxy local DNS endpoints - the relay is
+        # ENGINE-AGNOSTIC: it connects to 127.0.0.1:<inbound port>
+        # exactly like any other client of the sing-box proxies
+        self.dns = DnsRelay(self.listen_host)
         self.procs = {}      # port -> (Popen, config_path, label)
         self.proxies = []    # [{port, label, host, upstreamPort, path, ...}]
         # v6.0 (req. 4): the sing-box configs are PERSISTED in config.json
@@ -8562,9 +12755,18 @@ class SingBoxEngine:
             key = (f"{srv['countryCode']}|{srv.get('cityCode') or ''}"
                    f"|{srv.get('serverIndex') or 0}")
             port = port_for_location(key, used)
+            # v9.0 (the user's decision, reversing v8.9): the
+            # per-proxy DNS endpoint is BACK - the SAME deterministic
+            # port_for_location scheme, key '<location>|dns' (it can
+            # never collide with the proxy ports or another DNS
+            # port): every proxy again owns a DEDICATED DNS port whose
+            # queries ride THAT proxy's inbound ONLY (never another
+            # one)
+            dns_port = port_for_location(key + "|dns", used)
             label = f"{srv['countryName']}/{srv['cityName']}"
             cfg = singbox_config(port, srv["protocolHost"], srv["protocolPort"],
-                                 token, self.listen_host)
+                                 token, self.listen_host,
+                                 inbound=singbox_inbound_of(get_proxy_type()))
             fname = (f"moz-{srv['countryCode']}-"
                      f"{srv.get('cityCode') or port}-{port}"
                      f"-{srv.get('serverIndex') or 0}.json")
@@ -8575,6 +12777,7 @@ class SingBoxEngine:
                             "host": srv["protocolHost"],
                             "upstreamPort": srv["protocolPort"],
                             "protocol": srv["protocol"],
+                            "dns_port": dns_port,
                             "path": path, "label": label})
             if max_p and len(proxies) >= max_p:
                 break
@@ -8607,16 +12810,33 @@ class SingBoxEngine:
                                     stderr=subprocess.DEVNULL)
             self.procs[p["port"]] = (proc, p["path"], p["label"])
             started.append(p)
+        # v9.0: bind the PER-PROXY DNS endpoints BEFORE the proxy
+        # lines are printed (each proxy_line shows the DNS port of
+        # ITS proxy when that endpoint actually bound - the v8.9 'the
+        # port must be visible' rule applied to the per-proxy scheme;
+        # the ONE summary line is announced after the list, v8.7: the
+        # quiet DNS log). Every endpoint is a client of ITS OWN
+        # sing-box inbound exactly like any other application and
+        # rides that proxy ONLY (never another one); --no-dns-relay
+        # skips them, the proxies and their socks5h remote DNS are
+        # NOT affected.
+        dns_bound = 0
+        if getattr(self.args, "dns_relay", True) and started:
+            dns_bound = self.dns.bind(started)
+        for p in started:
             # v5.13: the electric-plug emoji is replaced with the NATIONAL
             # FLAG of the proxy's country (REC/unknown keep the plug)
             info(tr("proxy_line", port=p["port"], label=p["label"].ljust(_proxy_label_width(self.proxies)),
                     host=p["host"], uport=p["upstreamPort"], proto=p["protocol"],
                     listen=self.listen_host,
+                    dns=(f" DNS:{p['dns_port']}" if p.get("dns_bound") else ""),
                     _e=country_flag(p.get("countryCode"))))
+        if dns_bound:
+            self.dns.announce(dns_bound)
         if not started:
             raise MozVpnError(tr("no_free_ports"))
         ok(tr("engine_started", engine=tr("engine_singbox"), n=len(started),
-              listen=self.listen_host))
+              listen=self.listen_host, ptype=get_proxy_type()))
 
     def update_token(self, token: str):
         """Rewrite all configs with the new token and restart sing-box."""
@@ -8637,11 +12857,14 @@ class SingBoxEngine:
                                          self._fname_of(p))
         for p in self.proxies:
             cfg = singbox_config(p["port"], p["host"], p["upstreamPort"], token,
-                              self.listen_host)
+                              self.listen_host,
+                              inbound=singbox_inbound_of(get_proxy_type()))
             p["path"] = self._write_config(self._fname_of(p), cfg)
         self.start_all()
 
     def stop_all(self):
+        # v8.5: the DNS endpoints close with the processes
+        self.dns.stop()
         for port, (proc, path, label) in list(self.procs.items()):
             try:
                 proc.terminate()
@@ -8686,6 +12909,23 @@ def ensure_session(args, creds, totp_provider, interactive=True,
         raise MozVpnError(tr("session_token_hex"))
     if session_token:
         return session_token.lower()
+
+    # v8.0 (A3): the PASSWORDLESS profile session (--fxa-profile PATH,
+    # a LAUNCH PARAMETER ONLY by the user's explicit request): the
+    # sessionToken read from the DESKTOP FIREFOX PROFILE
+    # (signedInUser.json -> accountData.sessionToken) wins over the
+    # CACHED account session - an explicit launch parameter is a
+    # deliberate choice of the run - and is RE-READ FRESH on every
+    # call: after a Guardian 401 re-login the user may have re-signed
+    # Firefox, and the new session is picked up automatically (no
+    # password login, no 2FA prompt, no Fastly bot wall on third-party
+    # password logins). A failed read falls through to the normal
+    # chain (the cached session / the password login), so a moved or
+    # locked profile can never brick the run.
+    if getattr(args, "fxa_profile", None):
+        tok = read_fxa_profile_session_token(args.fxa_profile)
+        if tok:
+            return tok
 
     # v6.0: the cached session token lives in the CURRENT account entry
     # of config.json (the old separate session.json file is gone - the
@@ -8970,7 +13210,7 @@ def run_manager(args, creds, totp_provider):
     # token may still be valid; a full 30 s retry delay would eat into
     # the refresh margin of the NEXT attempt).
     token_exp = None
-    copy_mode = None        # None | "local" | "remote" | "doh" | "files" (v5.1)
+    copy_mode = None        # None | "multi" | "local" | "remote" | "doh" | "lang" | "files" | "ptype" (v5.1)
     select_buf = ""        # v5.1: the typed selection token (confirmed by Enter)
     select_items = []      # v5.1: [{"token": ..., ...}] of the active list
     select_pad = 0         # v5.12.1: length of the in-place 'w' selection line
@@ -9036,12 +13276,35 @@ def run_manager(args, creds, totp_provider):
 
             token, until, ghdrs = obtain_proxy_pass(session_token)
             token_holder.set(token)
-            exp = jwt_exp(token)
+            # v6.6 (item 1): ANCHOR-AT-RECEIPT (Firefox
+            # GuardianTypes.ProxyPass: 'Anchor the pass to our clock at
+            # receipt: it is valid from now for the token's lifetime.
+            # This makes rotation scheduling immune to any drift between
+            # Guardian's clock (nbf/exp) and ours'). The pass is valid
+            # from NOW for (exp - nbf) seconds of OUR clock - not until
+            # the absolute exp of Guardian's clock, which a skewed local
+            # clock misreads in BOTH directions (a slow clock 'extends'
+            # the pass into real expiry - the 'proxy stopped working for
+            # a while' window; a fast clock can even see a fresh pass as
+            # already expired). The rotation lead stays --refresh-margin
+            # (default 120 s = Firefox's 'Rotate 2 Minutes from the End
+            # Time').
+            _receipt = int(time.time())
+            exp = anchored_exp(token, _receipt)
             token_exp = exp
+            _PassMonitor.mark_refresh()
             exp_str = time.strftime("%H:%M:%S", time.gmtime(exp)) if exp else "?"
-            # req. 9: a human-readable expiry instead of "None"
-            ok(tr("proxypass_received",
-                  until=format_until(until, token), exp=exp_str))
+            # req. 9: a human-readable expiry instead of "None".
+            # v8.1 (req. 3): the whole per-refresh block - the
+            # proxyPass line, the quota, the raw + decoded JWT, the
+            # next-refresh countdown, the hotkeys hint, the files list
+            # and the clear targets - is no longer APPENDED to the log
+            # on every refresh; it is collected into `panel` and
+            # REDRAWN IN PLACE at the tail of this iteration
+            # (_panel_render): one refresh costs zero new log rows.
+            panel = [("ok", tr("proxypass_received",
+                               until=format_until(until, token),
+                               exp=exp_str))]
             # v5.27 (fix 2): the sign-in SUCCEEDED - cache this account
             # (login/password/TOTP/session) in accounts.json. Silent
             # when the entry is unchanged (every token refresh calls it).
@@ -9073,12 +13336,84 @@ def run_manager(args, creds, totp_provider):
                 total = len(verified_servers)
                 ok(tr("serverlist_done", countries=len(locations), servers=total))
 
-            print_quota(ghdrs)
+            print_quota(ghdrs, panel=panel)
+            # v8.0 (A2): the ACCOUNT AUTO-ROTATION TRIGGER. The current
+            # account just reported a DRY allowance (_QUOTA_LAST['zero'],
+            # set by print_quota above - remaining <= 0, not unlimited)
+            # and the rotation is enabled: switch the WHOLE profile to
+            # the other cached account with the MOST data left
+            # (pick_rotation_account) and let the NEXT iteration sign
+            # in on ITS cached session - never a password login (an
+            # account without a cached session token is not a
+            # candidate, so the rotation can never trigger the FxA 429
+            # login rate limit; the foxyvpn-pool lesson). The switch is
+            # the EXACT sequence of the hotkey-'a' selection, so every
+            # piece of profile state - args/creds, the TOTP provider,
+            # the current-account pointer, the runtime settings and the
+            # engine - moves together.
+            if _QUOTA_LAST["zero"] and auto_rotate_enabled():
+                rot_em, rot_left = pick_rotation_account(
+                    cfg_current_email() or "")
+                if rot_em:
+                    rot_acc = cfg_accounts().get(rot_em) or {}
+                    info(tr("auto_rotate_to", email=rot_em,
+                            left=(human_bytes(rot_left)
+                                  if rot_left is not None else "?")))
+                    args.email = rot_em
+                    args.password = rot_acc.get("password")
+                    st = (rot_acc.get("session_token") or "").strip()
+                    args.session_token = (st if st and all(
+                        ch in "0123456789abcdefABCDEF"
+                        for ch in st) else None)
+                    args.totp_secret = ((rot_acc.get("totp_secret")
+                                         or "").strip() or None)
+                    args.qr = None
+                    args.totp = None
+                    creds.clear()
+                    creds.update({kk: rot_acc.get(kk)
+                                  for kk in _CRED_KEYS})
+                    creds["email"] = rot_em
+                    totp_secret = args.totp_secret
+                    totp_provider = make_totp_provider(args, creds)
+                    session_token = args.session_token
+                    if args.session_token:
+                        save_cache(rot_em, args.session_token)
+                    cfg_set_current(rot_em)
+                    apply_profile_runtime(args)
+                    # the engine of the DRY profile is stopped - the
+                    # next iteration rebuilds it from the NEW profile's
+                    # filter and sing-box configs; the live relays
+                    # drain on their own (daemon threads, the OS reaps
+                    # the sockets when the peers hang up)
+                    if engine:
+                        engine.stop_all()
+                    engine = None
+                    _ROTATE_WARNED["none"] = False
+                    continue
+                elif not _ROTATE_WARNED["none"]:
+                    # every OTHER cached account is dry or has no cached
+                    # session: say it ONCE (not once per refresh) and
+                    # keep serving the current account as long as it
+                    # answers - the egress may still accept the pass.
+                    _ROTATE_WARNED["none"] = True
+                    warn(tr("auto_rotate_none",
+                            email=(cfg_current_email()
+                                   or args.email or "")))
+            elif (_QUOTA_LAST["zero"] and not _ROTATE_WARNED["off"]):
+                # the allowance is dry and the rotation is OFF: say it
+                # ONCE with the hotkey hint, then stay quiet.
+                _ROTATE_WARNED["off"] = True
+                warn(tr("auto_rotate_off_zero"))
+            # The TOTP code line stays a real LOG line: a code is
+            # perishable (30 s), while the panel is redrawn once per
+            # REFRESH - a panel row would show a dead code most of
+            # the time. Everything else below is static per refresh
+            # and belongs to the redrawn panel.
             print_current_totp(totp_secret, creds)
-            print()
-            info(tr("proxypass_jwt"))
-            print(token)
-            print_jwt_decoded(token)
+            panel.append((None, ""))
+            panel.append(("info", tr("proxypass_jwt")))
+            panel.append((None, token))
+            print_jwt_decoded(token, panel=panel)
 
             json_out = save_result(args, token, until, session_token,
                                    args.email or creds.get("email"),
@@ -9100,6 +13435,12 @@ def run_manager(args, creds, totp_provider):
                     # --foxyproxy-legacy-export (with the paired --*-out
                     # paths) run ONCE right after the proxies started.
                     maybe_foxyproxy_export(args, engine)
+                    # v8.2 (user request): the PAC file is NO longer
+                    # auto-created on a rebuild - maybe_pac_export
+                    # writes it ONLY for an explicit --pac-export FILE
+                    # (or a bare --pac-export opt-in); the default copy
+                    # is refreshed by the Ctrl+P hotkey.
+                    maybe_pac_export(args, engine)
                     # Test commands: ready-to-paste curl lines for EVERY local
                     # proxy and for EVERY upstream (remote) proxy. The local
                     # command goes through the local listener (no Bearer
@@ -9144,30 +13485,44 @@ def run_manager(args, creds, totp_provider):
                 sleep_s = exp - args.refresh_margin - int(time.time())
             if sleep_s < 5:
                 sleep_s = 5
-            info(tr("next_refresh", sec=sleep_s,
+            panel.append(("info", tr("next_refresh", sec=sleep_s,
                     at=time.strftime("%H:%M:%S", time.gmtime(time.time() + sleep_s)))
-                 + " " + tr("confirm_exit_hint"))
+                 + " " + tr("confirm_exit_hint")))
             # Sleep in short steps to react to Ctrl+C and hotkeys quickly.
             # Single-keypress hotkeys mirror the CLI flags:
             #   r = fresh re-login, c = --clear-cache + restart,
             #   e = toggle --local-proxy-engine + restart proxies, q = stop.
             # v4.5: every hotkey on its OWN line, the key on its color
             # block, the description in the dedicated hotdesc color.
-            print_hotkeys_hint()
+            print_hotkeys_hint(panel=panel)
             files = config_open_files()
             if files:
-                info(tr("hotkey_files_hint"))
+                panel.append(("info", tr("hotkey_files_hint")))
                 for i, p in enumerate(files):
-                    hint(tr("hotkey_file_entry", n=selection_token(i), path=p))
+                    panel.append(("hint", tr("hotkey_file_entry",
+                                             n=selection_token(i), path=p)))
                 if len(files) > 9:
                     # v5.1: more than 9 files -> tokens + Enter (see the
                     # selection sub-mode in the key handler below)
-                    hint(tr("select_hint"))
+                    panel.append(("hint", tr("select_hint")))
             # What the 'c' hotkey / --clear-cache will remove (req: log it)
-            print_clear_targets()
+            print_clear_targets(panel=panel)
+            # v8.1 (req. 3): (re)paint the LIVE PANEL - the previous
+            # refresh's block is erased in place and the current one
+            # printed at the same spot, so the log gains ZERO rows per
+            # refresh. A real log line emitted while the panel is on
+            # screen lifts it, prints above and drops it back; a non-tty
+            # run (or a window too short for the block) falls back to
+            # the classic append inside _panel_render.
+            _panel_render(panel)
             _hotkey_mode(True)
             slept = 0
             while slept < sleep_s and not _STOP:
+                # v6.6 (items 3/4): a pass-health signal of the builtin
+                # engine (a REJECTED pass / a session-level failure) ends
+                # the sleep AT ONCE (handled right below the loop).
+                if _PassMonitor.rejected.is_set() or _PassMonitor.session_fail.is_set():
+                    break
                 # --confirm-exit: a Ctrl+C was issued but not confirmed within 5s
                 if _CONFIRMISSUED and isinstance(_CONFIRMISSUED, float):
                     if time.time() - _CONFIRMISSUED > 5:
@@ -9324,6 +13679,33 @@ def run_manager(args, creds, totp_provider):
                                     set_language(item["lang"])
                                     save_lang_cache(item["lang"])
                                     ok(tr("lang_set", lang=item["lang"]))
+                            elif copy_mode == "ptype":
+                                # v8.4: apply the proxy-type choice from
+                                # the Ctrl+T menu - the exact v8.0 cycle
+                                # apply sequence: set + save, then stop
+                                # the engine so the next watch-loop
+                                # iteration rebuilds the listeners (both
+                                # engines read get_proxy_type() at build
+                                # time; the PAC file follows the v8.2
+                                # rebuild rules). Choosing the CURRENT
+                                # type is an explicit no-op: just the
+                                # selected line, no needless rebuild.
+                                new_type = item["ptype"]
+                                if new_type == get_proxy_type():
+                                    info(tr("proxy_type_selected",
+                                            type=new_type))
+                                else:
+                                    set_proxy_type(new_type)
+                                    save_str_setting("proxy_type",
+                                                     new_type)
+                                    info(tr("proxy_type_switched",
+                                            type=new_type))
+                                    if engine:
+                                        engine.stop_all()
+                                    engine = None
+                                    # the shared cleanup + break below
+                                    # leaves the sleep phase; the loop
+                                    # rebuilds with the new type
                             elif copy_mode == "files":
                                 open_in_system_editor(item["path"])
                         else:
@@ -9449,6 +13831,9 @@ def run_manager(args, creds, totp_provider):
                                 interactive=not args.no_input):
                             args.local_proxy_engine = "builtin"
                             warn(tr("singbox_engine_still_missing"))
+                    # v6.9: the final engine choice is SAVED
+                    # (settings.engine) and survives restarts.
+                    save_str_setting("engine", args.local_proxy_engine)
                     info(tr("hotkey_engine",
                             engine=tr("engine_singbox")
                             if args.local_proxy_engine == "singbox"
@@ -9867,16 +14252,25 @@ def run_manager(args, creds, totp_provider):
                     token_now = token_holder.get()
                     if token_now:
                         info(tr("hotkey_jwt"))
+                        # v8.1 (req. 3): the raw token row goes through
+                        # the panel lift/drop pair, so the long wrapped
+                        # row lands ABOVE the panel (like every log
+                        # line) instead of overwriting its rows.
+                        _panel_lift()
                         print(token_now)
+                        _panel_drop()
                         copy_to_clipboard(token_now)
                     else:
                         info(tr("hotkey_jwt_none"))
                 elif k == "m":
                     # v4.4 (req. 2): switch the color theme dark <-> light
                     # (mirrors --theme); v4.5: the WHOLE log is redrawn in
-                    # the new theme (every remembered line re-rendered)
+                    # the new theme (every remembered line re-rendered);
+                    # v6.9: the choice is SAVED (settings.theme) and
+                    # survives restarts.
                     new_theme = "light" if _THEME == "dark" else "dark"
                     set_theme(new_theme)
+                    save_str_setting("theme", new_theme)
                     redraw_log()
                     info(tr("hotkey_theme", theme=new_theme))
                 elif k == "h":
@@ -9889,6 +14283,12 @@ def run_manager(args, creds, totp_provider):
                     # (cloudflare); the CURRENT resolver is marked [x];
                     # the applied choice is PERSISTED to doh.json and
                     # survives restarts.
+                    # v9.1: the SAME choice is the DoH target of the
+                    # per-proxy DNS endpoints - EXACTLY ONE provider,
+                    # NO fallback chain (default cloudflare); the
+                    # relay reads doh_wire_targets() per query, so
+                    # the change applies LIVE (no restart, no engine
+                    # rebuild).
                     copy_mode = "doh"
                     select_buf = ""
                     select_items = [{"token": "0", "default": True}]
@@ -9920,8 +14320,11 @@ def run_manager(args, creds, totp_provider):
                                     url="") + mark)
                 elif k == "k":
                     # v5.1 (req. 4): toggle the DoH answer cache on/off
-                    # (mirrors --doh-cache); the cache is DISABLED by default.
+                    # (mirrors --doh-cache); the cache is DISABLED by
+                    # default. v6.9: the choice is SAVED
+                    # (settings.doh_cache) and survives restarts.
                     set_doh_cache(not doh_cache_enabled())
+                    save_bool_setting("doh_cache", doh_cache_enabled())
                     state = tr("color_state_on" if doh_cache_enabled()
                                else "color_state_off")
                     info(tr("hotkey_doh_cache", state=state))
@@ -9929,6 +14332,24 @@ def run_manager(args, creds, totp_provider):
                         info(tr("doh_cache_state_on", ttl=DOH_TTL))
                     else:
                         info(tr("doh_cache_state_off"))
+                elif k == "i":
+                    # v6.6 (req. 12): toggle the TLS ClientHello
+                    # fragmentation (mirrors --tls-split; 'i' is the one
+                    # free letter of the hotkey set). ON by default
+                    # since v6.7 (the user's defaults-on directive) and
+                    # SAFE by construction: any fragmented-handshake
+                    # failure falls back to the plain profile matrix,
+                    # so the v6.1 lesson (a transport 'hardening' must
+                    # never surprise the working data path) holds even
+                    # with the feature enabled. Applies to the NEW
+                    # outer-TLS connections of the probes and the
+                    # builtin engine. v6.9: the choice is SAVED
+                    # (settings.tls_split) and survives restarts.
+                    set_tls_split(not tls_split())
+                    save_bool_setting("tls_split", tls_split())
+                    state = tr("color_state_on" if tls_split()
+                               else "color_state_off")
+                    info(tr("hotkey_tls_split", state=state))
                 elif k == "n":
                     # v4.4 (req. 3): toggle the colored log output on/off
                     # (mirrors --no-color); v4.5: the WHOLE log is redrawn
@@ -9946,8 +14367,11 @@ def run_manager(args, creds, totp_provider):
                     # value") and killed the handler after set_color()
                     # had already flipped the mode (the outer retry loop
                     # reported it as 'Unexpected error').
+                    # v6.9: the color choice is SAVED (settings.color)
+                    # and survives restarts.
                     global _BG_CURRENT
                     set_color(not _USE_COLOR)
+                    save_bool_setting("color", _USE_COLOR)
                     if _USE_COLOR:
                         _force_terminal_bg(_THEME)
                     elif _BG_CURRENT is not None:
@@ -9980,23 +14404,26 @@ def run_manager(args, creds, totp_provider):
                     else:
                         info(tr("foxyproxy_no_proxies"))
                 elif k and k.isdigit() and k != "0":
-                    # 1-9: open the config file in the system default
-                    # editor. v5.34 (user request): the digits now open
-                    # the file DIRECTLY again - the selection tokens of
-                    # the first nine files ARE the single digits 1-9, so
-                    # a digit press is always UNAMBIGUOUS and needs no
-                    # Enter confirmation. (v5.1-v5.33 switched the digits
-                    # into the token sub-mode whenever the list exceeded
-                    # 9 files - which the v5.32/v5.33 settings files made
-                    # the common case - and the number hotkeys stopped
-                    # opening anything directly, exactly the reported
-                    # 'files in the list but no hotkeys to open them'.)
-                    # Files BEYOND the ninth are opened with the NEW 'z'
-                    # hotkey (the full token menu, see below).
+                    # v8.2 (user request): since v6.0 the editable config
+                    # is ONE file (config.json), so only '1' opens
+                    # anything - the hint used to promise '1-9' and the
+                    # digits 2-9 failed SILENTLY. The mechanism stays
+                    # DYNAMIC (config_open_files() decides the list -
+                    # more files would light their digits up again), and
+                    # an out-of-range digit now SAYS so via hotkey_no_file
+                    # instead of doing nothing. History: v5.34 made the
+                    # digits open the file DIRECTLY - the selection token
+                    # of the first file IS '1', no Enter needed (v5.1-
+                    # v5.33 switched the digits into the token sub-mode
+                    # whenever the list exceeded 9 files). Files beyond
+                    # the list are opened with the 'z' hotkey (the full
+                    # token menu, see below).
                     files = config_open_files()
                     idx = int(k) - 1
                     if 0 <= idx < len(files):
                         open_in_system_editor(files[idx])
+                    else:
+                        info(tr("hotkey_no_file", k=k, n=int(k)))
                 elif k == "z":
                     # v5.34 (user request): the FULL config-file selection
                     # menu - the analog of the other hotkey menus (tokens
@@ -10055,6 +14482,69 @@ def run_manager(args, creds, totp_provider):
                     _hotkey_mode(False)
                     clean_old_config_format(verbose=True)
                     _hotkey_mode(True)
+                elif k == "\x12":
+                    # v8.0 (A2): Ctrl+R (the single control char 0x12 in
+                    # cbreak mode) - toggle the ACCOUNT AUTO-ROTATION by
+                    # quota on/off. The choice is SAVED at once
+                    # (settings.auto_rotate, the v6.9 sticky-settings
+                    # pattern) and mirrors --auto-rotate /
+                    # --no-auto-rotate; the run keeps going - the flag
+                    # only GATES the rotation trigger of the watch loop.
+                    new_state = not auto_rotate_enabled()
+                    set_auto_rotate(new_state)
+                    save_bool_setting("auto_rotate", new_state)
+                    info(tr("auto_rotate_switched",
+                            state=(tr("auto_rotate_on") if new_state
+                                   else tr("auto_rotate_off"))))
+                elif k == "\x14":
+                    # v8.4 (user request): Ctrl+T (the single control char
+                    # 0x14) now opens the LOCAL PROXY TYPE SELECTION MENU -
+                    # the SAME generic token sub-mode the 'h' DoH / 'y'
+                    # language / 'z' files menus ride (type the number,
+                    # Enter applies, Backspace deletes, any other key
+                    # cancels, the menu exits automatically after applying)
+                    # - instead of the v8.0 blind cycle. v8.5: the menu
+                    # rides _PROXY_TYPES, so it lists EXACTLY the two
+                    # http / socks5 options (the 'mixed' single-port
+                    # listener is REMOVED). Every option carries its
+                    # short description and
+                    # the RUNNING type is marked [x]; the apply branch in
+                    # the generic selection handler runs the exact v8.0
+                    # cycle sequence (set + save settings.proxy_type +
+                    # stop the engine so the next watch-loop iteration
+                    # rebuilds the listeners; BOTH engines read
+                    # get_proxy_type() at build time); mirrors
+                    # --proxy-type. The PAC file follows on the rebuild
+                    # only for an explicit --pac-export FILE (the default
+                    # copy is on demand via Ctrl+P).
+                    copy_mode = "ptype"
+                    select_buf = ""
+                    select_items = []
+                    for i, t in enumerate(_PROXY_TYPES):
+                        select_items.append({"token": selection_token(i),
+                                             "ptype": t})
+                    info(tr("ptype_menu_hint", cur=get_proxy_type()))
+                    hint(tr("select_hint"))
+                    for it in select_items:
+                        mark = (" [x]" if it["ptype"] == get_proxy_type()
+                                else "")
+                        hint(tr("ptype_menu_entry", n=it["token"],
+                                name=it["ptype"],
+                                desc=tr("ptype_desc_" + it["ptype"]))
+                             + mark)
+                elif k == "\x10":
+                    # v8.0 (B3): Ctrl+P (the single control char 0x10) -
+                    # rewrite the PAC file with the CURRENTLY RUNNING
+                    # listeners on demand, e.g. after a 'w' filter
+                    # change. v8.2: this hotkey is now the ONLY writer
+                    # of the DEFAULT copy (a rebuild touches just an
+                    # explicit --pac-export FILE). Mirrors --pac-export.
+                    _hotkey_mode(False)
+                    if engine and getattr(engine, "proxies", None):
+                        maybe_pac_export(args, engine, on_demand=True)
+                    else:
+                        info(tr("pac_no_proxies"))
+                    _hotkey_mode(True)
                 elif k == "q":
                     info(tr("hotkey_stop"))
                     _STOP = True
@@ -10068,6 +14558,41 @@ def run_manager(args, creds, totp_provider):
             _hotkey_mode(False)
             if _STOP:
                 break
+            # v6.6 (items 3/4/13): THE LIVE PASS-HEALTH SIGNALS of the
+            # builtin engine broke the sleep above - react IMMEDIATELY
+            # (Firefox reacts to a non-2xx CONNECT of the egress the
+            # moment it observes it: IPPNetworkErrorObserver ->
+            # 'proxy-http-error'), with the rotation floors applied
+            # (minRotationInterval 1 s + the 500 ms retryAfter pacing -
+            # never a tight refresh loop).
+            if _PassMonitor.rejected.is_set() or _PassMonitor.session_fail.is_set():
+                _ev_reject = _PassMonitor.rejected.is_set()
+                _PassMonitor.rejected.clear()
+                _PassMonitor.session_fail.clear()
+                if _ev_reject:
+                    warn(tr("pass_rejected_refresh"))
+                else:
+                    warn(tr("session_fail_refresh"))
+                _floor = 1.0 - _PassMonitor.since_refresh()
+                if _floor > 0:
+                    time.sleep(_floor + 0.5)
+                # v6.6 (item 13): THE PERSISTENTLY-BROKEN SELECTION -
+                # when a saved countries filter leaves the engine serving
+                # proxies whose egresses ALL keep failing (5+ consecutive
+                # failures on EVERY served host), clear the saved choice:
+                # the next rebuild serves ALL proxies (the same 'never
+                # zero usable proxies' fallback the probe phase has); the
+                # user can re-apply the selection with 'w' once the
+                # egresses recover.
+                if (engine is not None and getattr(engine, "proxies", None)
+                        and load_countries_filter()
+                        and all(_PassMonitor.host_failures(p["host"]) >= 5
+                                for p in engine.proxies)):
+                    warn(tr("filter_cleared_broken"))
+                    clear_countries_filter()
+                    engine.stop_all()
+                    engine = None
+                continue
 
         except MozVpnError as e:
             # v5.26 (POSIX terminal safety): the exception may have fired
@@ -10080,11 +14605,28 @@ def run_manager(args, creds, totp_provider):
             err(str(e))
             # Language-independent classification via MozVpnError.code
             code = getattr(e, "code", "")
-            if code == "blocked":
+            if code == "blocked_login":
+                # v6.6 (item 8): the FxA LOGIN rate limit (HTTP 429 /
+                # errno 114): a 15-minute cooldown, and the retry prefers
+                # the CACHED session token (ensure_session reuses it
+                # automatically - a rate-limited password login never
+                # keeps re-prompting). The Guardian-side blocks keep the
+                # old generic 'blocked' wait below.
+                info(tr("fxa_429_cooldown"))
+                _sleep_interruptible(900)
+            elif code == "blocked":
                 info(tr("blocked_wait"))
                 _sleep_interruptible(600)
             elif code == "relogin":
                 info(tr("relogin_needed"))
+                # v8.0 (A3): with --fxa-profile the re-login RE-READS
+                # the Firefox profile session file first (ensure_session
+                # does this on every call) - so when the browser session
+                # itself expired (the OAuth errno 110 path), the user
+                # must sign into Firefox again BEFORE the retry can
+                # succeed; the hint says exactly that.
+                if getattr(args, "fxa_profile", None) and "110" in str(e):
+                    info(tr("fxa_profile_session_invalid"))
                 # v4.4: say explicitly that the login/password/TOTP prompt
                 # will appear again - with a live countdown (--retry-delay)
                 info(tr("retry_wait"))
@@ -10731,9 +15273,11 @@ def reinstall_singbox(interactive=True) -> bool:
 def _truthy_env(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
-def _env_flag(name: str, default: bool) -> bool:
+def _env_flag(name: str, default: "bool | None") -> "bool | None":
     """Env-aware boolean default (v4.7.2): unset/empty env -> the given
     default; a set env is checked with the truthy words 1/true/yes/on.
+    v6.9: default=None means 'not chosen' (the sticky-settings
+    resolution then falls through to the SAVED config.json choice).
     Used for the now-DEFAULT-ON flags: MOZVPN_LOCAL_PROXY=0 disables the
     local proxies, MOZVPN_NO_SAVE=0 re-enables saving the result JSON."""
     v = os.environ.get(name)
@@ -10757,16 +15301,24 @@ def print_config_files():
             status = tr("config_file_missing")
         hint(tr("config_file_entry", path=path, status=status))
 
-def print_clear_targets():
+def print_clear_targets(panel: list = None):
     """req: log exactly which files/directories the 'c' hotkey and the
     --clear-cache flag remove. v6.0 (req. 4): the wipe RESETS the single
     uber-config config.json (keeping the account store) and removes every
     leftover of the OLD config format - there are no other persisted
-    files anymore."""
-    info(tr("clear_will_remove_header"))
+    files anymore. v8.1 (req. 3): with `panel` given the rows go to the
+    live-panel line list (the block is re-shown by every refresh and
+    belongs to the redrawn UI); the --clear-cache one-shot path keeps
+    the classic log lines."""
+    def _row(level, msg):
+        if panel is None:
+            _emit(level, msg)
+        else:
+            panel.append((level, msg))
+    _row("info", tr("clear_will_remove_header"))
     if os.path.exists(CONFIG_FILE):
-        hint(tr("clear_will_remove_entry", path=CONFIG_FILE))
-    hint(tr("clear_will_remove_legacy", path=LEGACY_CONF_DIR))
+        _row("hint", tr("clear_will_remove_entry", path=CONFIG_FILE))
+    _row("hint", tr("clear_will_remove_legacy", path=LEGACY_CONF_DIR))
 
 def config_open_files() -> list:
     """Ordered list of the config files that can be opened with the number
@@ -10868,10 +15420,11 @@ def main():
                          "Env: MOZVPN_LOCAL_PROXY=0/1")
     ap.add_argument("--local-proxy-engine", dest="local_proxy_engine",
                     choices=["builtin", "singbox"],
-                    default=os.environ.get("MOZVPN_PROXY_ENGINE", "builtin").strip().lower() or "builtin",
+                    default=None,
                     help="Local proxy engine: builtin (default, in-process threads, no "
                          "external dependencies, Nuitka/exe-friendly) or singbox "
-                         "(external binary). Env: MOZVPN_PROXY_ENGINE")
+                         "(external binary). v6.9: the last choice is saved and "
+                         "survives restarts. Env: MOZVPN_PROXY_ENGINE")
     ap.add_argument("--listen", metavar="HOST", default="127.0.0.1",
                     help="Bind address of the local proxy listeners "
                          "(default 127.0.0.1, loopback only; use 0.0.0.0 to "
@@ -10914,18 +15467,45 @@ def main():
                          "you to a US PoP). Presets: cloudflare (default), "
                          "google, nextdns, quad9; 'off' = the system DNS. "
                          "v5.31: default = the SAVED hotkey-'h' choice when "
-                         "present, else env, else 'cloudflare'. Env: "
+                         "present, else env, else 'cloudflare'. v9.1: the "
+                         "local DNS endpoints relay the CLIENTS' DNS "
+                         "through the proxies to this provider's RFC "
+                         "8484 wireformat endpoint ONLY (NO fallback "
+                         "chain anymore: nothing chosen / 'off' -> the "
+                         "built-in default cloudflare; a dead target "
+                         "fails THAT query, the client's resolver "
+                         "retries). v8.6: the preset resolvers "
+                         "are contacted by their well-known IPs directly "
+                         "(the resolver hostname is never resolved with "
+                         "the system resolver) and every DoH TLS "
+                         "handshake rides the fragmented ClientHello "
+                         "(--tls-split). Env: "
                          "MOZVPN_DOH")
     ap.add_argument("--doh-url", metavar="URL", default=None,
                     help="Custom DoH endpoint (RFC 8484 JSON API, "
-                         "?name=&type=A) - overrides the --doh preset")
-    # v5.1 (req. 4): the DoH answer cache is DISABLED by default and is
-    # strictly opt-in (--doh-cache / hotkey 'k' / env MOZVPN_DOH_CACHE=1).
+                         "?name=&type=A) - overrides the --doh preset; "
+                         "v9.1: the ONLY (best-effort parsed) "
+                         "RFC 8484 wireformat target of the local DNS "
+                         "endpoints - a JSON-only custom endpoint fails "
+                         "the relayed query instead of falling back to "
+                         "another provider; v8.6: a custom endpoint keeps "
+                         "the "
+                         "urlopen transport for the script's OWN "
+                         "resolution (its IP is unknowable without a "
+                         "name resolution) - the RELAYED DoH handshakes "
+                         "to it are still fragmented (--tls-split)")
+    # v5.1 (req. 4) -> v6.9: the DoH answer cache is DISABLED by
+    # default and is opt-in (--doh-cache / hotkey 'k' / env
+    # MOZVPN_DOH_CACHE=1); since v6.9 the choice is SAVED
+    # (settings.doh_cache) and survives restarts. The argparse
+    # default is None ('not chosen'), so the SAVED choice applies
+    # and an explicit flag always wins.
     ap.add_argument("--doh-cache", action=argparse.BooleanOptionalAction,
-                    default=_env_flag("MOZVPN_DOH_CACHE", False),
+                    default=None,
                     help="Cache DoH answers for %d seconds (v5.1; DISABLED "
                          "by default: without the flag every lookup queries "
-                         "the DoH chain directly). Env: MOZVPN_DOH_CACHE" %
+                         "the DoH chain directly). v6.9: the last choice is "
+                         "saved and survives restarts. Env: MOZVPN_DOH_CACHE" %
                          DOH_TTL)
     # v5.29 (security, user request): STRICT DoH - NO automatic fallback
     # from the DoH chain to the system (non-DoH) resolver. The fallback
@@ -10941,6 +15521,26 @@ def main():
                          "behavior; the system DNS is always available "
                          "explicitly via --doh off. Env: "
                          "MOZVPN_SYSTEM_DNS_FALLBACK")
+    # v8.5 -> v9.0: the PER-PROXY local DNS endpoints (the OS-resolver
+    # door: plain DNS on every proxy's deterministic '<location>|dns'
+    # port -> DoH through THAT proxy only - never another one). ON by
+    # default; '--no-dns-relay' does not bind them at all (the proxies
+    # and their socks5h remote DNS are NOT affected).
+    ap.add_argument("--dns-relay",
+                    action=argparse.BooleanOptionalAction,
+                    default=_env_flag("MOZVPN_DNS_RELAY", True),
+                    help="v8.5 -> v9.0: the PER-PROXY local DNS "
+                         "endpoints - plain DNS (UDP+TCP) on every "
+                         "proxy's deterministic port, relayed as DoH "
+                         "through THAT proxy only (never another "
+                         "one, so a country's DNS blocks follow the "
+                         "proxy you actually ride); point the SYSTEM "
+                         "resolver / any plain-DNS app at the DNS "
+                         "port shown next to the proxy you use. "
+                         "--no-dns-relay does not bind the endpoints "
+                         "at all (proxy clients with remote DNS / "
+                         "socks5h do not need them either way). Env: "
+                         "MOZVPN_DNS_RELAY")
     ap.add_argument("--probe-geo", choices=["warn", "drop", "off"],
                     default="warn",
                     help="Exit-country check of every probed upstream "
@@ -11112,14 +15712,16 @@ def main():
                          "hotkey-'y' choice when present, else env, else "
                          "'en'). Env: MOZVPN_LANG")
     ap.add_argument("--no-color", action="store_true",
-                    default=_truthy_env("MOZVPN_NO_COLOR"),
-                    help="Disable colored log output. Env: MOZVPN_NO_COLOR")
+                    default=None,
+                    help="Disable colored log output. v6.9: the color choice "
+                         "(hotkey 'n') is saved and survives restarts. "
+                         "Env: MOZVPN_NO_COLOR")
     ap.add_argument("--theme", choices=["dark", "light"],
-                    default=(os.environ.get("MOZVPN_THEME", "dark")
-                             .strip().lower() or "dark"),
+                    default=None,
                     help="Color theme for the colored log: dark (default, "
                          "near-black background) or light (white background). "
-                         "Env: MOZVPN_THEME")
+                         "v6.9: the theme choice (hotkey 'm') is saved and "
+                         "survives restarts. Env: MOZVPN_THEME")
     ap.add_argument("--flag-style", dest="flag_style",
                     choices=["auto", "emoji", "art"],
                     default=(os.environ.get("MOZVPN_FLAG_STYLE",
@@ -11144,6 +15746,110 @@ def main():
                     help="Seconds to wait before the automatic sign-in retry "
                          "after a failed attempt, shown with a live countdown "
                          "(default 30). Env: MOZVPN_RETRY_DELAY")
+    # v6.6: the pass-health / transport knobs of this version. v6.7:
+    # --tls-split is ON by default (the user's directive - a useful
+    # option ships enabled; it cannot break the data path, every
+    # fragmented-handshake failure falls back to plain TLS); --verbose
+    # stays opt-in BY DESIGN (it de-redacts the user's browsing
+    # destinations; both references keep it off) and --api-proxy needs
+    # a URL, so those two have no default.
+    ap.add_argument("--api-proxy", metavar="URL",
+                    default=os.environ.get("MOZVPN_API_PROXY") or None,
+                    help="Route the CONTROL-plane requests (FxA, Guardian, "
+                         "Remote Settings, the Fastly challenge) through a "
+                         "fixed HTTP(S) proxy - http://host:port or "
+                         "https://host:port (the Go reference client's "
+                         "-api-proxy: the Fastly WAF cookie and the Guardian "
+                         "enrollment are bound to the egress IP, so the "
+                         "control plane keeps ONE stable exit while the "
+                         "proxied browsing traffic rotates freely). socks5:// "
+                         "is NOT supported (the stdlib ProxyHandler tunnels "
+                         "http/https via CONNECT; this script adds no new "
+                         "dependency). Default: off. Env: MOZVPN_API_PROXY")
+    ap.add_argument("--tls-split", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Send the TLS ClientHello of the outer connection "
+                         "in SMALL TCP segments (64-byte pieces, the first "
+                         "one delayed 30 ms) so a single-packet DPI cannot "
+                         "read the whole SNI from the first segment. ON by "
+                         "default (v6.7: a useful option ships enabled; "
+                         "--no-tls-split or MOZVPN_TLS_SPLIT=0 restores "
+                         "the plain single-segment ClientHello); hotkey 'i' "
+                         "toggles it live; any fragmented-handshake failure "
+                         "falls back to the plain TLS profile matrix, so "
+                         "the data path never breaks; v6.9: the choice is "
+                         "saved and survives restarts. Env: MOZVPN_TLS_SPLIT")
+    ap.add_argument("--verbose", action=argparse.BooleanOptionalAction,
+                    default=_env_flag("MOZVPN_VERBOSE", False),
+                    help="Reveal the CONNECT targets in the engine failure "
+                         "logs - by default they are REDACTED like the Go "
+                         "reference client's logTarget ('<redacted; use "
+                         "--verbose>'), because the destination of a client "
+                         "request is the user's browsing. Env: MOZVPN_VERBOSE")
+    ap.add_argument("--fxa-profile", dest="fxa_profile", metavar="PATH",
+                    default=None,
+                    help="v8.0: sign in WITHOUT a password - read the FxA "
+                         "sessionToken from a DESKTOP FIREFOX PROFILE "
+                         "(signedInUser.json -> accountData.sessionToken; "
+                         "PATH may be the file itself or the profile "
+                         "DIRECTORY) and mint the OAuth token from it via "
+                         "the same grant_type=fxa-credentials flow: no "
+                         "password login, no 2FA prompt, no Fastly bot "
+                         "wall on third-party password logins. The file "
+                         "is re-read on every session use, so re-signing "
+                         "Firefox heals the run automatically. An explicit "
+                         "--session-token still wins. LAUNCH PARAMETER "
+                         "ONLY (no hotkey, per design)")
+    ap.add_argument("--proxy-type", dest="proxy_type",
+                    choices=["http", "socks5"], default=None,
+                    help="v8.0 -> v9.0: the LOCAL proxy listener type - "
+                         "exactly TWO protocols: socks5 (the DEFAULT "
+                         "since v9.0 - RFC 1928 CONNECT-only with "
+                         "REMOTE DNS: the domain names go to the "
+                         "egress, the curl socks5h/socks5a semantics; "
+                         "'socks5h' is NOT a separate wire protocol - "
+                         "it is the CLIENT sending the domain instead "
+                         "of a pre-resolved IP, and this listener "
+                         "accepts BOTH shapes, so a plain-'socks5' "
+                         "client works too) or http (the v8.5-v8.9 "
+                         "default - the classic HTTP CONNECT listener; "
+                         "the CONNECT hostname goes to the egress, "
+                         "remote DNS). The v8.0 'mixed' single-port "
+                         "auto-detect listener is REMOVED; a SAVED "
+                         "old 'mixed' choice falls back to the "
+                         "default. Hotkey Ctrl+T opens the choice "
+                         "menu live; the choice is saved and "
+                         "survives restarts; the sing-box engine maps "
+                         "it to its http/socks inbound")
+    ap.add_argument("--auto-rotate", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="v8.0: auto-rotation of cached ACCOUNTS by quota - "
+                         "when the current account's allowance is "
+                         "exhausted, the profile switches to the cached "
+                         "account with the most data left (cached "
+                         "sessions only, NEVER a password login, so the "
+                         "FxA 429 login rate limit can never trigger). ON "
+                         "by DEFAULT (a useful option ships enabled); "
+                         "--no-auto-rotate disables. Hotkey Ctrl+R "
+                         "toggles it live; the choice is saved")
+    ap.add_argument("--pac-export", dest="pac_export", metavar="FILE",
+                    nargs="?", const="", default=None,
+                    help="v8.2: write the PAC file (local sites "
+                         "DIRECT, everything else through the local "
+                         "listeners with a fail-over chain) to FILE on "
+                         "every engine rebuild. Without FILE: opt back "
+                         "into the automatic default copy at <config "
+                         "dir>/mozvpn.pac on every rebuild. Otherwise "
+                         "the default copy is written on demand by "
+                         "the Ctrl+P hotkey ONLY (nothing is created "
+                         "at startup)")
+    ap.add_argument("--doctor", action="store_true",
+                    help="v8.0: run the ONE-SHOT READ-ONLY diagnostics of "
+                         "the whole chain (interpreter, config store, "
+                         "dependencies, system DNS, DoH, FxA API, the "
+                         "server list, a REAL TLS handshake to a live "
+                         "egress, and the OAuth -> Guardian -> quota "
+                         "chain on the CACHED session only) and exit")
     ap.add_argument("--reinstall-deps", action="store_true",
                     help="Reinstall ALL Python dependencies from scratch "
                          "(pip --force-reinstall --no-cache-dir) and exit")
@@ -11200,8 +15906,40 @@ def main():
         set_language(load_lang_cache()
                      or (os.environ.get("MOZVPN_LANG", "en").strip().lower()
                          or "en"))
+    # v6.9 (the user's request 2): STICKY COLOR/THEME. The precedence
+    # is now the doh/lang one - an EXPLICIT --no-color/--theme wins,
+    # then the SAVED hotkey choice (config.json settings.color /
+    # settings.theme, survives restarts), then the env, then the
+    # built-in default; the hotkeys 'n'/'m' save the state the
+    # moment they flip it. The argparse defaults are None ('not
+    # chosen'), so a never-written key can never pose as an
+    # explicit choice (the v6.8 lesson). The _explicit markers keep
+    # the 'an argument of THIS run wins' contract for the profile
+    # switch (apply_profile_runtime) after the values are resolved
+    # in place below.
+    a._no_color_explicit = getattr(a, "no_color", None) is not None
+    a._theme_explicit = bool(getattr(a, "theme", None))
+    _no_color = getattr(a, "no_color", None)
+    if _no_color is None:
+        _saved_color = load_bool_setting("color", None)
+        if _saved_color is not None:
+            _no_color = not _saved_color       # the saved hotkey-'n' state
+        elif "MOZVPN_NO_COLOR" in os.environ:
+            _no_color = _truthy_env("MOZVPN_NO_COLOR")
+        else:
+            _no_color = False                 # the default: colors ON
+    a.no_color = bool(_no_color)
     set_color(not a.no_color)
+    if not a._theme_explicit:
+        _saved_theme = load_str_setting("theme")
+        if _saved_theme in ("dark", "light"):
+            a.theme = _saved_theme            # the saved hotkey-'m' state
+        else:
+            a.theme = ((os.environ.get("MOZVPN_THEME") or "").strip().lower()
+                       or "dark")
     set_theme(a.theme)
+    save_bool_setting("color", _USE_COLOR)
+    save_str_setting("theme", _THEME)
     # v5.18: the flag representation of the proxy lines (see
     # country_flag); "auto" (the default) resolves per platform inside
     # country_flag: the emoji pair where flag emoji render, the pixel
@@ -11244,11 +15982,15 @@ def main():
         else:
             set_doh_provider(a.doh)
     else:
-        # v5.31: no explicit --doh -> the SAVED hotkey-'h' choice
-        # (doh.json, survives restarts), else env, else the default
+        # v5.31 -> v6.8: no explicit --doh -> the SAVED hotkey-'h'
+        # choice (settings.doh; '' only from the EXPLICIT 'off'
+        # marker), else env, else the built-in 'cloudflare' default.
+        # v6.8: a never-chosen key - or a legacy '' the v6.0-v6.7
+        # default bug wrote - falls THROUGH to the default instead
+        # of masquerading as a system-DNS choice.
         _saved_doh = load_doh_provider_cache()
         if _saved_doh is not None:
-            set_doh_provider(_saved_doh)     # '' = the saved system-DNS mode
+            set_doh_provider(_saved_doh)     # '' = the explicit 'off' choice
         else:
             set_doh_provider(
                 (os.environ.get("MOZVPN_DOH", "cloudflare").strip().lower()
@@ -11291,13 +16033,123 @@ def main():
     if doh_provider() != "custom":
         save_doh_provider_cache(doh_provider())
     save_lang_cache(_LANG)
-    # v5.1 (req. 4): the DoH answer cache state at startup (opt-in)
-    set_doh_cache(bool(getattr(a, "doh_cache", False)))
+    # v6.9 (the user's request 2): the ENGINE choice is sticky too
+    # (hotkey 'e' / --local-proxy-engine): an explicit argument wins,
+    # then the SAVED choice (settings.engine), then
+    # MOZVPN_PROXY_ENGINE, then the built-in 'builtin'. The
+    # resolution runs before the first reader (the engine echo
+    # below) and before run_manager(); the profile switch does
+    # NOT change the live engine (that is hotkey 'e' territory) -
+    # the saved engine of the new profile applies at the next
+    # start.
+    a._engine_explicit = getattr(a, "local_proxy_engine", None) is not None
+    if not a._engine_explicit:
+        _saved_engine = load_str_setting("engine")
+        if _saved_engine in ("builtin", "singbox"):
+            a.local_proxy_engine = _saved_engine
+        else:
+            a.local_proxy_engine = (
+                (os.environ.get("MOZVPN_PROXY_ENGINE") or "")
+                .strip().lower() or "builtin")
+        if a.local_proxy_engine not in ("builtin", "singbox"):
+            a.local_proxy_engine = "builtin"     # a garbage env value
+    save_str_setting("engine", a.local_proxy_engine)
+    # v5.1 (req. 4) -> v6.9: the DoH answer cache state at startup.
+    # v6.9: the choice is STICKY (settings.doh_cache - the config
+    # layout has carried this key name since v6.4): an explicit
+    # --doh-cache/--no-doh-cache wins, then the SAVED hotkey-'k'
+    # choice, then MOZVPN_DOH_CACHE, then the built-in OFF default.
+    a._doh_cache_explicit = getattr(a, "doh_cache", None) is not None
+    _dch = getattr(a, "doh_cache", None)
+    if _dch is None:
+        _dch = load_bool_setting("doh_cache", None)
+    if _dch is None:
+        _dch = _env_flag("MOZVPN_DOH_CACHE", False)
+    set_doh_cache(bool(_dch))
+    save_bool_setting("doh_cache", doh_cache_enabled())
     if doh_cache_enabled():
         info(tr("doh_cache_state_on", ttl=DOH_TTL))
     else:
         info(tr("doh_cache_state_off"))
     info(tr("locked_note"))
+    # v6.6: the pass-health / transport knobs of this version.
+    # --api-proxy: the control plane rides ONE FIXED HTTP(S) exit (the
+    # shared _OPENER of req_full/_fastly_http is rebuilt with a
+    # ProxyHandler); the DoH chain is NOT routed through it (the DoH
+    # endpoints are anycast - DNS needs no fixed exit).
+    if getattr(a, "api_proxy", None):
+        _apu = str(a.api_proxy).strip()
+        if _apu.lower().startswith("socks"):
+            err(tr("api_proxy_socks_unsupported"))
+            sys.exit(1)
+        set_api_proxy(_apu)
+        info(tr("api_proxy_on", url=_apu))
+    else:
+        info(tr("api_proxy_off"))
+    # --tls-split -> v6.9: the ClientHello fragmentation state (ON by
+    # default since v6.7) and STICKY since v6.9 (settings.tls_split):
+    # an explicit --tls-split/--no-tls-split wins, then the SAVED
+    # hotkey-'i' choice, then MOZVPN_TLS_SPLIT, then the ON default.
+    a._tls_split_explicit = getattr(a, "tls_split", None) is not None
+    _tsp = getattr(a, "tls_split", None)
+    if _tsp is None:
+        _tsp = load_bool_setting("tls_split", None)
+    if _tsp is None:
+        _tsp = _env_flag("MOZVPN_TLS_SPLIT", True)
+    set_tls_split(bool(_tsp))
+    save_bool_setting("tls_split", tls_split())
+    info(tr("tls_split_startup",
+            state=tr("color_state_on" if tls_split()
+                     else "color_state_off")))
+    # --verbose: the CONNECT targets of the engine failure logs.
+    set_verbose_targets(bool(getattr(a, "verbose", False)))
+    # v8.0 -> v9.0 --proxy-type: the local listener type (socks5/http).
+    # Sticky like --tls-split above: an explicit argument wins, then
+    # the SAVED hotkey-Ctrl+T choice, then the 'socks5' DEFAULT of
+    # v9.0 (RFC 1928 CONNECT-only with REMOTE DNS - a DOMAIN request
+    # address is passed through to the egress, the curl socks5h
+    # semantics, so the domain never leaks to the local system
+    # resolver; a plain-'socks5' client that pre-resolves locally and
+    # sends the IP is accepted too - 'socks5h' is a CLIENT-side
+    # convention, not a separate wire protocol). A SAVED 'mixed' or
+    # 'http' choice of an older run keeps winning only when it was
+    # SAVED; a never-chosen run takes the new default.
+    a._proxy_type_explicit = getattr(a, "proxy_type", None) is not None
+    _pt = _proxy_type_of(a)
+    set_proxy_type(_pt)
+    if a._proxy_type_explicit:
+        save_str_setting("proxy_type", _pt)
+    info(tr("proxy_type_selected", type=_pt))
+    # v8.0 --auto-rotate: the quota-based account rotation. ON by
+    # DEFAULT (a useful option ships enabled); an explicit argument
+    # wins, then the SAVED hotkey-Ctrl+R choice.
+    a._auto_rotate_explicit = getattr(a, "auto_rotate", None) is not None
+    _ar = getattr(a, "auto_rotate", None)
+    if _ar is None:
+        _ar = load_bool_setting("auto_rotate", True)
+    set_auto_rotate(bool(_ar))
+    if a._auto_rotate_explicit:
+        save_bool_setting("auto_rotate", auto_rotate_enabled())
+    if auto_rotate_enabled():
+        info(tr("auto_rotate_startup"))
+    # v6.6 (item 14) -> v6.9 CORRECTION -> v8.1 UPDATE: the channel
+    # facts, stated ONCE per run. Re-verified 2026-10-30 against the
+    # Fastly engineering blog ('We built the proxy behind Firefox's
+    # new built-in VPN'): the rollout is HTTP CONNECT over HTTP/2, and
+    # the CONNECT tunnel is a RAW TCP TUNNEL - ANY TCP protocol, ANY
+    # destination port ('anything can run through it'); the v6.6
+    # 'web-ports-only' claim mistook the EGRESS LISTENER ports of a
+    # third-party server list for allowed DESTINATION ports and is
+    # retracted. UDP/IP is the NEXT step, not the current one: MASQUE
+    # over HTTP/3 (RFC 9298 CONNECT-UDP - the code is already in the
+    # Firefox networking stack and the Mozilla Remote Settings server
+    # list carries a per-server 'masque' protocol next to 'connect').
+    # Fastly does no deep packet inspection; Mozilla positions the
+    # feature for browser-level web traffic (not full-device
+    # tunneling). The CODE needs no port fix: the builtin engine and
+    # the sing-box configs relay EVERY CONNECT host:port - the local
+    # side never restricted the destination ports.
+    info(tr("channel_limits_note"))
 
     # req. 8: --clear-cache wipes everything and exits (a fresh dict is
     # passed: nothing has been loaded into memory yet at this point)
@@ -11311,6 +16163,15 @@ def main():
     if getattr(a, "clean_old_config", False):
         clean_old_config_format(verbose=True)
         sys.exit(0)
+
+    # v8.0 --doctor (C4, the foxhole-vpn idea): the one-shot READ-ONLY
+    # diagnostics of the whole chain - interpreter, config store,
+    # dependencies, system DNS, DoH, the FxA API, the server list, a
+    # REAL TLS handshake to a live egress and the OAuth -> Guardian
+    # -> quota chain on the CACHED session only (never a password
+    # login). Exits with 0 (healthy) / 1 (at least one failed step).
+    if getattr(a, "doctor", False):
+        sys.exit(run_doctor(a))
 
     # v5.27 (fix 2): the multi-account cache parameters work OFFLINE -
     # no sign-in, no probes; they print the store and exit
@@ -11512,7 +16373,9 @@ def main():
     try:
         session_token = ensure_session(a, creds, totp_provider, interactive=True)
         token, until, ghdrs = obtain_proxy_pass(session_token)
-        exp = jwt_exp(token)
+        # v6.6 (item 1): anchor-at-receipt (see run_manager) - the
+        # displayed expiry is OUR clock's view of the pass lifetime.
+        exp = anchored_exp(token)
         ok(tr("proxypass_received", until=format_until(until, token),
               exp=time.strftime("%H:%M:%S", time.gmtime(exp)) if exp else "?"))
         # v5.27 (fix 2): cache the successfully signed-in account
