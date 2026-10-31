@@ -752,6 +752,44 @@
 #      patchelf-version FATAL was ever seen there. Windows does not
 #      use patchelf at all (standalone patching there is MSVC-based).
 #
+# FIX 31 (release job Skipped on branch-push runs + no way to attach
+#      to an EXISTING release, 2026-10-31): a live run on a plain
+#      branch push showed all build jobs green and
+#      "Attach binaries to release — Skipped", and the release page
+#      did not receive the binaries. The SKIP ITSELF IS CORRECT AND
+#      KEPT: for a branch push there is NO release to attach to
+#      (FIX 3/FIX 22 doctrine — assets attach only for tag pushes
+#      and release publishes, and only the COMPLETE set). A green
+#      branch run can therefore never update a release by itself,
+#      which is exactly what the user observed. What was MISSING is
+#      a path to attach a FRESH full binary set to an ALREADY
+#      EXISTING release whose tag push predates the fixed config
+#      (exactly the release/2.0.0 incident of FIX 22: its tag was
+#      pushed with the broken config, so re-attaching required
+#      either a NEW tag or re-publishing the release). FIX:
+#      workflow_dispatch gains the `release_tag` input. Dispatching
+#      the workflow from the default branch with
+#      release_tag=<existing tag, e.g. release/2.0.0> runs the
+#      complete 13-binary build matrix and attaches ALL binaries to
+#      THAT tag's release — softprops/action-gh-release resolves
+#      the release by tag_name and uploads/replaces its assets.
+#      Dispatch WITHOUT a tag stays a pure CI build (release-bundle
+#      skips). The automatic paths are UNCHANGED: pushing a tag
+#      (v* / release/**) or publishing a GitHub Release still
+#      attaches without any manual step. The `if` gains exactly one
+#      disjunct — (github.event_name == 'workflow_dispatch' &&
+#      inputs.release_tag != '') — every other condition is
+#      required by a real path and nothing is superfluous:
+#        * startsWith(github.ref, 'refs/tags/v')      — v* tag pushes;
+#        * startsWith(github.ref, 'refs/tags/release/') — release/**
+#          tag pushes;
+#        * github.event_name == 'release'  — releases published via
+#          the GitHub UI: creating a release there fires the
+#          `release` event but NOT `push`, so without this disjunct
+#          UI-published releases would never receive binaries;
+#        * the new workflow_dispatch disjunct — the manual re-attach
+#          path described above.
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn-* file to the GitHub Release as a
@@ -860,7 +898,18 @@ on:
   pull_request:
   release:
     types: [published]
+  # FIX 31: manual re-attach path. Run this workflow from the Actions
+  # tab with release_tag set to an EXISTING tag (e.g. release/2.0.0)
+  # to build the full 13-binary set and attach it to that tag's
+  # release — no new tag needed. Leave the input EMPTY for a pure CI
+  # build: nothing is attached and release-bundle skips as usual.
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing tag whose release receives the binaries (e.g. release/2.0.2). Leave empty for a pure CI build — nothing is attached."
+        required: false
+        default: ""
+        type: string
 
 env:
   APP_NAME: "Free Mozilla VPN"
@@ -1956,7 +2005,9 @@ jobs:
   # --------------------------------------------------------------------------
   # Release: downloads ALL build artifacts into one folder and attaches
   # every binary to the GitHub Release as a SEPARATE asset — NO zip (FIX 8).
-  # Runs for v* tags, release/** tags, or a published GitHub Release.
+  # Runs for v* tags, release/** tags, a published GitHub Release, or a
+  # workflow_dispatch run with a non-empty release_tag input (FIX 31 —
+  # the manual re-attach path for an EXISTING release).
   # Built only when all `needs` jobs succeeded (no `always()`). The Termux
   # jobs are NOT continue-on-error anymore (FIX 22): the release/2.0.0
   # run attached a PARTIAL release (7 of 9 binaries) because a silently
@@ -1970,14 +2021,25 @@ jobs:
   # OS/arch/libc) guarantees that. softprops/action-gh-release
   # attaches each matched file as its own asset and supports glob patterns
   # in `files`.
+  #
+  # FIX 31 (2026-10-31): on a plain branch push this job shows Skipped
+  # BY DESIGN — there is no release for a branch, so a green branch run
+  # must never attach anything. To attach a fresh full binary set to an
+  # EXISTING release (e.g. release/2.0.0, whose tag predates the fixed
+  # config), dispatch this workflow from the Actions tab with
+  # release_tag=<that tag>: the builds run from the selected branch and
+  # the binaries attach to that tag's release via the explicit tag_name
+  # below. Pushing a tag (v* / release/**) or publishing a release via
+  # the UI still attaches automatically — no manual step needed.
   # --------------------------------------------------------------------------
   release-bundle:
-    name: Attach binaries to release
+    name: Attach binaries to release (tags, releases, manual dispatch)
     needs: [build, build-linux-glibc, build-linux-musl, build-termux]
     if: >
       startsWith(github.ref, 'refs/tags/v') ||
       startsWith(github.ref, 'refs/tags/release/') ||
-      github.event_name == 'release'
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -2052,8 +2114,30 @@ jobs:
       #   mozvpn-windows-x86_64-ucrt-win10.exe,
       #   mozvpn-windows-x86-ucrt-win10.exe,
       #   mozvpn-windows-arm64-ucrt-win10.exe.
-      - name: Attach binaries to GitHub Release
+      #
+      # FIX 31: the attach step is SPLIT by trigger. The automatic
+      # path (tag push / release publish) resolves the release from
+      # the event itself — softprops/action-gh-release uses the
+      # triggering ref, no tag_name needed. The workflow_dispatch
+      # path MUST pass tag_name explicitly: a dispatch run's ref is
+      # the BRANCH it was dispatched from (refs/heads/main), so
+      # without tag_name the action would look for a "main" release
+      # and create a bogus one. With tag_name = the release_tag
+      # input, the binaries attach to the requested EXISTING release
+      # (softprops updates the release for that tag and uploads/
+      # replaces the assets). Re-uploading an existing asset name
+      # REPLACES the old file on the release.
+      - name: Attach binaries to GitHub Release (tag push / release publish)
+        if: github.event_name == 'push' || github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
+          files: dist/mozvpn-*
+          generate_release_notes: true
+
+      - name: Attach binaries to GitHub Release (manual dispatch, FIX 31)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
           files: dist/mozvpn-*
           generate_release_notes: true
