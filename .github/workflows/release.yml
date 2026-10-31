@@ -2,75 +2,113 @@
 # Free Mozilla VPN — build mozvpn.py with Nuitka (Python 3.15)
 #
 # Targets (unified uname-style naming, identical for every OS):
-#   linux-x86_64   — 64-bit Intel/AMD Linux (a.k.a. x64 / amd64)
-#   linux-x86      — 32-bit Linux (i386/i686)
-#   linux-armv8    — 64-bit ARM Linux, ARMv8-A baseline (= aarch64 /
-#                    arm64; runs on ALL ARMv8+ hardware)
-#   linux-armv9    — 64-bit ARM Linux tuned for the ARMv9-A ISA (runs on
-#                    ARMv9 hardware: Neoverse N2/V2, Cobalt 100, Cortex-X2+,
-#                    Snapdragon 8 Gen 1+, Apple M-series is NOT Linux —
-#                    do NOT run this build on ARMv8-only devices)
-#   windows-x86_64 — 64-bit Intel/AMD Windows (a.k.a. x64)
-#   windows-x86    — 32-bit Windows (i386/i686)
-#   windows-arm64  — 64-bit ARM Windows (= ARMv8; Windows 11 on Arm)
-#   termux-armv8   — Termux (Android, Bionic libc), armv8-baseline
-#                    aarch64 — runs in Termux on ANY aarch64 Android
-#                    device; does NOT run on glibc Linux
-#   termux-armv9   — Termux (Android, Bionic libc), TUNED for ARMv9
-#                    devices with -mtune (scheduler tuning only, the
-#                    ISA stays ARMv8-baseline: runs on ALL aarch64
-#                    phones; FIX 18 — an -march=armv9-a build SIGILLs
-#                    on phones without userspace SVE2, which includes
-#                    most real-world devices)
+#   linux-x86_64        — 64-bit Intel/AMD Linux (a.k.a. x64 / amd64)
+#   linux-x86           — 32-bit Linux (i386/i686)
+#   linux-armv8         — 64-bit ARM Linux, ARMv8-A baseline (= aarch64 /
+#                         arm64; runs on ALL ARMv8+ hardware)
+#   linux-armv9         — 64-bit ARM Linux tuned for the ARMv9-A ISA (runs
+#                         on ARMv9 hardware: Neoverse N2/V2, Cobalt 100,
+#                         Cortex-X2+, Snapdragon 8 Gen 1+, Apple M-series
+#                         is NOT Linux — do NOT run this build on
+#                         ARMv8-only devices)
+#   linux-x86_64-musl   — the same four architectures, built against
+#   linux-x86-musl        musl 1.2.6 (Alpine 3.24 containers) for musl
+#   linux-armv8-musl      distributions (Alpine, Void-musl, ...): a glibc
+#   linux-armv9-musl      binary does NOT run there, and a musl binary
+#                         does NOT run on glibc systems (different libc +
+#                         ELF interpreter — /lib/ld-musl-x86_64.so.1 vs
+#                         /lib/ld-linux-*.so.1)
+#   windows-x86_64      — 64-bit Intel/AMD Windows (a.k.a. x64)
+#   windows-x86         — 32-bit Windows (i386/i686)
+#   windows-arm64       — 64-bit ARM Windows (= ARMv8; Windows 11 on Arm)
+#   termux-armv8        — Termux (Android, Bionic libc), armv8-baseline
+#                         aarch64 — runs in Termux on ANY aarch64 Android
+#                         device; does NOT run on glibc or musl Linux
+#   termux-armv9        — Termux (Android, Bionic libc), TUNED for ARMv9
+#                         devices with -mtune (scheduler tuning only, the
+#                         ISA stays ARMv8-baseline: runs on ALL aarch64
+#                         phones; FIX 18 — an -march=armv9-a build SIGILLs
+#                         on phones without userspace SVE2, which includes
+#                         most real-world devices)
 #   (glibc linux-* binaries do NOT work in Termux, and termux binaries
 #    do not work on glibc Linux: different libc + ELF interpreter —
 #    see the NOTE below)
 #
-# BINARY NAMING (FIX 23, 2026-10-25): every job name AND every built
-# binary file name now carries the C library the binary runs against.
-# The Termux jobs have always declared theirs in the job name (Bionic);
-# the same annotation now exists for every target:
-#   linux-* (runner builds)  — glibc 2.39 — the Ubuntu 24.04 runner
-#                              image, x64 AND arm64 (Launchpad, glibc
-#                              source package in noble: 2.39-0ubuntu8.9,
-#                              verified 2026-10-25). The x86_64 cell is
-#                              PINNED to ubuntu-24.04 (NOT ubuntu-
-#                              latest): GitHub is migrating the
-#                              ubuntu-latest label from Ubuntu 24.04 to
-#                              26.04 between 2026-10-19 and 2026-11-19
-#                              (GitHub changelog, 2026-09-17), and 26.04
-#                              ships glibc 2.43 (Launchpad, glibc in
-#                              resolute: 2.43-2ubuntu2.4) — a floating
-#                              label would make both the produced
-#                              binary AND its glibc2.39 name a LIE on
-#                              some runs mid-window. A release pipeline
-#                              must be deterministic.
-#   linux-x86 (i386 container) — glibc 2.41 — the python:${PYTHON_VERSION}
-#                              -slim image is the Debian 13 "trixie"
-#                              slim build (the docker-library
-#                              official-images tag list: 3.15-slim =
-#                              3.15.1-slim-trixie), and trixie ships
-#                              glibc 2.41 (Debian packages, libc6 in
-#                              trixie, verified 2026-10-25). The HOST
-#                              runner's glibc does not matter here —
-#                              the binary is produced entirely inside
-#                              the trixie i386 container.
-#   windows-*                 — UCRT — the Universal C Runtime, the
-#                              OS C library since Windows 10 (Microsoft
-#                              Learn, "Universal CRT deployment");
-#                              Nuitka standalone binaries depend on the
-#                              Visual C runtime, and Nuitka ships/
-#                              copies the dependent DLLs itself
-#                              (Nuitka User Manual).
-#   termux-*                  — Bionic — Android's libc (unchanged;
-#                              the termux binary is built inside real
-#                              Termux and runs ONLY in Termux).
+# BINARY NAMING (FIX 23, unified in FIX 25/26, 2026-10-31): every job
+# name AND every built binary file name carries the C library the binary
+# runs against — ONE popular, CURRENT, STABLE version per libc — and,
+# for the two Linux libcs, the MOST POPULAR distribution of that libc
+# (FIX 27, 2026-10-31): ubuntu26.04 for glibc, alpine3.24 for musl.
+#   linux-* (glibc)  — glibc 2.41 — Debian 13 "trixie" (the CURRENT
+#                      STABLE Debian, released 2025-08-09; glibc 2.41,
+#                      GCC 14.2 — verified 2026-10-31). ALL glibc builds
+#                      run inside python:3.15-slim-trixie containers —
+#                      the Debian 13 trixie slim builds referenced by
+#                      the EXPLICIT tag (docker-library official-images
+#                      list; the bare -slim alias would follow the next
+#                      Debian and silently change the linked glibc —
+#                      same determinism doctrine as FIX 23/26), so the
+#                      annotation is the truth for EVERY target,
+#                      and the HOST runner glibc is irrelevant to every
+#                      produced binary. glibc is backward compatible:
+#                      a 2.41-linked binary runs on any glibc >= 2.41 —
+#                      the latest Ubuntu LTS 26.04 "resolute" (glibc
+#                      2.43), Debian 13+, and the current Fedora /
+#                      Arch / openSUSE releases.
+#                      FIX 27 DISTRO TOKEN — ubuntu26.04: Ubuntu 26.04
+#                      LTS "resolute", the MOST POPULAR glibc
+#                      distribution and the project own compatibility
+#                      target (its glibc 2.43 satisfies the 2.41
+#                      floor, so the binary is verified to run there);
+#                      the BUILD stays in the pinned Debian 13 trixie
+#                      containers, which define the FLOOR (FIX 25).
+#   linux-* (musl)   — musl 1.2.6 — the CURRENT STABLE musl release
+#                      (2026-03-20, the official musl mailing-list
+#                      announcement) and exactly the version in Alpine
+#                      3.24-stable (the aports musl APKBUILD). Alpine
+#                      3.24.3 (2026-10-21) is the current stable
+#                      Alpine — the popular stable "LTS-equivalent" of
+#                      the musl world — and the base of the pinned
+#                      python:3.15-alpine3.24 images the musl builds
+#                      run in (FIX 26).
+#                      FIX 27 DISTRO TOKEN — alpine3.24: Alpine Linux,
+#                      the de-facto standard and MOST POPULAR musl
+#                      distribution — and exactly the pinned build
+#                      base (FIX 26), so the token doubles as the
+#                      floor statement: the binary runs on any musl
+#                      >= 1.2.6.
+#   windows-*        — ucrt-win10 — the Universal C Runtime: ucrtbase.dll
+#                      is an OS component WITHOUT its own version number,
+#                      shipped with Windows 10 and later and serviced
+#                      via Windows Update (Microsoft Learn, "Universal
+#                      CRT deployment"; the UCRT release notes state the
+#                      DLLs "do not include a version number and become
+#                      components of Windows Operating System"). The
+#                      version is therefore the OS baseline: Windows 10+
+#                      (incl. Windows 11 on Arm). Nuitka standalone
+#                      binaries depend on the Visual C runtime, and
+#                      Nuitka ships/copies the dependent DLLs itself
+#                      (Nuitka User Manual).
+#   termux-*         — bionic24 — Android Bionic; the version is the
+#                      minimum Android the binary supports: Termux —
+#                      and every prebuilt Termux package, built against
+#                      Bionic — requires Android 7.0+ = API level 24
+#                      (the termux-app README: full app and package
+#                      support only on Android >= 7; the F-Droid/GitHub
+#                      builds used here support Android 7.0+).
 # The release assets are therefore named:
-#   mozvpn-linux-x86_64-glibc2.39, mozvpn-linux-armv8-glibc2.39,
-#   mozvpn-linux-armv9-glibc2.39, mozvpn-linux-x86-glibc2.41,
-#   mozvpn-termux-armv8-bionic, mozvpn-termux-armv9-bionic,
-#   mozvpn-windows-x86_64-ucrt.exe, mozvpn-windows-x86-ucrt.exe,
-#   mozvpn-windows-arm64-ucrt.exe.
+#   mozvpn-linux-x86_64-glibc2.41-ubuntu26.04,
+#   mozvpn-linux-x86-glibc2.41-ubuntu26.04,
+#   mozvpn-linux-armv8-glibc2.41-ubuntu26.04,
+#   mozvpn-linux-armv9-glibc2.41-ubuntu26.04,
+#   mozvpn-linux-x86_64-musl1.2.6-alpine3.24,
+#   mozvpn-linux-x86-musl1.2.6-alpine3.24,
+#   mozvpn-linux-armv8-musl1.2.6-alpine3.24,
+#   mozvpn-linux-armv9-musl1.2.6-alpine3.24,
+#   mozvpn-termux-armv8-bionic24, mozvpn-termux-armv9-bionic24,
+#   mozvpn-windows-x86_64-ucrt-win10.exe,
+#   mozvpn-windows-x86-ucrt-win10.exe,
+#   mozvpn-windows-arm64-ucrt-win10.exe.
 #
 # ARMv8 vs ARMv9 (why two separate builds, and why both are "aarch64"):
 #   * ARMv9-A is a superset of ARMv8-A at the A64 base level, so an
@@ -79,17 +117,19 @@
 #   * The GitHub arm64 runners (ubuntu-24.04-arm) are Microsoft Cobalt
 #     100 machines: Arm Neoverse N2 cores, ARMv9-A with SVE2 — so the
 #     runner itself is ARMv9 hardware and can build AND smoke-test an
-#     -march=armv9-a binary natively.
+#     -march=armv9-a binary natively (this is true for the glibc cells,
+#     the musl cells and the Termux cells alike).
 #   * -march=armv9-a is supported by GCC since GCC 12 and by Clang since
-#     D109517; Ubuntu 24.04 ships GCC 13 / a recent clang, so both
-#     toolchains accept it.
-#   * The linux-armv9 job therefore compiles with
+#     D109517; Debian 13 trixie ships GCC 14.2 and Alpine 3.24 a current
+#     GCC, so every container toolchain accepts it.
+#   * The linux-armv9 jobs (glibc AND musl) therefore compile with
 #     CFLAGS="-march=armv9-a" LDFLAGS="-march=armv9-a" — Nuitka applies
 #     the CCFLAGS/LDFLAGS environment values ON TOP of its own flag set
 #     (verified: Nuitka honors CCFLAGS/LDFLAGS env vars). Everything
-#     else (CPython, the compiled C modules, the manylinux wheels of
-#     aioquic/cryptography/etc.) stays ARMv8-baseline — the -march flag
-#     applies to the Nuitka-generated C code of the binary itself.
+#     else (CPython, the compiled C modules, the manylinux/musllinux
+#     wheels of aioquic/cryptography/etc.) stays ARMv8-baseline — the
+#     -march flag applies to the Nuitka-generated C code of the binary
+#     itself.
 #   * NOTE on the ARMv9 build: the EMBEDDED CPython and the binary
 #     extension modules inside the onefile payload come from ARMv8
 #     baseline wheels/interpreter — the armv9 build is therefore an
@@ -114,6 +154,12 @@
 #   `pip install -r requirements.txt` when the file exists, and the
 #   build FAILS if it cannot be satisfied — aioquic is REQUIRED (real
 #   MASQUE / HTTP-3 CONNECT-UDP probing must be compiled in).
+#   The two files are verified IN SYNC (2026-10-31): this workflow
+#   quotes the requirements.txt pin line verbatim, installs the system
+#   headers its comments promise (apt in the trixie glibc containers,
+#   apk in the Alpine musl containers), pre-installs the Termux
+#   packages it describes (python-cryptography, python-pillow), and
+#   states the same aioquic constraint (cryptography>=43.0.0).
 #
 #   NOTHING runtime-related is pinned or hardcoded in this workflow:
 #   even the cryptography==46.0.3 constraint for Windows is a PEP 508
@@ -124,16 +170,20 @@
 #       missing OpenSSL (pyca/cryptography#14249);
 #     * win32 (32-bit Windows): support REMOVED in the 49.0.0 release
 #       (2026-06-12; changelog: "BACKWARDS INCOMPATIBLE: Support for
-#       32-bit Windows has
-#       been removed") — pip again falls back to the Rust sdist build
-#       and dies on the missing OpenSSL (exactly the FATAL seen live in
-#       the windows-x86 job, 2026-09-24).
+#       32-bit Windows has been removed") — pip again falls back to the
+#       Rust sdist build and dies on the missing OpenSSL (exactly the
+#       FATAL seen live in the windows-x86 job, 2026-09-24).
 #   46.0.3 ships abi3 wheels for win32, win_amd64 AND win_arm64; abi3
 #   wheels are forward-compatible across Python 3.x (so 3.15 is fine)
-#   and still satisfy aioquic's `cryptography>=42.0.0`. Linux and macOS
-#   keep resolving to the latest release (prebuilt wheels exist there;
-#   on i686 Linux the sdist build succeeds thanks to the apt packages
-#   below).
+#   and still satisfy aioquic's `cryptography>=43.0.0` (verified on
+#   PyPI 2026-10-31, requirements.txt). Linux (glibc AND
+#   musl) keeps resolving to the latest release (prebuilt manylinux AND
+#   musllinux_1_2 wheels exist for x86_64/aarch64; on i686 the sdist
+#   build succeeds thanks to the apt/apk packages below).
+#   FORWARD-LOOKING (from requirements.txt): the unreleased
+#   cryptography 51.0.0 changelog requires CFFI 2.1.1 or newer on
+#   Python 3.15 to avoid an ABI issue — recheck the Windows pin
+#   before ever unpinning cryptography there.
 #
 #   This is THE fix for the "dependencies NOT installed in the exe" bug:
 #   mozvpn.py imports these packages behind try/except ImportError,
@@ -153,27 +203,31 @@
 #        * win32 + win_arm64: no wheel — fixed inside requirements.txt
 #          via the environment-marker pin (see above); no Rust/OpenSSL
 #          toolchain is needed on the runner at all.
-#        * linux x86 (i686): pip builds the sdist via maturin, whose
+#        * linux x86 (i686, glibc): pip builds the sdist via maturin, whose
 #          openssl-sys crate discovers OpenSSL through pkg-config —
 #          and python:*-slim images ship neither pkg-config nor
 #          libssl-dev. Fixed by apt-installing `pkg-config libssl-dev`
-#          in the container job (puccinialin/maturin fetch the Rust
-#          toolchain themselves, as seen live in the job log — only the
-#          OpenSSL headers were missing). These are SYSTEM libraries,
+#          in the glibc container jobs (puccinialin/maturin fetch the
+#          Rust toolchain themselves, as seen live in the job log — only
+#          the OpenSSL headers were missing). These are SYSTEM libraries,
 #          not pip packages: they cannot live in requirements.txt.
-#        * Pillow (i686): no cp314 i686 wheel — pip builds the sdist,
-#          which hard-requires zlib headers and dies with
+#        * Pillow (i686, glibc): no cp315 i686 wheel — pip builds the
+#          sdist, which hard-requires zlib headers and dies with
 #          "RequiredDependencyException: zlib" on the slim image.
 #          Fixed by apt-installing `zlib1g-dev libjpeg-dev` in the
-#          container job (zlib is a hard Pillow dependency; libjpeg is
-#          the standard recommended companion per the Pillow docs).
-#          Again system headers, not pip packages.
-#      All apt additions are REQUIRED (not ||-fallbacks): a build env
+#          glibc container jobs (zlib is a hard Pillow dependency;
+#          libjpeg is the standard recommended companion per the Pillow
+#          docs). Again system headers, not pip packages.
+#        * musl cells: the same sdist fallbacks are covered by the apk
+#          packages of the build-linux-musl job (pkgconf + openssl-dev,
+#          zlib-dev, jpeg-dev, libffi-dev, cmake, ninja, linux-headers —
+#          see FIX 26).
+#      All apt/apk additions are REQUIRED (not ||-fallbacks): a build env
 #      without them cannot produce a binary with working QR/TOTP and
 #      real MASQUE probing.
 #
 # FIX 9 (build-env check crash, 2026-09-24): the "Show toolchain info"
-#      step (and the identical checks inside the container job) died
+#      step (and the identical checks inside the container jobs) died
 #      with `AttributeError: module 'pyotp' has no attribute '__version__'`.
 #      pyotp does NOT export __version__ — the canonical way to get an
 #      installed package's version is importlib.metadata.version() from
@@ -186,18 +240,18 @@
 #      again.
 #
 # NOTE — WHY THE linux-arm64 BINARY DOES NOT RUN IN TERMUX (2026-09-24):
-#      Termux is NOT a glibc Linux distribution: it runs on Android's
-#      Bionic libc with Android's dynamic linker. A Nuitka onefile
-#      binary built on Ubuntu is a glibc ELF whose ELF interpreter is
-#      /lib/ld-linux-aarch64.so.1 — that path does not exist on Android,
-#      so the kernel's execve() fails with ENOENT and the shell reports
-#      "cannot execute: required file not found" (or the onefile payload
-#      fails the same way after self-extraction). Even patchelf-ing the
-#      binary to a glibc prefix installed inside Termux leads to a
-#      segfault during glibc initialization — Bionic and glibc cannot
-#      be mixed in one process. This is a FUNDAMENTAL incompatibility
-#      (libc + dynamic linker), NOT an instruction-set problem: the CPU
-#      in an Android phone is the same aarch64.
+#      Termux is NOT a glibc (or musl) Linux distribution: it runs on
+#      Android's Bionic libc with Android's dynamic linker. A Nuitka
+#      onefile binary built on Ubuntu is a glibc ELF whose ELF
+#      interpreter is /lib/ld-linux-aarch64.so.1 — that path does not
+#      exist on Android, so the kernel's execve() fails with ENOENT and
+#      the shell reports "cannot execute: required file not found" (or
+#      the onefile payload fails the same way after self-extraction).
+#      Even patchelf-ing the binary to a glibc prefix installed inside
+#      Termux leads to a segfault during glibc initialization — Bionic
+#      and glibc cannot be mixed in one process. This is a FUNDAMENTAL
+#      incompatibility (libc + dynamic linker), NOT an instruction-set
+#      problem: the CPU in an Android phone is the same aarch64.
 #
 #      THE FIX: native Termux builds (the build-termux job below) build
 #      THE BINARY INSIDE REAL TERMUX — in the
@@ -219,14 +273,14 @@
 #      (50.0.2 in termux-packages as of 2026-10-25;
 #      deps: openssl + python + python-pip) is installed BEFORE
 #      `pip install -r requirements.txt` — pip then sees
-#      `cryptography>=42.0.0` (the aioquic requirement) as already
+#      `cryptography>=43.0.0` (the aioquic requirement) as already
 #      satisfied and does not touch it at all. Pillow is likewise
 #      installed as the prebuilt Termux package python-pillow
-#      (13.0.0, verified 2026-10-25). The rest (pyotp — pure Python, zxing-cpp,
-#      aioquic + pylsqpack) is built by pip from sdists with the Termux
-#      clang: Termux does NOT use -dev packages — headers ship inside
-#      the packages themselves (openssl, libjpeg-turbo, zlib), so
-#      building from source only needs CFLAGS/LDFLAGS with
+#      (13.0.0, verified 2026-10-25). The rest (pyotp — pure Python,
+#      zxing-cpp, aioquic + pylsqpack) is built by pip from sdists with
+#      the Termux clang: Termux does NOT use -dev packages — headers
+#      ship inside the packages themselves (openssl, libjpeg-turbo,
+#      zlib), so building from source only needs CFLAGS/LDFLAGS with
 #      -I$PREFIX/include and -L$PREFIX/lib. The Termux python package
 #      is PEP 668 externally managed: PIP_BREAK_SYSTEM_PACKAGES=1 is
 #      exported before pip. The armv9 variant is built with
@@ -238,8 +292,8 @@
 #      Termux job was tolerated — now a Termux failure fails the run
 #      immediately, and the release gate additionally refuses to
 #      attach an incomplete binary set. The Termux binary runs ONLY
-#      in Termux on Android (Bionic libc), NOT on regular glibc
-#      Linux — and vice versa.
+#      in Termux on Android (Bionic libc, Android 7.0+ / API 24),
+#      NOT on regular glibc or musl Linux — and vice versa.
 #
 # FIX 14 (Termux build: bind-mount-independent file transfer, 2026-09-25):
 #      A LIVE RUN failed at `cp /src/mozvpn.py` with "No such file or
@@ -280,7 +334,10 @@
 #      (including inside comments within run:), so literal placeholder
 #      stubs — double curly braces with three dots — are forbidden in
 #      the script text; only the real matrix.target/march
-#      substitutions remain.
+#      substitutions remain. (The glibc/musl container jobs keep the
+#      plain -v bind mount: with ordinary OCI images on the hosted
+#      runners it is standard behavior and proven in live runs — the
+#      FIX 14 problem was specific to the termux-docker entrypoint.)
 #
 # FIX 15 (Termux build: zxing-cpp dlopen "cannot locate symbol PyTuple_Type",
 #      2026-09-25): the second live run (FIX 14 already working: COPY
@@ -304,11 +361,14 @@
 #      symbols at dlopen.
 #      FIX: LDFLAGS inside the Termux script gains -lpython${PYVER},
 #      where PYVER is derived from the interpreter itself (3.14.8 in
-#      the current Termux, verified 2026-10-25) — the libpython name follows the Python major
-#      automatically, with no hardcoding. aioquic/pylsqpack only benefit
-#      from this (their .so files also get all symbols resolved). A
-#      stable-ABI module linked against libpython works on Termux
-#      (the numpy precedent).
+#      the current Termux, verified 2026-10-25) — the libpython name
+#      follows the Python major automatically, with no hardcoding.
+#      aioquic/pylsqpack only benefit from this (their .so files also
+#      get all symbols resolved). A stable-ABI module linked against
+#      libpython works on Termux (the numpy precedent).
+#      (NOTE: this is an ANDROID linker issue — the musl cells do NOT
+#      need -lpython: musl, like glibc, resolves dlopen symbols through
+#      the main application.)
 #
 # FIX 17 (Termux build: zxing-cpp dlopen "cannot locate symbol
 #      _ZNSt6__ndk113__hash_memoryEPKvm", 2026-09-25): the third live
@@ -349,9 +409,10 @@
 #      — pure SCHEDULER TUNING (the instruction set stays ARMv8
 #      baseline), so the binary runs on EVERY aarch64 Android device
 #      while the code is scheduled for ARMv9-class (Neoverse N2)
-#      pipelines. The linux-armv9 job KEEPS -march=armv9-a: it is
-#      smoke-tested on the Neoverse N2 (ARMv9+SVE2) runner and targets
-#      ARMv9 Linux servers, not consumer phones.
+#      pipelines. The linux-armv9 jobs (glibc AND musl) KEEP
+#      -march=armv9-a: they are smoke-tested on the Neoverse N2
+#      (ARMv9+SVE2) runner and target ARMv9 Linux servers, not consumer
+#      phones.
 #
 # FIX 19 (FATAL smoke tests everywhere, 2026-09-25): every build job
 #      now VERIFIES that the binary actually LAUNCHES, and a failed
@@ -377,7 +438,11 @@
 #      Scope: launch-only, by design — the smoke test proves the ELF
 #      loads, the interpreter starts and the modules import; it does
 #      NOT verify the VPN logic (that needs real credentials and
-#      network access, out of CI scope).
+#      network access, out of CI scope). The musl smoke test runs the
+#      binary INSIDE the same Alpine container it was built in; the
+#      glibc smoke test runs it INSIDE the same trixie container; the
+#      armv9 variants are smoke-tested on the ARMv9 (Neoverse N2) arm
+#      runner, which executes ARMv9 encodings natively.
 #
 # FIX 20 (actions/setup-python v6 -> v7, 2026-09-25): the current
 #      major of actions/setup-python is v7 (the official README and
@@ -392,26 +457,23 @@
 #      support, 2026-02), softprops/action-gh-release@v3. Runners
 #      re-verified: ubuntu-24.04-arm and windows-11-arm are standard
 #      supported arm64 runners (windows-11-arm moves to the VS2026
-#      image in September 2026 — still the same label). Nuitka 4.3.1
-#      (current release, verified 2026-10-25) pronounces Python 3.15
-#      experimentally supported in its changelog; the official PyPI
-#      range is still "Python 3 (3.4 - 3.14) are supported".
+#      image in September 2026 — still the same label); Docker is
+#      preinstalled on BOTH ubuntu-24.04 and ubuntu-24.04-arm hosted
+#      runners, so the container jobs run natively on both. Nuitka
+#      4.3.1 (current release, verified 2026-10-25) pronounces Python
+#      3.15 experimentally supported in its changelog; the official
+#      PyPI range is still "Python 3 (3.4 - 3.14) are supported".
 #      The Nuitka version is PINNED per cell (2026-10-25): 4.3.1 in the
 #      Python 3.15 cells (the only line with 3.15 support), 4.2.2 in
 #      the Termux cell (the 4.3 inline scons copy crashes there —
 #      FIX 21).
 #
-# RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
-# job downloads all build artifacts into one folder (merge-multiple:
-# true) and attaches every mozvpn-* file to the GitHub Release as a
-# SEPARATE asset (softprops/action-gh-release supports multi-line file
-# lists and glob patterns in `files`). Each asset keeps its
-# OS-specific name — the full list is in the BINARY NAMING block above
-# (mozvpn-linux-x86_64-glibc2.39, mozvpn-windows-x86_64-ucrt.exe,
-# mozvpn-termux-armv8-bionic, ...).
-# Per GitHub documentation, an asset filename must be unique within one
-# release — the unified target naming guarantees that (one file per
-# target). Nothing is zipped anywhere in this workflow anymore.
+# FIX 21 (Termux Nuitka pin, 2026-10-25): see the build-termux job —
+#      the 4.3+ inline scons copy ships no ilink.py and crashes on the
+#      clang-only Termux toolchain; the Termux cell stays on 4.2.2
+#      (the last hotfix of the 4.2 line). Every OTHER cell of this
+#      workflow has gcc or MSVC: scons finds the gnulink/mslink tool
+#      and the broken ilink fallback is never reached.
 #
 # FIX 22 (release completeness gate, 2026-10-25): the release/2.0.0 run
 #      attached only 7 of the 9 binaries to the release page. The Termux
@@ -428,10 +490,167 @@
 #            file set BEFORE attaching anything: one missing binary =
 #            the job fails and NOTHING is attached. A partial release
 #            is now impossible by construction.
-#      (The run that builds on a plain branch push never attaches —
-#      only tag pushes and release events do — so the missing Termux
-#      binaries of release/2.0.0 were never re-attached; re-publish
-#      the release to attach the full set with the fixed config.)
+#
+# FIX 23 (runner image pinning, 2026-10-25; glibc annotation part
+#      superseded by FIX 25): GitHub is migrating the ubuntu-latest
+#      label from Ubuntu 24.04 to 26.04 between 2026-10-19 and
+#      2026-11-19 (GitHub changelog, 2026-09-17). A floating label is
+#      non-deterministic, so every Linux runner in this workflow stays
+#      PINNED (ubuntu-24.04 / ubuntu-24.04-arm). Since FIX 25 the
+#      runners no longer contribute their glibc to ANY produced
+#      binary (every Linux build happens inside pinned containers) —
+#      the pinning now guarantees a stable Docker host only, which is
+#      still exactly what a release pipeline wants.
+#
+# FIX 24 (DNS failure inside the build containers, live run 2026-10-31):
+#      the linux-x86 job died at apt-get update with
+#      "Temporary failure resolving 'deb.debian.org'" — the image PULL
+#      worked (the daemon downloads layers with host networking; the
+#      log shows every layer arriving), but the container process could
+#      not resolve ANY name, so apt-get update failed and the apt
+#      installs died with "Unable to locate package".
+#      ROOT CAUSE: a docker container inherits the resolv.conf of the
+#      HOST. The GitHub runner runs systemd-resolved, whose resolv.conf
+#      points to the stub listener 127.0.0.53 — an address reachable
+#      ONLY from the host network namespace. Inside the container,
+#      127.0.0.53 is the CONTAINER OWN loopback, where nothing
+#      listens, so every DNS query fails. The same failure class is
+#      documented for Debian containers on GitHub-hosted runners
+#      (actions/runner-images#6013, actions/runner#2036) and for
+#      systemd-resolved hosts in the Docker/Moby issue tracker.
+#      FIX: EVERY `docker run` in this workflow now passes
+#      `--dns 8.8.8.8 --dns 1.1.1.1` — the per-container override of
+#      the inherited resolver with public servers that ARE reachable
+#      from the container network namespace (Docker reference: --dns
+#      sets the DNS servers written into the container resolv.conf).
+#      Image pulls are unaffected (the daemon resolves them itself —
+#      the failing run downloaded every layer fine); only
+#      container-level apt/apk/pkg/pip resolution needed the fix.
+#      The termux `docker build` needs no DNS: its Dockerfile contains
+#      only FROM + COPY (no RUN step touches the network).
+#
+# FIX 25 (ONE glibc version for every glibc target, 2026-10-31): the
+#      release previously shipped glibc 2.39 binaries for x86_64/arm
+#      (built NATIVELY on the Ubuntu 24.04 runners) and a glibc 2.41
+#      binary for 32-bit x86 (built in the python:3.15-slim = Debian 13
+#      "trixie" container, glibc 2.41). The verdict: ONE popular,
+#      current, stable glibc version for every glibc binary.
+#      The 32-bit target FORCED the choice of the version: there is NO
+#      i386 environment with glibc 2.39 — Ubuntu publishes no i386
+#      Docker images and keeps only a tiny i386 package subset in the
+#      noble archive (no CPython, no toolchain), while Debian 13
+#      trixie publishes full i386 archives AND the official
+#      python:3.15-slim image supports i386 (docker-library
+#      official-images architecture list; proven live: the failing run
+#      pulled and started the linux/386 image fine).
+#      glibc 2.41 IS the current stable Debian glibc — Debian 13
+#      "trixie", released 2025-08-09, ships glibc 2.41 (libc6 in
+#      trixie) and GCC 14.2 — and a 2.41-linked binary runs on the
+#      latest Ubuntu LTS (26.04 "resolute", glibc 2.43) and on every
+#      current distribution (Debian 13+, Fedora, Arch, openSUSE),
+#      because glibc is backward compatible: the requirement is
+#      "glibc >= the version linked against".
+#      IMPLEMENTATION: ALL glibc Linux builds now run inside
+#      python:3.15-slim-trixie containers — the SAME trixie slim
+#      build for
+#      amd64 (linux-x86_64), i386 (linux-x86) and arm64v8 (linux-armv8,
+#      linux-armv9) — so the runner own glibc is irrelevant to every
+#      produced binary, the annotation glibc2.41 is the truth for ALL
+#      FOUR targets, and the pipeline stays deterministic. The main
+#      matrix job keeps only the Windows cells; the ARM builds moved
+#      from native runner builds (setup-python + CCFLAGS on the host)
+#      to the container pattern proven by the linux-x86 job. The
+#      smoke tests run inside the same containers, so a glibc-linked
+#      binary is verified in its own libc environment.
+#      NOTE on "x32": the "x32 ABI" that web searches surface is a
+#      DIFFERENT thing (ILP32 on the x86-64 kernel — 32-bit pointers
+#      with 64-bit registers); THIS 32-bit target is the classic i386
+#      (IA-32, uname i686), which trixie builds natively in the
+#      linux/386 image on the x86_64 kernel (no emulation).
+#
+# FIX 26 (NEW musl targets, 2026-10-31): four new binaries for musl
+#      distributions (Alpine, Void-musl, OpenWrt-style systems) — a
+#      glibc binary does NOT run there (its ELF interpreter
+#      /lib/ld-linux-*.so.1 does not exist on musl systems) and a
+#      musl binary does NOT run on glibc systems (reciprocal; gcompat
+#      shims are out of scope).
+#      musl VERSION: 1.2.6 — the current stable musl release
+#      (2026-03-20, the official musl mailing-list announcement) and
+#      exactly the version shipped by Alpine 3.24-stable (the aports
+#      musl APKBUILD; Alpine rebuilds it as 1.2.6-rX with security
+#      backports, the upstream version stays 1.2.6).
+#      Alpine 3.24 is the current stable Alpine (3.24.3, 2026-10-21,
+#      supported ~2 years) — the popular, stable, current musl
+#      distribution; the musl "LTS-equivalent" of the glibc world.
+#      IMPLEMENTATION: the builds run inside python:3.15-alpine3.24
+#      containers (official image; amd64, i386 and arm64v8
+#      architectures per the docker-library official-images list), so
+#      the annotation musl1.2.6 is the truth for the produced binaries.
+#      The Alpine tag is PINNED in the image reference: the floating
+#      python:3.15-alpine tag moves to a newer Alpine branch every
+#      ~6 months, which would silently change the musl version under
+#      the musl1.2.6 name — a release pipeline must be deterministic.
+#      Nuitka supports Alpine Linux since release 0.6.2 ("Added
+#      support for Alpine Linux", Nuitka release notes), and musl
+#      binaries built with Nuitka inside Alpine containers are an
+#      established pattern. The cell has gcc/g++ (apk build-base), so
+#      the scons gnulink tool is found and the FIX 21 ilink crash is
+#      never reached; Nuitka stays pinned to 4.3.1 (the Python 3.15
+#      line). requirements.txt remains the single source of runtime
+#      dependencies; the Windows-only cryptography pin does not apply
+#      there (sys_platform == "linux").
+#      WHEELS (verified 2026-10-31): cryptography 50.0.2 ships
+#      cp315-abi3 musllinux_1_2 wheels for x86_64 and aarch64, and
+#      Pillow ships musllinux wheels — on those architectures pip
+#      installs everything with NO source build at all. Every sdist
+#      fallback is covered by apk packages (the FIX 10 analog):
+#        * cryptography i686 — sdist via maturin (maturin/puccinialin
+#          fetch the Rust toolchain themselves): OpenSSL discovered
+#          via pkgconf + openssl-dev;
+#        * Pillow i686 — zlib-dev + jpeg-dev;
+#        * zstandard — libffi-dev for the cffi backend chain;
+#        * zxing-cpp — cmake + ninja (scikit-build-core needs a system
+#          cmake >= 3.18, the FIX 13 lesson) + g++;
+#        * pylsqpack / aioquic — gcc + linux-headers.
+#      Targets: linux-x86_64-musl (amd64), linux-x86-musl (i386 — runs
+#      natively on the x86_64 runner kernel), linux-armv8-musl (arm64
+#      baseline) and linux-armv9-musl (-march=armv9-a — the same policy
+#      as the glibc armv9 build: targets ARMv9 Linux servers, built and
+#      smoke-tested on the ARMv9 Neoverse N2 arm runner; the TERMUX
+#      armv9 build keeps -mtune=neoverse-n2 instead — phones, FIX 18).
+#
+# FIX 27 (distro token in the Linux names, 2026-10-31): every glibc
+#      and musl JOB NAME and BINARY FILE NAME now also carries the
+#      name of the MOST POPULAR distribution of the corresponding
+#      C library — the reference TARGET distro of that libc:
+#        * glibc  — ubuntu26.04: Ubuntu 26.04 LTS "resolute", the
+#          most popular glibc distribution and the project own
+#          compatibility target (its glibc 2.43 >= the 2.41 floor
+#          of these binaries — they are verified to run there). The
+#          BUILD itself stays in the pinned Debian 13 trixie
+#          containers, which define the FLOOR (FIX 25); the token
+#          names the TARGET, not the build base.
+#        * musl   — alpine3.24: Alpine Linux, the de-facto standard
+#          and most popular musl distribution — and exactly the
+#          pinned build base (FIX 26), so the token doubles as the
+#          floor statement: these binaries run on any musl >= 1.2.6.
+#      Termux (Android — not a Linux distribution) and Windows keep
+#      their existing annotations (bionic24 / ucrt-win10); the
+#      release gate list (FIX 22) is updated accordingly.
+#
+# RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
+# job downloads all build artifacts into one folder (merge-multiple:
+# true) and attaches every mozvpn-* file to the GitHub Release as a
+# SEPARATE asset (softprops/action-gh-release supports multi-line file
+# lists and glob patterns in `files`). Each asset keeps its
+# OS-specific name — the full list is in the BINARY NAMING block above
+# (mozvpn-linux-x86_64-glibc2.41-ubuntu26.04,
+# mozvpn-linux-armv8-musl1.2.6-alpine3.24,
+# mozvpn-termux-armv8-bionic24, mozvpn-windows-x86_64-ucrt-win10.exe,
+# ...). Per GitHub documentation, an asset filename must be unique
+# within one release — the unified target naming guarantees that (one
+# file per target). Nothing is zipped anywhere in this workflow
+# anymore. The expected-set gate (FIX 22) lists ALL 13 binaries.
 #
 # FIX 1 (the historical windows-arm64 FATAL): since Python 3.12 the
 #     CPython distributions from setup-python and the official python
@@ -451,7 +670,8 @@
 #     3.15), but if its wheel is ever unavailable the same cell has to
 #     BUILD it from source — libffi-dev covers that chain too.
 #     Fix: libffi-dev is
-#     apt-installed in the container job, with an || fallback for
+#     apt-installed in the glibc container jobs (and apk-installed in
+#     the musl cells), with an || fallback for
 #     zstandard ONLY (aioquic stays REQUIRED — the build fails if it
 #     cannot be built).
 #
@@ -476,25 +696,30 @@
 #     softprops/action-gh-release@v3 — current, valid major tags.
 #   * setup-python provides pre-built CPython 3.15.1 (the current
 #     stable, 2026-10-21) for x64/x86 on windows-latest and for arm64
-#     on windows-11-arm and linux arm64 (the 3.15.1 manifest asset
-#     list, verified 2026-10-25, covers win32/win_amd64/win_arm64 +
-#     the linux aarch64 builds); ubuntu-24.04-arm
-#     provides the system aarch64 CPython 3.15 for the armv8/armv9
-#     builds via apt/python3-... — see the jobs below.
+#     on windows-11-arm (the 3.15.1 manifest asset list, verified
+#     2026-10-25, covers win32/win_amd64/win_arm64) — it is used ONLY
+#     by the Windows cells now; every Linux build uses the official
+#     python Docker images (3.15-slim trixie / 3.15-alpine3.24).
+#   * Docker is preinstalled on the ubuntu-24.04 and ubuntu-24.04-arm
+#     hosted runners, so the glibc/musl container builds and the
+#     Termux build run natively (no emulation anywhere in this
+#     workflow).
 #   * Tag filter "release/**" ("*" alone does NOT match "/" in tag
 #     filters); a tag push uses the workflow file FROM THE COMMIT the
 #     tag points at; the `release` event uses the DEFAULT branch's file
 #     and cannot be filtered by tag (handled via the release job's `if`).
 #   * `cache: pip` in setup-python is NOT used: it hard-fails when the
 #     dependency glob matches nothing (actions/setup-python#807); the
-#     container job does not go through setup-python either.
-#   * jobs.<id>.container CANNOT be used for the 32-bit build: the
+#     container jobs do not go through setup-python either.
+#   * jobs.<id>.container CANNOT be used for the container builds: the
 #     runner mounts only 64-bit node binaries into /__e/, so every
 #     action dies in an i386 container with "exec /__e/node24/bin/node:
 #     no such file or directory" (actions/runner#2115). Actions run on
-#     the host; the build runs via plain `docker run` with the
-#     workspace bind-mounted.
-#   * linux-x86 runs natively on the x86_64 kernel — no emulation.
+#     the host; the builds run via plain `docker run` with the
+#     workspace bind-mounted (FIX 14 note: the Termux job uses the
+#     docker build + docker cp pattern instead).
+#   * linux-x86 (glibc AND musl) runs natively on the x86_64 kernel —
+#     no emulation.
 #   * Nuitka 4.3.1 supports Python 3.4–3.14 (3.15 experimentally) and
 #     does NOT cross-compile; every
 #     target is built natively with a PRE-BUILT CPython. The version
@@ -527,21 +752,30 @@ on:
 env:
   APP_NAME: "Free Mozilla VPN"
   SCRIPT: mozvpn.py
-  # Python 3.15.1 — the current stable (2026-10-21). Verified 2026-10-25:
-  #   * setup-python v7 ships 3.15.1 for win32-x86/x64, win arm64 and
-  #     linux arm64 (manifest asset list), so every matrix cell builds
-  #     with a pre-built interpreter;
-  #   * the official python:3.15-slim Docker image includes the i386
-  #     architecture (docker-library official-images), so the 32-bit
-  #     container build keeps working;
+  # Python 3.15 — the current stable (3.15.1, 2026-10-21). Verified
+  # 2026-10-31:
+  #   * setup-python v7 ships 3.15.1 for win32-x86/x64 and win arm64
+  #     (manifest asset list), so every Windows matrix cell builds with
+  #     a pre-built interpreter;
+  #   * the official python:3.15-slim-trixie images (Debian 13
+  #     "trixie", glibc 2.41) cover amd64, i386 and arm64v8 — ALL
+  #     glibc container builds (FIX 25; the EXPLICIT slim-trixie tag
+  #     is used instead of the floating -slim alias so the glibc
+  #     version in the file names stays the truth);
+  #   * the official python:3.15-alpine3.24 images (Alpine 3.24,
+  #     musl 1.2.6) cover amd64, i386 and arm64v8 — ALL musl builds
+  #     (FIX 26; the Alpine tag is PINNED so the musl version in the
+  #     file names stays the truth);
   #   * Nuitka 4.3.1 pronounces Python 3.15 experimentally supported
   #     (its changelog; the official PyPI range is still 3.4-3.14);
-  #   * Pillow 13.0.0 ships cp315 wheels (incl. win32/win_arm64), the
-  #     cryptography 46.0.3 / aioquic 1.7.0 cp311-abi3 and the
-  #     zxing-cpp 3.1.1 cp312-abi3 wheels are forward-compatible with
-  #     3.15 (all verified on PyPI 2026-10-25; zxing-cpp win32 has no
-  #     wheel at any Python — the windows-x86 cell builds it from
-  #     source with the preinstalled MSVC, exactly as before).
+  #   * Pillow 13.0.0 ships cp315 wheels (incl. win32/win_arm64 and
+  #     musllinux), the cryptography 46.0.3 (Windows pin) / 50.0.2
+  #     (latest, incl. musllinux_1_2 x86_64/aarch64 cp315-abi3) and
+  #     the aioquic 1.7.0 cp311-abi3 / zxing-cpp 3.1.1 cp312-abi3 wheels
+  #     are forward-compatible with 3.15 (all verified on PyPI
+  #     2026-10-31; zxing-cpp win32 has no wheel at any Python — the
+  #     windows-x86 cell builds it from source with the preinstalled
+  #     MSVC, exactly as before).
   PYTHON_VERSION: "3.15"
   FILE_VERSION: "1.0.0.0"
 
@@ -550,80 +784,37 @@ permissions:
 
 jobs:
   # --------------------------------------------------------------------------
-  # Main matrix: targets that run directly on hosted runners using a
-  # pre-built CPython from setup-python, plus the two ARMv8/ARMv9 Linux
-  # builds on the ARMv9 (Cobalt 100 / Neoverse N2) arm64 runner.
+  # Windows matrix (FIX 25: the Linux glibc cells moved to the
+  # build-linux-glibc container job). Windows binaries run against the
+  # Universal C Runtime — the OS C library since Windows 10 (Microsoft
+  # Learn, "Universal CRT deployment"); ucrtbase.dll has no version
+  # number of its own and is serviced via Windows Update, so the
+  # version annotation is the OS baseline: ucrt-win10 = Windows 10+.
+  # Nuitka ships the dependent VC runtime DLLs itself (Nuitka User
+  # Manual).
   # --------------------------------------------------------------------------
   build:
-    # FIX 23: the job name shows the C library the built binary runs
-    # against — the same annotation the Termux jobs always had.
     name: Build ${{ matrix.target }} (${{ matrix.libc }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # FIX 23: pinned to ubuntu-24.04, NOT ubuntu-latest. GitHub
-          # is migrating the ubuntu-latest label from Ubuntu 24.04 to
-          # 26.04 gradually between 2026-10-19 and 2026-11-19 (GitHub
-          # changelog, 2026-09-17) — mid-window runs would randomly
-          # land on glibc 2.43 instead of 2.39, which would make both
-          # the binary and its glibc2.39 name non-deterministic. The
-          # explicit label is deterministic and keeps the annotation
-          # truthful (Launchpad, glibc in noble: 2.39-0ubuntu8.9,
-          # verified 2026-10-25).
-          # libc = display form (job name); tag = file-name token.
-          - os: ubuntu-24.04
-            target: linux-x86_64
-            python_arch: x64
-            march: ""
-            libc: "glibc 2.39"
-            tag: glibc2.39
-          # Both ARM builds run on ubuntu-24.04-arm (Cobalt 100 =
-          # Neoverse N2 = ARMv9-A hardware). The armv8 build uses the
-          # compiler default (ARMv8-A baseline — runs on ALL aarch64
-          # hardware); the armv9 build adds -march=armv9-a so gcc/clang
-          # may emit ARMv9 encodings for the Nuitka-generated C code.
-          # Nuitka applies the CCFLAGS/LDFLAGS environment values on
-          # top of its own flags; -march=armv9-a is supported by
-          # GCC >= 12 and by clang (D109517).
-          # Same glibc 2.39 as the x86_64 cell: the arm64 runner image
-          # is also Ubuntu 24.04 (noble, glibc 2.39).
-          - os: ubuntu-24.04-arm
-            target: linux-armv8
-            python_arch: arm64
-            march: ""
-            libc: "glibc 2.39"
-            tag: glibc2.39
-          - os: ubuntu-24.04-arm
-            target: linux-armv9
-            python_arch: arm64
-            march: "-march=armv9-a"
-            libc: "glibc 2.39"
-            tag: glibc2.39
-          # Windows binaries run against the Universal C Runtime —
-          # the OS C library since Windows 10 (Microsoft Learn,
-          # "Universal CRT deployment"); Nuitka ships the dependent
-          # VC runtime DLLs itself (Nuitka User Manual), so "ucrt" is
-          # the complete runtime annotation for every Windows target.
           - os: windows-latest
             target: windows-x86_64
             python_arch: x64
-            march: ""
-            libc: "UCRT"
-            tag: ucrt
+            libc: "UCRT, Windows 10+"
+            tag: ucrt-win10
           - os: windows-11-arm
             target: windows-arm64
             python_arch: arm64
-            march: ""
-            libc: "UCRT"
-            tag: ucrt
+            libc: "UCRT, Windows 10+"
+            tag: ucrt-win10
           - os: windows-latest
             target: windows-x86
             python_arch: x86
-            march: ""
-            libc: "UCRT"
-            tag: ucrt
+            libc: "UCRT, Windows 10+"
+            tag: ucrt-win10
 
     steps:
       - name: Checkout
@@ -666,22 +857,14 @@ jobs:
           # only one with 3.15 support, experimental per the changelog);
           # 4.3.1 is the current stable (verified 2026-10-25; the failing
           # run itself confirmed it: "up to date with stable release
-          # 4.3.1"). The Windows/Linux cells are NOT affected by the
-          # FIX 21 scons bug: Windows resolves the mslink tool, and
-          # every Linux cell has gcc/g++ (preinstalled on the runners,
-          # apt-installed inside the i386 container), so gnulink is
-          # found and the broken ilink fallback is never reached. Bump
-          # the pin deliberately after reading the Nuitka changelog.
+          # 4.3.1"). The Windows cells are NOT affected by the FIX 21
+          # scons bug: Windows resolves the mslink tool, so the broken
+          # ilink fallback is never reached. Bump the pin deliberately
+          # after reading the Nuitka changelog.
           python -m pip install nuitka==4.3.1 ordered-set
           # zstandard: optional onefile compressor (uncompressed fallback).
           python -m pip install --upgrade zstandard || \
             echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
-
-      - name: Install C compiler cache (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ccache clang
 
       # ------------------------------------------------------------------------
       # FIX 9: version reporting goes through importlib.metadata ONLY.
@@ -698,7 +881,7 @@ jobs:
           python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
           # Prove pip/setuptools AND ALL runtime deps are importable in
           # the build env (the precondition for the --include-package
-          # options in the compile steps). Version strings come from
+          # options in the compile step). Version strings come from
           # importlib.metadata, never from module __version__ attributes.
           python - <<'PYEOF'
           from importlib.metadata import version
@@ -716,44 +899,6 @@ jobs:
           print("cryptography", version("cryptography"))
           PYEOF
           python -m nuitka --version
-
-      # ------------------------------------------------------------------------
-      # Nuitka build. --include-package is passed for EVERY runtime dep:
-      # the script's try/except imports plus dynamic submodule loading in
-      # these packages would otherwise leave sub-modules out of the
-      # standalone binary.
-      #
-      # The ARMv9 flavor is produced purely via the CCFLAGS/LDFLAGS
-      # environment variables (${march} is empty for every other target,
-      # so those builds are completely unaffected). Nuitka appends the
-      # CCFLAGS/LDFLAGS environment values on top of its own flag set.
-      # ------------------------------------------------------------------------
-      - name: Compile with Nuitka (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          CCFLAGS="${{ matrix.march }}" LDFLAGS="${{ matrix.march }}" python -m nuitka \
-            --standalone \
-            --onefile \
-            --lto=yes \
-            --include-package=pip \
-            --include-package=setuptools \
-            --include-package=pyotp \
-            --include-package=zxingcpp \
-            --include-package=PIL \
-            --include-package=aioquic \
-            --clang \
-            --jobs=4 \
-            --output-dir=build \
-            --output-filename="mozvpn-${{ matrix.target }}-${{ matrix.tag }}" \
-            --company-name="${{ env.APP_NAME }}" \
-            --product-name="${{ env.APP_NAME }}" \
-            --file-description="${{ env.APP_NAME }} (mozvpn)" \
-            --file-version="${{ env.FILE_VERSION }}" \
-            --product-version="${{ env.FILE_VERSION }}" \
-            --remove-output \
-            --assume-yes-for-downloads \
-            "${{ env.SCRIPT }}"
 
       - name: Compile with Nuitka (Windows)
         if: runner.os == 'Windows'
@@ -784,35 +929,13 @@ jobs:
             --assume-yes-for-downloads `
             "${{ env.SCRIPT }}"
 
-      - name: Smoke test binary (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          set -euo pipefail
-          BIN="build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}"
-          file "$BIN"
-          # FIX 19: the smoke test is now FATAL. The old `|| true`
-          # swallowed exactly the failures the smoke test exists to
-          # catch: a SIGILL (e.g. an ARMv9-only instruction on
-          # non-ARMv9 hardware) makes the shell report exit code
-          # 132 (128 + signal 4) — with `|| true` the job went
-          # green and a broken binary was released (live incident:
-          # termux armv9, FIX 18). The Nuitka onefile bootstrap
-          # propagates the child's exit status to its own exit
-          # code (WEXITSTATUS in OnefileBootstrap.c), and argparse
-          # exits 0 after printing --help, so a healthy binary
-          # MUST exit 0 here. `set -e` turns any non-zero exit
-          # (crash, missing interpreter, import failure) into a
-          # FAILED job.
-          "$BIN" --help
-          echo "smoke: $BIN --help exited 0"
-
       - name: Smoke test binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = "build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}.exe"
           if (-not (Test-Path $bin)) { throw "Binary not found: $bin" }
-          # FIX 19: the smoke test is now FATAL. The binary is built
+          # FIX 19: the smoke test is FATAL. The binary is built
           # with --windows-console-mode=force, so the console-enabled
           # process prints --help to the captured stdout. argparse
           # exits 0 after --help; the Nuitka onefile bootstrap
@@ -835,52 +958,112 @@ jobs:
           retention-days: 14
 
   # --------------------------------------------------------------------------
-  # Linux x86 (32-bit): runs the build in an i386 container on the regular
-  # x86_64 ubuntu-latest runner (the x86_64 kernel executes 32-bit code
-  # natively, no emulation). jobs.<id>.container CANNOT be used (the runner
-  # mounts only 64-bit node binaries into /__e/ — actions/runner#2115), so
-  # all actions run on the host and the build runs via plain `docker run`
-  # with the workspace bind-mounted (requirements.txt is visible inside
-  # via the bind mount).
+  # Linux glibc builds (FIX 25): ALL glibc targets are built inside
+  # python:3.15-slim-trixie containers — the Debian 13 "trixie" slim
+  # build, referenced by the EXPLICIT tag (docker-library
+  # official-images tag list: the bare 3.15-slim alias currently means
+  # 3.15.2-slim-trixie, but an alias FOLLOWS the newest Debian of the
+  # 3.15 line and would silently move to the next Debian once that
+  # becomes the default — the explicit slim-trixie tag pins the
+  # glibc 2.41 base for the whole 3.15 lifetime; the same determinism
+  # doctrine as FIX 23 ubuntu-24.04 and FIX 26 alpine3.24) — so EVERY
+  # glibc binary is linked against the
+  # SAME glibc 2.41 (libc6 in trixie) and the annotation glibc2.41 is
+  # the truth for all four targets. The HOST runner glibc is irrelevant:
+  # the binary is produced entirely inside the container and never
+  # touches the host libc. Debian 13 ships GCC 14.2, which accepts
+  # -march=armv9-a (GCC >= 12).
   #
-  # FIX 23 (libc annotation, 2026-10-25): this binary is linked against
-  # the glibc of the python:3.15-slim CONTAINER — that image is the
-  # Debian 13 "trixie" slim build (docker-library official-images tag
-  # list: 3.15-slim = 3.15.1-slim-trixie), and trixie ships glibc 2.41
-  # (Debian packages, libc6 in trixie, verified 2026-10-25). The HOST
-  # runner's glibc is irrelevant (the binary never touches it), so the
-  # annotation is glibc2.41 — NOT the runner's 2.39.
+  # Platforms (all native, no emulation):
+  #   linux/amd64  on ubuntu-24.04       (linux-x86_64)
+  #   linux/386    on ubuntu-24.04       (linux-x86 — the x86_64 kernel
+  #                                       executes 32-bit code natively)
+  #   linux/arm64  on ubuntu-24.04-arm   (linux-armv8, linux-armv9 — the
+  #                                       ARMv9 Neoverse N2 runner builds
+  #                                       AND smoke-tests the
+  #                                       -march=armv9-a binary natively)
+  # Docker is preinstalled on the hosted runners (amd64 and arm64).
+  # jobs.<id>.container CANNOT be used (the runner mounts only 64-bit
+  # node binaries into /__e/ — actions/runner#2115), so all actions run
+  # on the host and the build runs via plain docker run with the
+  # workspace bind-mounted (proven in live runs for the i386 cell; the
+  # FIX 14 empty-mount incident was specific to the termux-docker
+  # entrypoint).
+  #
+  # FIX 24: the docker run lines pass --dns 8.8.8.8 --dns 1.1.1.1 —
+  # without them the container inherits the runner resolv.conf with
+  # the systemd-resolved stub 127.0.0.53, which is unreachable from the
+  # container network namespace (the live "Temporary failure resolving
+  # deb.debian.org" failure, 2026-10-31).
   # --------------------------------------------------------------------------
-  build-linux-x86:
-    name: Build linux-x86 (glibc 2.41)
-    runs-on: ubuntu-latest
+  build-linux-glibc:
+    # FIX 27: the job name and the file name carry ubuntu26.04 —
+    # Ubuntu 26.04 LTS, the most popular glibc distribution and the
+    # verified TARGET distro (its glibc 2.43 satisfies the 2.41
+    # floor). The BUILD base stays the pinned Debian 13 trixie
+    # containers (FIX 25) — the token names the target, not the
+    # build base.
+    name: Build ${{ matrix.target }} (glibc 2.41, Ubuntu 26.04)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux/amd64
+            target: linux-x86_64
+            march: ""
+          - os: ubuntu-24.04
+            platform: linux/386
+            target: linux-x86
+            march: ""
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: linux-armv8
+            march: ""
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: linux-armv9
+            march: "-march=armv9-a"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Compile with Nuitka (32-bit Linux, inside i386 container)
+      - name: Compile with Nuitka (inside Debian 13 trixie container)
         run: |
           set -euo pipefail
           # NOTE: the workflow-level env block is exported into run-step
-          # shells, so ${PYTHON_VERSION} expands correctly here (host shell).
+          # shells, so ${PYTHON_VERSION} expands correctly here (host
+          # shell). The image is referenced by the EXPLICIT -slim-trixie
+          # tag (docker-library official-images tag list), NOT the bare
+          # -slim alias: the alias follows the newest Debian of the 3.15
+          # line and would silently move to the next Debian once that
+          # becomes the default — changing the linked glibc under the
+          # glibc2.41 name. Same determinism doctrine as pinning
+          # ubuntu-24.04 over ubuntu-latest (FIX 23) and alpine3.24 over
+          # alpine (FIX 26).
           docker run --rm \
-            --platform linux/386 \
+            --platform ${{ matrix.platform }} \
+            --dns 8.8.8.8 --dns 1.1.1.1 \
             -e PYTHON_VERSION \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
-            "python:${PYTHON_VERSION}-slim" \
+            "python:${PYTHON_VERSION}-slim-trixie" \
             bash -euo pipefail -c '
+              TARGET="${{ matrix.target }}"
+              MARCH="${{ matrix.march }}"
+              echo "=== glibc target: ${TARGET} | march: [${MARCH}]"
               # Pre-built packages only where they exist; everything that
               # must be built from source (FIX 10) needs its native
               # SYSTEM headers present (these are OS packages, NOT pip
               # packages — they cannot live in requirements.txt):
-              #   libffi-dev    — <ffi.h> for cffi (zstandard/aioquic chain)
+              #   libffi-dev    — ffi.h for cffi (zstandard chain)
               #   pkg-config + libssl-dev — REQUIRED to build cryptography
               #                  from the sdist: the openssl-sys build script
-              #                  discovers OpenSSL via `pkg-config openssl`
-              #                  first (FIX 10; without them maturin dies
-              #                  with "Could not find directory of OpenSSL
+              #                  discovers OpenSSL via pkg-config first
+              #                  (FIX 10; without them maturin dies with
+              #                  "Could not find directory of OpenSSL
               #                  installation").
               #   zlib1g-dev + libjpeg-dev — REQUIRED to build Pillow from
               #                  the sdist (zlib is a hard Pillow dependency;
@@ -912,7 +1095,7 @@ jobs:
               # Build tooling: Nuitka + onefile compression helpers.
               # PINNED to 4.3.1 (2026-10-25) for build reproducibility:
               # the unpinned --upgrade silently broke the Termux job the
-              # same day (FIX 21). This cell is NOT affected by that
+              # same day (FIX 21). These cells are NOT affected by that
               # bug: gcc and g++ are apt-installed above, so the scons
               # gnulink tool is found and the pruned ilink fallback is
               # never reached. Python 3.15 requires the 4.3 line.
@@ -931,7 +1114,11 @@ jobs:
               python -c "import PIL; from importlib.metadata import version; print(\"Pillow\", version(\"Pillow\"))"
               python -c "import aioquic; from importlib.metadata import version; print(\"aioquic\", version(\"aioquic\"))"
               python -c "import cryptography; from importlib.metadata import version; print(\"cryptography\", version(\"cryptography\"))"
-              python -m nuitka \
+              # Nuitka build. The ARMv9 flavor is produced purely via the
+              # CCFLAGS/LDFLAGS environment values (MARCH is empty for
+              # every other target); Nuitka applies the CCFLAGS/LDFLAGS
+              # env values ON TOP of its own flag set.
+              CCFLAGS="${MARCH}" LDFLAGS="${MARCH}" python -m nuitka \
                 --standalone \
                 --onefile \
                 --lto=yes \
@@ -943,7 +1130,7 @@ jobs:
                 --include-package=aioquic \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-linux-x86-glibc2.41" \
+                --output-filename="mozvpn-${TARGET}-glibc2.41-ubuntu26.04" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
                 --file-description="Free Mozilla VPN (mozvpn)" \
@@ -954,19 +1141,205 @@ jobs:
                 "mozvpn.py"
               # Smoke test (FIX 19: FATAL — no || true anymore; see
               # the matrix-job smoke step). --help works because the
-              # script uses argparse and exits 0; the i386 binary runs
-              # natively on the x86_64 runner kernel. A SIGILL/crash
-              # exits non-zero and FAILS the build under set -e.
-              file build/mozvpn-linux-x86-glibc2.41
-              ./build/mozvpn-linux-x86-glibc2.41 --help
-              echo "smoke: build/mozvpn-linux-x86-glibc2.41 --help exited 0"
+              # script uses argparse and exits 0; the Nuitka onefile
+              # bootstrap propagates the child exit status, so a crash
+              # (e.g. SIGILL = exit 132) FAILS the build under set -e.
+              # The binary runs right here in the same trixie container
+              # it was built in (on the armv9 cells that means the
+              # Neoverse N2 runner executes the ARMv9 encodings).
+              file "build/mozvpn-${TARGET}-glibc2.41-ubuntu26.04"
+              "./build/mozvpn-${TARGET}-glibc2.41-ubuntu26.04" --help
+              echo "smoke: build/mozvpn-${TARGET}-glibc2.41-ubuntu26.04 --help exited 0"
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-linux-x86-glibc2.41
-          path: build/mozvpn-linux-x86-glibc2.41*
+          name: mozvpn-${{ matrix.target }}-glibc2.41-ubuntu26.04
+          path: build/mozvpn-${{ matrix.target }}-glibc2.41-ubuntu26.04*
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # Linux musl builds (FIX 26, NEW): four targets for musl distributions
+  # (Alpine, Void-musl, ...). Built inside python:3.15-alpine3.24
+  # containers — Alpine 3.24, the current stable Alpine (the popular
+  # stable musl distribution), with musl 1.2.6 (the current stable musl
+  # release, 2026-03-20). The Alpine tag is PINNED: the floating
+  # 3.15-alpine tag would move to a newer Alpine branch and silently
+  # change the musl version under the musl1.2.6 name.
+  #
+  # Platforms (all native, no emulation):
+  #   linux/amd64  on ubuntu-24.04       (linux-x86_64-musl)
+  #   linux/386    on ubuntu-24.04       (linux-x86-musl — the x86_64
+  #                                       kernel executes 32-bit code
+  #                                       natively; Alpine publishes
+  #                                       x86 images, docker-library
+  #                                       official-images architecture
+  #                                       list)
+  #   linux/arm64  on ubuntu-24.04-arm   (linux-armv8-musl; linux-armv9-musl
+  #                                       with -march=armv9-a, built AND
+  #                                       smoke-tested on the ARMv9
+  #                                       Neoverse N2 runner)
+  #
+  # A glibc binary does NOT run on musl systems and vice versa
+  # (different libc + ELF interpreter), which is why these are SEPARATE
+  # release assets. The smoke test runs INSIDE the same Alpine container
+  # the binary was built in — against the same musl it will meet on the
+  # user machine.
+  #
+  # The Alpine containers have NO bash — the inner script runs under
+  # busybox sh (sh -eu; pipefail is not available in busybox ash, and
+  # no step of the script depends on it). The FIX 16 single-quote rule
+  # applies here as well: NO single-quote characters anywhere in the
+  # script body, not even inside comments.
+  #
+  # FIX 24: --dns 8.8.8.8 --dns 1.1.1.1 on the docker run line (same
+  # DNS root cause as the glibc cells; apk would fail identically
+  # without it).
+  # --------------------------------------------------------------------------
+  build-linux-musl:
+    name: Build ${{ matrix.target }}-musl (musl 1.2.6, Alpine 3.24)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux/amd64
+            target: linux-x86_64
+            march: ""
+          - os: ubuntu-24.04
+            platform: linux/386
+            target: linux-x86
+            march: ""
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: linux-armv8
+            march: ""
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: linux-armv9
+            march: "-march=armv9-a"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compile with Nuitka (inside Alpine 3.24 container)
+        run: |
+          set -euo pipefail
+          # NOTE: the workflow-level env block is exported into run-step
+          # shells, so ${PYTHON_VERSION} expands correctly here (host shell).
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            --dns 8.8.8.8 --dns 1.1.1.1 \
+            -e PYTHON_VERSION \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "python:${PYTHON_VERSION}-alpine3.24" \
+            sh -eu -c '
+              TARGET="${{ matrix.target }}"
+              MARCH="${{ matrix.march }}"
+              echo "=== musl target: ${TARGET} | march: [${MARCH}]"
+              cat /etc/alpine-release
+              ldd --version 2>&1 | head -n 1 || true
+              # System packages for the Nuitka toolchain and every pip
+              # sdist fallback (FIX 26, the FIX 10 analog — these are OS
+              # packages, NOT pip packages):
+              #   build-base (gcc g++ make musl-dev binutils) + patchelf +
+              #   ccache + file — the Nuitka toolchain
+              #   cmake + ninja — zxing-cpp builds via scikit-build-core,
+              #                 which needs a system cmake >= 3.18 (FIX 13)
+              #   pkgconf + openssl-dev — the cryptography sdist build
+              #                 (maturin discovers OpenSSL via pkg-config;
+              #                 needed on i686 where no musllinux wheel exists)
+              #   libffi-dev — the cffi chain (zstandard sdist)
+              #   zlib-dev + jpeg-dev — the Pillow sdist (i686)
+              #   linux-headers — the pylsqpack / aioquic sdist builds
+              apk add --no-cache \
+                build-base patchelf file ccache cmake ninja pkgconf \
+                openssl-dev libffi-dev zlib-dev jpeg-dev linux-headers
+              python --version
+              python -c "import platform; print(\"arch:\", platform.machine())"
+              python -m pip install --upgrade pip
+              # Runtime dependencies from requirements.txt (ALL REQUIRED,
+              # including aioquic — the build FAILS if they cannot be
+              # installed; wheels are used where they exist — cryptography
+              # and Pillow ship musllinux wheels for x86_64/aarch64 —
+              # and every sdist fallback is covered by the apk packages
+              # above). The Windows-only cryptography pin in
+              # requirements.txt does not apply here (sys_platform is
+              # linux).
+              if [ -f requirements.txt ]; then
+                python -m pip install -r requirements.txt
+              else
+                echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
+                exit 1
+              fi
+              # FIX 1: the python images do not bundle setuptools;
+              # Nuitka --include-package=setuptools requires it.
+              python -m pip install --upgrade pip setuptools wheel
+              # Build tooling, PINNED to 4.3.1 (Python 3.15 needs the
+              # 4.3 line). Nuitka has supported Alpine Linux since
+              # release 0.6.2; this cell has gcc (build-base), so the
+              # scons gnulink tool is found and the FIX 21 ilink crash
+              # is never reached.
+              python -m pip install nuitka==4.3.1 ordered-set
+              # zstandard: optional onefile compressor (uncompressed fallback).
+              python -m pip install --upgrade zstandard || \
+                echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
+              # FIX 9: prove pip/setuptools + ALL runtime deps are
+              # importable; versions come from importlib.metadata, NEVER
+              # from module __version__ attributes (pyotp has none).
+              python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
+              python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
+              python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
+              python -c "import PIL; from importlib.metadata import version; print(\"Pillow\", version(\"Pillow\"))"
+              python -c "import aioquic; from importlib.metadata import version; print(\"aioquic\", version(\"aioquic\"))"
+              python -c "import cryptography; from importlib.metadata import version; print(\"cryptography\", version(\"cryptography\"))"
+              # Nuitka build. The ARMv9 flavor is produced purely via the
+              # CCFLAGS/LDFLAGS environment values (MARCH is empty for
+              # every other target) — same policy as the glibc armv9
+              # cell: targets ARMv9 Linux servers; the TERMUX armv9
+              # cell keeps -mtune=neoverse-n2 instead (phones, FIX 18).
+              CCFLAGS="${MARCH}" LDFLAGS="${MARCH}" python -m nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --include-package=pip \
+                --include-package=setuptools \
+                --include-package=pyotp \
+                --include-package=zxingcpp \
+                --include-package=PIL \
+                --include-package=aioquic \
+                --jobs=4 \
+                --output-dir=build \
+                --output-filename="mozvpn-${TARGET}-musl1.2.6-alpine3.24" \
+                --company-name="Free Mozilla VPN" \
+                --product-name="Free Mozilla VPN" \
+                --file-description="Free Mozilla VPN (mozvpn)" \
+                --file-version="1.0.0.0" \
+                --product-version="1.0.0.0" \
+                --remove-output \
+                --assume-yes-for-downloads \
+                "mozvpn.py"
+              # Smoke test (FIX 19: FATAL). The musl binary runs right
+              # here in the same Alpine container, against the same musl
+              # it will meet on the user machine; --help exits 0 via
+              # argparse and the Nuitka onefile bootstrap propagates the
+              # child exit status, so any crash (e.g. SIGILL = exit 132
+              # on the armv9 cell) FAILS the build under set -e.
+              file "build/mozvpn-${TARGET}-musl1.2.6-alpine3.24"
+              "./build/mozvpn-${TARGET}-musl1.2.6-alpine3.24" --help
+              echo "smoke: build/mozvpn-${TARGET}-musl1.2.6-alpine3.24 --help exited 0"
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mozvpn-${{ matrix.target }}-musl1.2.6-alpine3.24
+          path: build/mozvpn-${{ matrix.target }}-musl1.2.6-alpine3.24*
           if-no-files-found: error
           retention-days: 14
 
@@ -983,7 +1356,10 @@ jobs:
   # /lib/ld-linux-aarch64.so.1 does not exist on Android —
   # execve() ENOENT; Bionic != glibc). And vice versa — a termux
   # binary (Bionic, ELF interpreter /system/bin/linker64) will NOT
-  # run on glibc Linux.
+  # run on glibc Linux. The Bionic version annotation (FIX 25/26
+  # naming): bionic24 = Android 7.0+ / API level 24 — the minimum
+  # Android of the Termux app and its packages (the termux-app README:
+  # full app and package support only on Android >= 7).
   #
   # FILE TRANSFER ORDER (FIX 14, 2026-09-25) — WITHOUT bind-mounts:
   #   INPUT:  docker build bakes mozvpn.py + requirements.txt
@@ -1014,7 +1390,7 @@ jobs:
   #      packages themselves (openssl is always installed,
   #      libjpeg-turbo/zlib come with python-pillow).
   #   2. `pip install -r requirements.txt` then sees the aioquic
-  #      requirements `cryptography>=42.0.0` and `Pillow` as already
+  #      requirements `cryptography>=43.0.0` and `Pillow` as already
   #      SATISFIED and does not rebuild them from sdist; the rest
   #      (pyotp — pure Python, zxing-cpp, aioquic + pylsqpack,
   #      pyopenssl, service-identity, certifi) is installed by pip
@@ -1039,9 +1415,15 @@ jobs:
   # Now a Termux failure fails the run immediately, and the
   # release-bundle job refuses to attach anything unless the COMPLETE
   # binary set is present.
+  #
+  # FIX 24: the docker run line passes --dns 8.8.8.8 --dns 1.1.1.1 —
+  # the Termux container resolves its package mirrors through the same
+  # inherited host resolv.conf as every other container; with the
+  # runner stub 127.0.0.53 unreachable from the container netns, pkg
+  # update would fail exactly like apt did in the glibc cell.
   # --------------------------------------------------------------------------
   build-termux:
-    name: Build termux-${{ matrix.target }} (Bionic, Android)
+    name: Build termux-${{ matrix.target }} (Bionic 24, Android 7.0+)
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -1086,6 +1468,7 @@ jobs:
           docker build -t mozvpn-termux-builder -f termux-builder.Dockerfile "$GITHUB_WORKSPACE"
           docker run \
             --privileged \
+            --dns 8.8.8.8 --dns 1.1.1.1 \
             --name mozvpn-termux-build \
             mozvpn-termux-builder \
             bash -euo pipefail -c '
@@ -1189,7 +1572,7 @@ jobs:
               # Runtime dependencies: requirements.txt is the single source
               # of truth. cryptography and Pillow are already satisfied by
               # the prebuilt Termux packages (python-cryptography 50.0.2 >=
-              # 42.0.0 — the aioquic requirement; python-pillow), pip does
+              # 43.0.0 — the aioquic requirement; python-pillow), pip does
               # not touch them.
               if [ -f requirements.txt ]; then
                 python -m pip install -r requirements.txt
@@ -1254,7 +1637,7 @@ jobs:
                 --clang \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-termux-${TARGET}-bionic" \
+                --output-filename="mozvpn-termux-${TARGET}-bionic24" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
                 --file-description="Free Mozilla VPN (mozvpn, Termux/Android Bionic)" \
@@ -1270,8 +1653,8 @@ jobs:
               # (like the FIX 18 armv9 incident) exits non-zero
               # (128+4=132) and FAILS the build under set -e — a
               # broken binary can no longer ship unnoticed.
-              file build/mozvpn-termux-"${TARGET}"-bionic
-              ./build/mozvpn-termux-"${TARGET}"-bionic --help
+              file build/mozvpn-termux-"${TARGET}"-bionic24
+              ./build/mozvpn-termux-"${TARGET}"-bionic24 --help
               echo "smoke: termux ${TARGET} --help exited 0"
               # NOTE: the binary is NOT copied out through a bind mount
               # anymore (FIX 14). The host extracts it from the stopped
@@ -1282,7 +1665,7 @@ jobs:
           # container — docker cp officially works with stopped containers,
           # and no host path is ever mounted.
           docker cp \
-            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-termux-${{ matrix.target }}-bionic \
+            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-termux-${{ matrix.target }}-bionic24 \
             termux-out/
           docker rm mozvpn-termux-build
 
@@ -1290,14 +1673,14 @@ jobs:
         run: |
           set -euo pipefail
           ls -la termux-out
-          test -f termux-out/mozvpn-termux-${{ matrix.target }}-bionic
-          file termux-out/mozvpn-termux-${{ matrix.target }}-bionic
+          test -f termux-out/mozvpn-termux-${{ matrix.target }}-bionic24
+          file termux-out/mozvpn-termux-${{ matrix.target }}-bionic24
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-termux-${{ matrix.target }}-bionic
-          path: termux-out/mozvpn-termux-${{ matrix.target }}-bionic
+          name: mozvpn-termux-${{ matrix.target }}-bionic24
+          path: termux-out/mozvpn-termux-${{ matrix.target }}-bionic24
           if-no-files-found: error
           retention-days: 14
 
@@ -1314,14 +1697,14 @@ jobs:
   # is attached. A partial release is impossible by construction.
   #
   # Per GitHub's release-assets documentation, asset names must be unique
-  # within a release — the unified target naming (one file per OS/arch,
-  # mozvpn-<target>-<libc>) guarantees that. softprops/action-gh-release
+  # within a release — the unified target naming (one file per
+  # OS/arch/libc) guarantees that. softprops/action-gh-release
   # attaches each matched file as its own asset and supports glob patterns
   # in `files`.
   # --------------------------------------------------------------------------
   release-bundle:
     name: Attach binaries to release
-    needs: [build, build-linux-x86, build-termux]
+    needs: [build, build-linux-glibc, build-linux-musl, build-termux]
     if: >
       startsWith(github.ref, 'refs/tags/v') ||
       startsWith(github.ref, 'refs/tags/release/') ||
@@ -1332,7 +1715,8 @@ jobs:
 
     steps:
       # Download all build artifacts into the SAME folder (merge-multiple:
-      # true) so every binary lands side by side as dist/mozvpn-<target>-<libc>.
+      # true) so every binary lands side by side as
+      # dist/mozvpn-<target>-<libc>.
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -1348,22 +1732,28 @@ jobs:
       # published WITHOUT ANY ERROR. This step checks the COMPLETE
       # expected set BEFORE anything is attached; ONE missing binary
       # means exit 1, the job fails and NOTHING is attached. If a new
-      # target is ever added to the build matrix, add its file here too.
+      # target is ever added to the build matrices, add its file here
+      # too. The list covers ALL 13 binaries: 4 glibc + 4 musl (FIX 26)
+      # + 2 termux + 3 windows.
       # ---------------------------------------------------------------------
       - name: Verify the COMPLETE binary set (FIX 22)
         run: |
           set -euo pipefail
           ls -laR dist
           expected=(
-            "mozvpn-linux-x86_64-glibc2.39"
-            "mozvpn-linux-armv8-glibc2.39"
-            "mozvpn-linux-armv9-glibc2.39"
-            "mozvpn-linux-x86-glibc2.41"
-            "mozvpn-termux-armv8-bionic"
-            "mozvpn-termux-armv9-bionic"
-            "mozvpn-windows-x86_64-ucrt.exe"
-            "mozvpn-windows-x86-ucrt.exe"
-            "mozvpn-windows-arm64-ucrt.exe"
+            "mozvpn-linux-x86_64-glibc2.41-ubuntu26.04"
+            "mozvpn-linux-x86-glibc2.41-ubuntu26.04"
+            "mozvpn-linux-armv8-glibc2.41-ubuntu26.04"
+            "mozvpn-linux-armv9-glibc2.41-ubuntu26.04"
+            "mozvpn-linux-x86_64-musl1.2.6-alpine3.24"
+            "mozvpn-linux-x86-musl1.2.6-alpine3.24"
+            "mozvpn-linux-armv8-musl1.2.6-alpine3.24"
+            "mozvpn-linux-armv9-musl1.2.6-alpine3.24"
+            "mozvpn-termux-armv8-bionic24"
+            "mozvpn-termux-armv9-bionic24"
+            "mozvpn-windows-x86_64-ucrt-win10.exe"
+            "mozvpn-windows-x86-ucrt-win10.exe"
+            "mozvpn-windows-arm64-ucrt-win10.exe"
           )
           missing=0
           for f in "${expected[@]}"; do
@@ -1379,12 +1769,20 @@ jobs:
           echo "All ${#expected[@]} expected binaries are present:"
           ls -1 dist/mozvpn-*
 
-      # Each file matching the glob becomes its OWN release asset:
-      # mozvpn-linux-x86_64-glibc2.39, mozvpn-linux-armv8-glibc2.39,
-      # mozvpn-linux-armv9-glibc2.39, mozvpn-linux-x86-glibc2.41,
-      # mozvpn-termux-armv8-bionic, mozvpn-termux-armv9-bionic,
-      # mozvpn-windows-x86_64-ucrt.exe, mozvpn-windows-x86-ucrt.exe,
-      # mozvpn-windows-arm64-ucrt.exe — no zip is created anywhere.
+      # Each file matching the glob becomes its OWN release asset — no
+      # zip is created anywhere:
+      #   mozvpn-linux-x86_64-glibc2.41-ubuntu26.04,
+      #   mozvpn-linux-x86-glibc2.41-ubuntu26.04,
+      #   mozvpn-linux-armv8-glibc2.41-ubuntu26.04,
+      #   mozvpn-linux-armv9-glibc2.41-ubuntu26.04,
+      #   mozvpn-linux-x86_64-musl1.2.6-alpine3.24,
+      #   mozvpn-linux-x86-musl1.2.6-alpine3.24,
+      #   mozvpn-linux-armv8-musl1.2.6-alpine3.24,
+      #   mozvpn-linux-armv9-musl1.2.6-alpine3.24,
+      #   mozvpn-termux-armv8-bionic24, mozvpn-termux-armv9-bionic24,
+      #   mozvpn-windows-x86_64-ucrt-win10.exe,
+      #   mozvpn-windows-x86-ucrt-win10.exe,
+      #   mozvpn-windows-arm64-ucrt-win10.exe.
       - name: Attach binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
