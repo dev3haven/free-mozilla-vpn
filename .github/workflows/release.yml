@@ -8,7 +8,7 @@
 #                         arm64; runs on ALL ARMv8+ hardware)
 #   linux-armv9         — 64-bit ARM Linux tuned for the ARMv9-A ISA (runs
 #                         on ARMv9 hardware: Neoverse N2/V2, Cobalt 100,
-#                         Cortex-X2+, Snapdragon 8 Gen 1+, Apple M-series
+#                         Cortex-X2+, Snapdragon 8 Gen 1+; Apple M-series
 #                         is NOT Linux — do NOT run this build on
 #                         ARMv8-only devices)
 #   linux-x86_64-musl   — the same four architectures, built against
@@ -34,11 +34,16 @@
 #    do not work on glibc Linux: different libc + ELF interpreter —
 #    see the NOTE below)
 #
-# BINARY NAMING (FIX 23, unified in FIX 25/26, 2026-10-31): every job
-# name AND every built binary file name carries the C library the binary
-# runs against — ONE popular, CURRENT, STABLE version per libc — and,
-# for the two Linux libcs, the MOST POPULAR distribution of that libc
-# (FIX 27, 2026-10-31): ubuntu26.04 for glibc, alpine3.24 for musl.
+# BINARY NAMING (FIX 23, unified in FIX 25/26/27, made fully uniform in
+# FIX 29, 2026-10-31): every job name AND every built binary file name
+# carries the C library the binary runs against — ONE popular, CURRENT,
+# STABLE version per libc — and, for the two Linux libcs, the MOST POPULAR
+# distribution of that libc (FIX 27): ubuntu26.04 for glibc, alpine3.24
+# for musl. Since FIX 29 EVERY job follows the SAME two formulas:
+#   job name:      Build <matrix.target> (<matrix.libc>)
+#   binary name:   mozvpn-<matrix.target>-<matrix.tag>[.exe]
+# so the naming lives in ONE place per matrix cell (target/libc/tag) and
+# no job glues its own ad-hoc suffixes anymore.
 #   linux-* (glibc)  — glibc 2.41 — Debian 13 "trixie" (the CURRENT
 #                      STABLE Debian, released 2025-08-09; glibc 2.41,
 #                      GCC 14.2 — verified 2026-10-31). ALL glibc builds
@@ -96,7 +101,7 @@
 #                      (the termux-app README: full app and package
 #                      support only on Android >= 7; the F-Droid/GitHub
 #                      builds used here support Android 7.0+).
-# The release assets are therefore named:
+# The release assets are therefore named (ONE formula, FIX 29):
 #   mozvpn-linux-x86_64-glibc2.41-ubuntu26.04,
 #   mozvpn-linux-x86-glibc2.41-ubuntu26.04,
 #   mozvpn-linux-armv8-glibc2.41-ubuntu26.04,
@@ -326,7 +331,7 @@
 #          No host path is mounted on either input or output.
 #        * Build exit code: docker run in the foreground — a non-zero
 #          container exit fails the GitHub Actions step automatically.
-#      The inner build script is unchanged: TARGET/MARCH are still
+#      The inner build script is unchanged in spirit: TARGET/TAG/MARCH are
 #      baked into the text by the matrix expression substitution (this
 #      was already proven to work in a live run), and the pkg toolchain
 #      and the dependency installation order are preserved. IMPORTANT:
@@ -361,8 +366,8 @@
 #      symbols at dlopen.
 #      FIX: LDFLAGS inside the Termux script gains -lpython${PYVER},
 #      where PYVER is derived from the interpreter itself (3.14.8 in
-#      the current Termux, verified 2026-10-25) — the libpython name
-#      follows the Python major automatically, with no hardcoding.
+#      the current Termux, verified 2026-10-25) — the libpython name follows the Python
+#      major automatically, with no hardcoding.
 #      aioquic/pylsqpack only benefit from this (their .so files also
 #      get all symbols resolved). A stable-ABI module linked against
 #      libpython works on Termux (the numpy precedent).
@@ -552,16 +557,16 @@
 #      "glibc >= the version linked against".
 #      IMPLEMENTATION: ALL glibc Linux builds now run inside
 #      python:3.15-slim-trixie containers — the SAME trixie slim
-#      build for
-#      amd64 (linux-x86_64), i386 (linux-x86) and arm64v8 (linux-armv8,
-#      linux-armv9) — so the runner own glibc is irrelevant to every
-#      produced binary, the annotation glibc2.41 is the truth for ALL
-#      FOUR targets, and the pipeline stays deterministic. The main
-#      matrix job keeps only the Windows cells; the ARM builds moved
-#      from native runner builds (setup-python + CCFLAGS on the host)
-#      to the container pattern proven by the linux-x86 job. The
-#      smoke tests run inside the same containers, so a glibc-linked
-#      binary is verified in its own libc environment.
+#      build for amd64 (linux-x86_64), i386 (linux-x86) and arm64v8
+#      (linux-armv8, linux-armv9) — so the runner own glibc is
+#      irrelevant to every produced binary, the annotation glibc2.41
+#      is the truth for ALL FOUR targets, and the pipeline stays
+#      deterministic. The main matrix job keeps only the Windows
+#      cells; the ARM builds moved from native runner builds
+#      (setup-python + CCFLAGS on the host) to the container pattern
+#      proven by the linux-x86 job. The smoke tests run inside the
+#      same containers, so a glibc-linked binary is verified in its
+#      own libc environment.
 #      NOTE on "x32": the "x32 ABI" that web searches surface is a
 #      DIFFERENT thing (ILP32 on the x86-64 kernel — 32-bit pointers
 #      with 64-bit registers); THIS 32-bit target is the classic i386
@@ -659,6 +664,55 @@
 #      i686-unknown-linux-gnu the rustup bootstrap works (seen
 #      live, FIX 10).
 #
+# FIX 29 (job-name unification + quoting repairs, 2026-10-31):
+#      The 2026-10-31 draft of the glibc/musl/termux rework carried
+#      FIVE defects, all fixed here — behavior preserved, naming
+#      and mechanics unified:
+#        (a) JOB NAME FORMAT was different in every job ("Build X
+#            (glibc 2.41, Ubuntu 26.04)" vs "Build X-musl (musl
+#            1.2.6, Alpine 3.24)" vs "Build termux-X (Bionic 24,
+#            Android 7.0+)" vs "Build X (UCRT, Windows 10+)").
+#            NOW every build job uses ONE template:
+#              Build <matrix.target> (<matrix.libc>)
+#            with matrix.target being the FULL uname-style target
+#            token everywhere (the Termux matrix cells are now
+#            termux-armv8 / termux-armv9, not bare armv8/armv9), so
+#            job names, matrix targets and file names finally use
+#            the same vocabulary.
+#        (b) BINARY FILE NAMES were glued ad-hoc per job (hardcoded
+#            -glibc2.41-ubuntu26.04 / -musl1.2.6-alpine3.24 /
+#            -bionic24 suffixes inside the inner scripts). NOW every
+#            matrix cell carries an explicit tag (glibc2.41-
+#            ubuntu26.04 / musl1.2.6-alpine3.24 / bionic24 /
+#            ucrt-win10) and every inner script builds ONE formula:
+#            mozvpn-${TARGET}-${TAG}. Artifact names equal binary
+#            names in every job. The release gate list (FIX 22) is
+#            unchanged — the file names were already correct.
+#        (c) QUOTING REGRESSION inside the single-quoted container
+#            scripts (glibc/musl/termux): the FIX 9 python -c
+#            one-liners and the platform.machine() probe had LOST
+#            their backslash-escaped inner double quotes
+#            (print("arch:", ...) instead of print(\"arch:\", ...)).
+#            Inside the outer single-quoted bash -c body, an
+#            UNescaped inner double quote TERMINATES the python
+#            argument early and splits it into bogus shell words —
+#            a guaranteed build failure in all three container jobs.
+#            Restored to the live-proven form of the original
+#            build-linux-x86 job (escaped \" pairs; still NO single
+#            quotes anywhere in these script bodies — the FIX 16
+#            rule, unchanged).
+#        (d) The march echo lines lost their closing bracket
+#            ("march: [${MARCH}" — now "[${MARCH}]").
+#        (e) The glibc/musl docker run lines now also pass
+#            -e APP_NAME -e FILE_VERSION -e SCRIPT next to
+#            -e PYTHON_VERSION, so the container builds consume the
+#            SAME workflow env values as the Windows job (company/
+#            product/file metadata + the script name) instead of
+#            hardcoding them — one source of truth for the naming
+#            metadata. The Termux job CANNOT do this: the
+#            termux-docker entrypoint drops -e env vars (FIX 14
+#            note), so it keeps the literals, documented in place.
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn-* file to the GitHub Release as a
@@ -690,9 +744,8 @@
 #     i686 wheel (verified 2026-10-25 on PyPI; abi3 covers Python
 #     3.15), but if its wheel is ever unavailable the same cell has to
 #     BUILD it from source — libffi-dev covers that chain too.
-#     Fix: libffi-dev is
-#     apt-installed in the glibc container jobs (and apk-installed in
-#     the musl cells), with an || fallback for
+#     Fix: libffi-dev is apt-installed in the glibc container jobs
+#     (and apk-installed in the musl cells), with an || fallback for
 #     zstandard ONLY (aioquic stays REQUIRED — the build fails if it
 #     cannot be built).
 #
@@ -720,7 +773,7 @@
 #     on windows-11-arm (the 3.15.1 manifest asset list, verified
 #     2026-10-25, covers win32/win_amd64/win_arm64) — it is used ONLY
 #     by the Windows cells now; every Linux build uses the official
-#     python Docker images (3.15-slim trixie / 3.15-alpine3.24).
+#     python Docker images (3.15-slim-trixie / 3.15-alpine3.24).
 #   * Docker is preinstalled on the ubuntu-24.04 and ubuntu-24.04-arm
 #     hosted runners, so the glibc/musl container builds and the
 #     Termux build run natively (no emulation anywhere in this
@@ -736,8 +789,8 @@
 #     runner mounts only 64-bit node binaries into /__e/, so every
 #     action dies in an i386 container with "exec /__e/node24/bin/node:
 #     no such file or directory" (actions/runner#2115). Actions run on
-#     the host; the builds run via plain `docker run` with the
-#     workspace bind-mounted (FIX 14 note: the Termux job uses the
+#     the host; the glibc/musl builds run via plain `docker run` with
+#     the workspace bind-mounted (FIX 14 note: the Termux job uses the
 #     docker build + docker cp pattern instead).
 #   * linux-x86 (glibc AND musl) runs natively on the x86_64 kernel —
 #     no emulation.
@@ -785,8 +838,8 @@ env:
   #     version in the file names stays the truth);
   #   * the official python:3.15-alpine3.24 images (Alpine 3.24,
   #     musl 1.2.6) cover amd64, i386 and arm64v8 — ALL musl builds
-  #     (FIX 26; the Alpine tag is PINNED so the musl version in the
-  #     file names stays the truth);
+  #     (FIX 26; the Alpine tag is PINNED so the musl version in
+  #     the file names stays the truth);
   #   * Nuitka 4.3.1 pronounces Python 3.15 experimentally supported
   #     (its changelog; the official PyPI range is still 3.4-3.14);
   #   * Pillow 13.0.0 ships cp315 wheels (incl. win32/win_arm64 and
@@ -813,6 +866,8 @@ jobs:
   # version annotation is the OS baseline: ucrt-win10 = Windows 10+.
   # Nuitka ships the dependent VC runtime DLLs itself (Nuitka User
   # Manual).
+  # FIX 29: the job name template is IDENTICAL in all four build jobs:
+  #   Build <matrix.target> (<matrix.libc>)
   # --------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.target }} (${{ matrix.libc }})
@@ -988,12 +1043,19 @@ jobs:
   # becomes the default — the explicit slim-trixie tag pins the
   # glibc 2.41 base for the whole 3.15 lifetime; the same determinism
   # doctrine as FIX 23 ubuntu-24.04 and FIX 26 alpine3.24) — so EVERY
-  # glibc binary is linked against the
-  # SAME glibc 2.41 (libc6 in trixie) and the annotation glibc2.41 is
-  # the truth for all four targets. The HOST runner glibc is irrelevant:
-  # the binary is produced entirely inside the container and never
-  # touches the host libc. Debian 13 ships GCC 14.2, which accepts
-  # -march=armv9-a (GCC >= 12).
+  # glibc binary is linked against the SAME glibc 2.41 (libc6 in
+  # trixie) and the annotation glibc2.41 is the truth for all four
+  # targets. The HOST runner glibc is irrelevant: the binary is
+  # produced entirely inside the container and never touches the host
+  # libc. Debian 13 ships GCC 14.2, which accepts -march=armv9-a
+  # (GCC >= 12).
+  #
+  # FIX 27: the job name and the file name carry ubuntu26.04 —
+  # Ubuntu 26.04 LTS, the most popular glibc distribution and the
+  # verified TARGET distro (its glibc 2.43 satisfies the 2.41
+  # floor). The BUILD base stays the pinned Debian 13 trixie
+  # containers (FIX 25) — the token names the target, not the
+  # build base.
   #
   # Platforms (all native, no emulation):
   #   linux/amd64  on ubuntu-24.04       (linux-x86_64)
@@ -1011,20 +1073,21 @@ jobs:
   # FIX 14 empty-mount incident was specific to the termux-docker
   # entrypoint).
   #
-  # FIX 24: the docker run lines pass --dns 8.8.8.8 --dns 1.1.1.1 —
+  # FIX 24: the docker run line passes --dns 8.8.8.8 --dns 1.1.1.1 —
   # without them the container inherits the runner resolv.conf with
   # the systemd-resolved stub 127.0.0.53, which is unreachable from the
   # container network namespace (the live "Temporary failure resolving
   # deb.debian.org" failure, 2026-10-31).
+  #
+  # FIX 29: the job name follows the SAME template as every other
+  # build job, the matrix carries the tag (glibc2.41-ubuntu26.04) and
+  # the inner script builds the file name by the ONE formula
+  # mozvpn-${TARGET}-${TAG}. The docker run line also forwards
+  # APP_NAME/FILE_VERSION/SCRIPT so the Nuitka metadata options read
+  # the SAME workflow env values as the Windows job.
   # --------------------------------------------------------------------------
   build-linux-glibc:
-    # FIX 27: the job name and the file name carry ubuntu26.04 —
-    # Ubuntu 26.04 LTS, the most popular glibc distribution and the
-    # verified TARGET distro (its glibc 2.43 satisfies the 2.41
-    # floor). The BUILD base stays the pinned Debian 13 trixie
-    # containers (FIX 25) — the token names the target, not the
-    # build base.
-    name: Build ${{ matrix.target }} (glibc 2.41, Ubuntu 26.04)
+    name: Build ${{ matrix.target }} (${{ matrix.libc }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -1034,18 +1097,26 @@ jobs:
             platform: linux/amd64
             target: linux-x86_64
             march: ""
+            libc: "glibc 2.41, Ubuntu 26.04"
+            tag: glibc2.41-ubuntu26.04
           - os: ubuntu-24.04
             platform: linux/386
             target: linux-x86
             march: ""
+            libc: "glibc 2.41, Ubuntu 26.04"
+            tag: glibc2.41-ubuntu26.04
           - os: ubuntu-24.04-arm
             platform: linux/arm64
             target: linux-armv8
             march: ""
+            libc: "glibc 2.41, Ubuntu 26.04"
+            tag: glibc2.41-ubuntu26.04
           - os: ubuntu-24.04-arm
             platform: linux/arm64
             target: linux-armv9
             march: "-march=armv9-a"
+            libc: "glibc 2.41, Ubuntu 26.04"
+            tag: glibc2.41-ubuntu26.04
 
     steps:
       - name: Checkout
@@ -1063,18 +1134,21 @@ jobs:
           # becomes the default — changing the linked glibc under the
           # glibc2.41 name. Same determinism doctrine as pinning
           # ubuntu-24.04 over ubuntu-latest (FIX 23) and alpine3.24 over
-          # alpine (FIX 26).
+          # alpine (FIX 26). FIX 29: APP_NAME/FILE_VERSION/SCRIPT are
+          # forwarded too, so the Nuitka metadata options below read the
+          # same workflow env values as the Windows job.
           docker run --rm \
             --platform ${{ matrix.platform }} \
             --dns 8.8.8.8 --dns 1.1.1.1 \
-            -e PYTHON_VERSION \
+            -e PYTHON_VERSION -e APP_NAME -e FILE_VERSION -e SCRIPT \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
             "python:${PYTHON_VERSION}-slim-trixie" \
             bash -euo pipefail -c '
               TARGET="${{ matrix.target }}"
+              TAG="${{ matrix.tag }}"
               MARCH="${{ matrix.march }}"
-              echo "=== glibc target: ${TARGET} | march: [${MARCH}]"
+              echo "=== glibc target: ${TARGET} | tag: ${TAG} | march: [${MARCH}]"
               # Pre-built packages only where they exist; everything that
               # must be built from source (FIX 10) needs its native
               # SYSTEM headers present (these are OS packages, NOT pip
@@ -1129,6 +1203,11 @@ jobs:
               # FIX 9: prove pip/setuptools + ALL runtime deps are
               # importable; versions come from importlib.metadata, NEVER
               # from module __version__ attributes (pyotp has none).
+              # FIX 29: the inner double quotes are backslash-escaped —
+              # this body is the single-quoted argument of bash -c, and
+              # an unescaped inner double quote would terminate the
+              # python argument early (live-proven form of the original
+              # build-linux-x86 job; FIX 16 rule: no single quotes here).
               python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
               python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
               python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
@@ -1138,7 +1217,9 @@ jobs:
               # Nuitka build. The ARMv9 flavor is produced purely via the
               # CCFLAGS/LDFLAGS environment values (MARCH is empty for
               # every other target); Nuitka applies the CCFLAGS/LDFLAGS
-              # env values ON TOP of its own flag set.
+              # env values ON TOP of its own flag set. FIX 29: the file
+              # name follows the ONE formula mozvpn-${TARGET}-${TAG}, and
+              # the metadata options read the forwarded workflow env.
               CCFLAGS="${MARCH}" LDFLAGS="${MARCH}" python -m nuitka \
                 --standalone \
                 --onefile \
@@ -1151,33 +1232,33 @@ jobs:
                 --include-package=aioquic \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-${TARGET}-glibc2.41-ubuntu26.04" \
-                --company-name="Free Mozilla VPN" \
-                --product-name="Free Mozilla VPN" \
-                --file-description="Free Mozilla VPN (mozvpn)" \
-                --file-version="1.0.0.0" \
-                --product-version="1.0.0.0" \
+                --output-filename="mozvpn-${TARGET}-${TAG}" \
+                --company-name="${APP_NAME}" \
+                --product-name="${APP_NAME}" \
+                --file-description="${APP_NAME} (mozvpn)" \
+                --file-version="${FILE_VERSION}" \
+                --product-version="${FILE_VERSION}" \
                 --remove-output \
                 --assume-yes-for-downloads \
-                "mozvpn.py"
-              # Smoke test (FIX 19: FATAL — no || true anymore; see
-              # the matrix-job smoke step). --help works because the
-              # script uses argparse and exits 0; the Nuitka onefile
-              # bootstrap propagates the child exit status, so a crash
-              # (e.g. SIGILL = exit 132) FAILS the build under set -e.
-              # The binary runs right here in the same trixie container
-              # it was built in (on the armv9 cells that means the
-              # Neoverse N2 runner executes the ARMv9 encodings).
-              file "build/mozvpn-${TARGET}-glibc2.41-ubuntu26.04"
-              "./build/mozvpn-${TARGET}-glibc2.41-ubuntu26.04" --help
-              echo "smoke: build/mozvpn-${TARGET}-glibc2.41-ubuntu26.04 --help exited 0"
+                "${SCRIPT}"
+              # Smoke test (FIX 19: FATAL — no || true anymore). --help
+              # works because the script uses argparse and exits 0; the
+              # Nuitka onefile bootstrap propagates the child exit
+              # status, so a crash (e.g. SIGILL = exit 132) FAILS the
+              # build under set -e. The binary runs right here in the
+              # same trixie container it was built in (on the armv9 cell
+              # that means the Neoverse N2 runner executes the ARMv9
+              # encodings).
+              file "build/mozvpn-${TARGET}-${TAG}"
+              "./build/mozvpn-${TARGET}-${TAG}" --help
+              echo "smoke: build/mozvpn-${TARGET}-${TAG} --help exited 0"
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-${{ matrix.target }}-glibc2.41-ubuntu26.04
-          path: build/mozvpn-${{ matrix.target }}-glibc2.41-ubuntu26.04*
+          name: mozvpn-${{ matrix.target }}-${{ matrix.tag }}
+          path: build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}*
           if-no-files-found: error
           retention-days: 14
 
@@ -1218,9 +1299,15 @@ jobs:
   # FIX 24: --dns 8.8.8.8 --dns 1.1.1.1 on the docker run line (same
   # DNS root cause as the glibc cells; apk would fail identically
   # without it).
+  #
+  # FIX 29: the job name follows the SAME template as every other
+  # build job (no ad-hoc -musl glued into the name — the libc parens
+  # already say it), the matrix carries the tag
+  # (musl1.2.6-alpine3.24) and the inner script builds the file name
+  # by the ONE formula mozvpn-${TARGET}-${TAG}.
   # --------------------------------------------------------------------------
   build-linux-musl:
-    name: Build ${{ matrix.target }}-musl (musl 1.2.6, Alpine 3.24)
+    name: Build ${{ matrix.target }} (${{ matrix.libc }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -1230,18 +1317,26 @@ jobs:
             platform: linux/amd64
             target: linux-x86_64
             march: ""
+            libc: "musl 1.2.6, Alpine 3.24"
+            tag: musl1.2.6-alpine3.24
           - os: ubuntu-24.04
             platform: linux/386
             target: linux-x86
             march: ""
+            libc: "musl 1.2.6, Alpine 3.24"
+            tag: musl1.2.6-alpine3.24
           - os: ubuntu-24.04-arm
             platform: linux/arm64
             target: linux-armv8
             march: ""
+            libc: "musl 1.2.6, Alpine 3.24"
+            tag: musl1.2.6-alpine3.24
           - os: ubuntu-24.04-arm
             platform: linux/arm64
             target: linux-armv9
             march: "-march=armv9-a"
+            libc: "musl 1.2.6, Alpine 3.24"
+            tag: musl1.2.6-alpine3.24
 
     steps:
       - name: Checkout
@@ -1252,17 +1347,21 @@ jobs:
           set -euo pipefail
           # NOTE: the workflow-level env block is exported into run-step
           # shells, so ${PYTHON_VERSION} expands correctly here (host shell).
+          # FIX 29: APP_NAME/FILE_VERSION/SCRIPT are forwarded too, so
+          # the Nuitka metadata options below read the same workflow env
+          # values as the Windows job.
           docker run --rm \
             --platform ${{ matrix.platform }} \
             --dns 8.8.8.8 --dns 1.1.1.1 \
-            -e PYTHON_VERSION \
+            -e PYTHON_VERSION -e APP_NAME -e FILE_VERSION -e SCRIPT \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
             "python:${PYTHON_VERSION}-alpine3.24" \
             sh -eu -c '
               TARGET="${{ matrix.target }}"
+              TAG="${{ matrix.tag }}"
               MARCH="${{ matrix.march }}"
-              echo "=== musl target: ${TARGET} | march: [${MARCH}]"
+              echo "=== musl target: ${TARGET} | tag: ${TAG} | march: [${MARCH}]"
               cat /etc/alpine-release
               ldd --version 2>&1 | head -n 1 || true
               # System packages for the Nuitka toolchain and every pip
@@ -1311,9 +1410,9 @@ jobs:
               # installed; wheels are used where they exist — cryptography
               # and Pillow ship musllinux wheels for x86_64/aarch64 —
               # and every sdist fallback is covered by the apk packages
-              # above and the FIX 28 native rust toolchain on i686). The Windows-only cryptography pin in
-              # requirements.txt does not apply here (sys_platform is
-              # linux).
+              # above and the FIX 28 native rust toolchain on i686). The
+              # Windows-only cryptography pin in requirements.txt does
+              # not apply here (sys_platform is linux).
               if [ -f requirements.txt ]; then
                 python -m pip install -r requirements.txt
               else
@@ -1335,6 +1434,11 @@ jobs:
               # FIX 9: prove pip/setuptools + ALL runtime deps are
               # importable; versions come from importlib.metadata, NEVER
               # from module __version__ attributes (pyotp has none).
+              # FIX 29: the inner double quotes are backslash-escaped —
+              # this body is the single-quoted argument of sh -c, and
+              # an unescaped inner double quote would terminate the
+              # python argument early (FIX 16 rule: no single quotes
+              # here).
               python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
               python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
               python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
@@ -1346,6 +1450,9 @@ jobs:
               # every other target) — same policy as the glibc armv9
               # cell: targets ARMv9 Linux servers; the TERMUX armv9
               # cell keeps -mtune=neoverse-n2 instead (phones, FIX 18).
+              # FIX 29: the file name follows the ONE formula
+              # mozvpn-${TARGET}-${TAG}, and the metadata options read
+              # the forwarded workflow env.
               CCFLAGS="${MARCH}" LDFLAGS="${MARCH}" python -m nuitka \
                 --standalone \
                 --onefile \
@@ -1358,31 +1465,31 @@ jobs:
                 --include-package=aioquic \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-${TARGET}-musl1.2.6-alpine3.24" \
-                --company-name="Free Mozilla VPN" \
-                --product-name="Free Mozilla VPN" \
-                --file-description="Free Mozilla VPN (mozvpn)" \
-                --file-version="1.0.0.0" \
-                --product-version="1.0.0.0" \
+                --output-filename="mozvpn-${TARGET}-${TAG}" \
+                --company-name="${APP_NAME}" \
+                --product-name="${APP_NAME}" \
+                --file-description="${APP_NAME} (mozvpn)" \
+                --file-version="${FILE_VERSION}" \
+                --product-version="${FILE_VERSION}" \
                 --remove-output \
                 --assume-yes-for-downloads \
-                "mozvpn.py"
+                "${SCRIPT}"
               # Smoke test (FIX 19: FATAL). The musl binary runs right
               # here in the same Alpine container, against the same musl
               # it will meet on the user machine; --help exits 0 via
               # argparse and the Nuitka onefile bootstrap propagates the
               # child exit status, so any crash (e.g. SIGILL = exit 132
               # on the armv9 cell) FAILS the build under set -e.
-              file "build/mozvpn-${TARGET}-musl1.2.6-alpine3.24"
-              "./build/mozvpn-${TARGET}-musl1.2.6-alpine3.24" --help
-              echo "smoke: build/mozvpn-${TARGET}-musl1.2.6-alpine3.24 --help exited 0"
+              file "build/mozvpn-${TARGET}-${TAG}"
+              "./build/mozvpn-${TARGET}-${TAG}" --help
+              echo "smoke: build/mozvpn-${TARGET}-${TAG} --help exited 0"
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-${{ matrix.target }}-musl1.2.6-alpine3.24
-          path: build/mozvpn-${{ matrix.target }}-musl1.2.6-alpine3.24*
+          name: mozvpn-${{ matrix.target }}-${{ matrix.tag }}
+          path: build/mozvpn-${{ matrix.target }}-${{ matrix.tag }}*
           if-no-files-found: error
           retention-days: 14
 
@@ -1464,18 +1571,31 @@ jobs:
   # inherited host resolv.conf as every other container; with the
   # runner stub 127.0.0.53 unreachable from the container netns, pkg
   # update would fail exactly like apt did in the glibc cell.
+  #
+  # FIX 29: the matrix target is the FULL token (termux-armv8 /
+  # termux-armv9) like in every other job, the matrix carries the tag
+  # (bionic24) and the inner script builds the file name by the ONE
+  # formula mozvpn-${TARGET}-${TAG}. The Nuitka metadata literals
+  # (Free Mozilla VPN / 1.0.0.0 / mozvpn.py) stay HARDCODED here on
+  # purpose: the termux-docker entrypoint drops Docker -e env vars
+  # (FIX 14 note), so the forwarded-env trick of the glibc/musl jobs
+  # is NOT available in this cell.
   # --------------------------------------------------------------------------
   build-termux:
-    name: Build termux-${{ matrix.target }} (Bionic 24, Android 7.0+)
+    name: Build ${{ matrix.target }} (${{ matrix.libc }})
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: armv8
+          - target: termux-armv8
             march: ""
-          - target: armv9
+            libc: "Bionic 24, Android 7.0+"
+            tag: bionic24
+          - target: termux-armv9
             march: "-mtune=neoverse-n2"
+            libc: "Bionic 24, Android 7.0+"
+            tag: bionic24
 
     steps:
       - name: Checkout
@@ -1519,15 +1639,16 @@ jobs:
               # NOTE: termux-docker entrypoint passes COMMAND-LINE ARGUMENTS
               # into the Termux environment (through a privilege-dropping su,
               # UID 1000) — Docker `-e` env vars do NOT survive into it.
-              # The two GitHub Actions expression substitutions below are
+              # The GitHub Actions expression substitutions below are
               # replaced BEFORE the shell runs, so the inner script sees
               # plain literals (never write a bare expression placeholder in
               # a comment: the workflow parser evaluates every expression
               # token in the whole file, comments inside run: included).
               TARGET="${{ matrix.target }}"
+              TAG="${{ matrix.tag }}"
               MARCH="${{ matrix.march }}"
               export PIP_BREAK_SYSTEM_PACKAGES=1
-              echo "=== Termux arch: $(uname -m) | target: ${TARGET} | march: [${MARCH}]"
+              echo "=== Termux arch: $(uname -m) | target: ${TARGET} | tag: ${TAG} | march: [${MARCH}]"
               pkg update -y || true
               pkg install -y \
                 python python-pip \
@@ -1654,7 +1775,9 @@ jobs:
               python -m pip install --upgrade zstandard || \
                 echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
               # FIX 9: versions ONLY via importlib.metadata (pyotp does
-              # not export __version__).
+              # not export __version__). FIX 29: the inner double quotes
+              # are backslash-escaped — live-proven form of the original
+              # job; FIX 16 rule: no single quotes anywhere in this body.
               python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
               python -c "import pyotp; from importlib.metadata import version; print(\"pyotp\", version(\"pyotp\"))"
               python -c "import zxingcpp; from importlib.metadata import version; print(\"zxing-cpp\", version(\"zxing-cpp\"))"
@@ -1667,6 +1790,12 @@ jobs:
               # termux-elf-cleaner; standalone rpath for Termux was fixed
               # in Nuitka 2.6.7/2.7). termux-elf-cleaner afterwards strips
               # the ELF versions Android linker64 does not support.
+              # FIX 29: the file name follows the ONE formula
+              # mozvpn-${TARGET}-${TAG}. The metadata literals stay
+              # hardcoded in this cell: the termux-docker entrypoint
+              # drops Docker -e env vars (FIX 14 note), so the
+              # forwarded-env trick of the glibc/musl jobs is NOT
+              # available here.
               python -m nuitka \
                 --standalone \
                 --onefile \
@@ -1680,7 +1809,7 @@ jobs:
                 --clang \
                 --jobs=4 \
                 --output-dir=build \
-                --output-filename="mozvpn-termux-${TARGET}-bionic24" \
+                --output-filename="mozvpn-${TARGET}-${TAG}" \
                 --company-name="Free Mozilla VPN" \
                 --product-name="Free Mozilla VPN" \
                 --file-description="Free Mozilla VPN (mozvpn, Termux/Android Bionic)" \
@@ -1690,15 +1819,14 @@ jobs:
                 --assume-yes-for-downloads \
                 "mozvpn.py"
               # Smoke test inside the real Termux (FIX 19: FATAL —
-              # no || true anymore; see the matrix-job smoke step).
-              # The binary is Bionic and runs right here on the
-              # aarch64 host; --help exits 0 via argparse. A SIGILL
-              # (like the FIX 18 armv9 incident) exits non-zero
-              # (128+4=132) and FAILS the build under set -e — a
-              # broken binary can no longer ship unnoticed.
-              file build/mozvpn-termux-"${TARGET}"-bionic24
-              ./build/mozvpn-termux-"${TARGET}"-bionic24 --help
-              echo "smoke: termux ${TARGET} --help exited 0"
+              # no || true anymore). The binary is Bionic and runs
+              # right here on the aarch64 host; --help exits 0 via
+              # argparse. A SIGILL (like the FIX 18 armv9 incident)
+              # exits non-zero (128+4=132) and FAILS the build under
+              # set -e — a broken binary can no longer ship unnoticed.
+              file "build/mozvpn-${TARGET}-${TAG}"
+              "./build/mozvpn-${TARGET}-${TAG}" --help
+              echo "smoke: ${TARGET} --help exited 0"
               # NOTE: the binary is NOT copied out through a bind mount
               # anymore (FIX 14). The host extracts it from the stopped
               # container via `docker cp` (see below).
@@ -1708,7 +1836,7 @@ jobs:
           # container — docker cp officially works with stopped containers,
           # and no host path is ever mounted.
           docker cp \
-            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-termux-${{ matrix.target }}-bionic24 \
+            mozvpn-termux-build:/data/data/com.termux/files/home/mozvpn/build/mozvpn-${{ matrix.target }}-${{ matrix.tag }} \
             termux-out/
           docker rm mozvpn-termux-build
 
@@ -1716,14 +1844,14 @@ jobs:
         run: |
           set -euo pipefail
           ls -la termux-out
-          test -f termux-out/mozvpn-termux-${{ matrix.target }}-bionic24
-          file termux-out/mozvpn-termux-${{ matrix.target }}-bionic24
+          test -f termux-out/mozvpn-${{ matrix.target }}-${{ matrix.tag }}
+          file termux-out/mozvpn-${{ matrix.target }}-${{ matrix.tag }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: mozvpn-termux-${{ matrix.target }}-bionic24
-          path: termux-out/mozvpn-termux-${{ matrix.target }}-bionic24
+          name: mozvpn-${{ matrix.target }}-${{ matrix.tag }}
+          path: termux-out/mozvpn-${{ matrix.target }}-${{ matrix.tag }}
           if-no-files-found: error
           retention-days: 14
 
