@@ -713,6 +713,45 @@
 #            termux-docker entrypoint drops -e env vars (FIX 14
 #            note), so it keeps the literals, documented in place.
 #
+# FIX 30 (patchelf 0.18.0 rejected by Nuitka, live run 2026-10-31):
+#      the musl armv9 cell died right after the dependency install:
+#        FATAL: Error, patchelf version 0.18.0 is a known buggy
+#        release and cannot be used. Please upgrade or downgrade it.
+#      ROOT CAUSE: the Nuitka check checkPatchElfPresenceAndUsability
+#      (nuitka/utils/SharedLibraries.py) hard-refuses EXACTLY
+#      version_tuple == (0, 18, 0) — and BOTH pinned build bases ship
+#      exactly that version: Alpine 3.24 packages patchelf 0.18.0-r3
+#      (seen live in the apk log of the failing run) and Debian 13
+#      trixie ships patchelf 0.18.0-1.4 (the Debian trixie package
+#      page) — so the glibc cells fail identically, preemptively
+#      fixed here too. The pinned distro branches offer NO other
+#      version through their package managers.
+#      FIX: the glibc and musl container jobs NO LONGER install the
+#      distro patchelf; they BUILD the pinned current stable patchelf
+#      0.19.3 from the OFFICIAL release source tarball (the GitHub
+#      release assets of the NixOS/patchelf 0.19.3 tag) into
+#      /usr/local/bin, with the published sha256 verified BEFORE the
+#      build and the active binary version verified AFTER it
+#      (patchelf --version | grep -q 0.19.3 — under set -e any
+#      mismatch FAILS the job). patchelf is a small autotools C++
+#      program: configure + make + make install, with g++/make
+#      already installed in both containers (apt g++ / apk
+#      build-base). The tarball is fetched with curl (apt-installed
+#      in the trixie cell) / busybox wget (built into the Alpine base
+#      image); ca-certificates ships with the official python images
+#      (pip itself needs HTTPS). 0.19.3 is the current stable
+#      release (the latest tag, 2026-10-30; its changelog fixes
+#      executable-rewrite and musl-related load-segment bugs).
+#      ANY version other than 0.18.0 passes the Nuitka check (the
+#      rejection is an exact version equality), so bumping the pin
+#      later is safe — update the sha256 from the release page when
+#      doing so.
+#      Termux is NOT affected and NOT touched: its patchelf comes
+#      from the Termux packages, the Termux cell runs Nuitka 4.2.2
+#      and its live runs completed the build (FIX 21) — no
+#      patchelf-version FATAL was ever seen there. Windows does not
+#      use patchelf at all (standalone patching there is MSVC-based).
+#
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
 # true) and attaches every mozvpn-* file to the GitHub Release as a
@@ -1166,10 +1205,38 @@ jobs:
               #                  "RequiredDependencyException: zlib") (FIX 10).
               #   make          — gcc LTO needs it for parallel LTRANS linking
               #                  (Nuitka#3238).
+              # FIX 30: patchelf is NOT taken from the distro (trixie
+              # ships 0.18.0-1.4, which Nuitka hard-refuses — see the
+              # header FIX 30); the pinned 0.19.3 is built from the
+              # official source tarball below. curl fetches it
+              # (ca-certificates ships with the python slim images).
               apt-get update
               apt-get install -y --no-install-recommends \
-                gcc g++ make ccache patchelf file libffi-dev \
+                gcc g++ make ccache curl file libffi-dev \
                 pkg-config libssl-dev zlib1g-dev libjpeg-dev
+              # FIX 30: build patchelf 0.19.3 (pinned, current stable)
+              # from the official release tarball into /usr/local/bin —
+              # earlier on PATH than any distro binary. The published
+              # sha256 is verified BEFORE the build and the active
+              # version AFTER it; under set -e any mismatch FAILS the
+              # job. patchelf is a small autotools C++ program, and
+              # g++/make are installed above.
+              curl -fsSL -o /tmp/patchelf-0.19.3.tar.gz \
+                https://github.com/NixOS/patchelf/releases/download/0.19.3/patchelf-0.19.3.tar.gz
+              echo "fac76a3c0b730e8d53ea1d10cd6015322d78c9900af91736f2cca51d5837b612  /tmp/patchelf-0.19.3.tar.gz" | sha256sum -c -
+              (
+                cd /tmp
+                tar -xzf patchelf-0.19.3.tar.gz
+                cd patchelf-0.19.3
+                ./configure
+                make -j4
+                make install
+              )
+              patchelf --version
+              patchelf --version | grep -q "0.19.3" || {
+                echo "ERROR: patchelf 0.19.3 not active on PATH" >&2
+                exit 1
+              }
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               python -m pip install --upgrade pip
@@ -1367,8 +1434,9 @@ jobs:
               # System packages for the Nuitka toolchain and every pip
               # sdist fallback (FIX 26, the FIX 10 analog — these are OS
               # packages, NOT pip packages):
-              #   build-base (gcc g++ make musl-dev binutils) + patchelf +
-              #   ccache + file — the Nuitka toolchain
+              #   build-base (gcc g++ make musl-dev binutils) +
+              #   ccache + file — the Nuitka toolchain (patchelf is
+              #   NOT taken from apk — FIX 30 below)
               #   cmake + ninja — zxing-cpp builds via scikit-build-core,
               #                 which needs a system cmake >= 3.18 (FIX 13)
               #   pkgconf + openssl-dev — the cryptography sdist build
@@ -1379,8 +1447,14 @@ jobs:
               #   libffi-dev — the cffi chain (zstandard sdist)
               #   zlib-dev + jpeg-dev — the Pillow sdist (i686)
               #   linux-headers — the pylsqpack / aioquic sdist builds
+              # FIX 30: patchelf is NOT taken from apk (Alpine 3.24
+              # ships 0.18.0-r3, which Nuitka hard-refuses — the live
+              # FATAL of 2026-10-31; see the header FIX 30); the pinned
+              # 0.19.3 is built from the official source tarball below.
+              # busybox wget fetches it (built into the Alpine base
+              # image; ca-certificates ships with the python image).
               apk add --no-cache \
-                build-base patchelf file ccache cmake ninja pkgconf \
+                build-base file ccache cmake ninja pkgconf \
                 openssl-dev libffi-dev zlib-dev jpeg-dev linux-headers
               # FIX 28 (musl i686 cryptography sdist, live run
               # 2026-10-31): cryptography 50.0.2 has NO musllinux
@@ -1402,6 +1476,30 @@ jobs:
                   apk add --no-cache rust cargo
                   ;;
               esac
+              # FIX 30: build patchelf 0.19.3 (pinned, current stable)
+              # from the official release tarball into /usr/local/bin —
+              # earlier on PATH than any distro binary. The published
+              # sha256 is verified BEFORE the build (busybox sha256sum
+              # -c) and the active version AFTER it; under set -e any
+              # mismatch FAILS the job. patchelf is a small autotools
+              # C++ program, and g++/make are installed above via
+              # build-base.
+              wget -q -O /tmp/patchelf-0.19.3.tar.gz \
+                https://github.com/NixOS/patchelf/releases/download/0.19.3/patchelf-0.19.3.tar.gz
+              echo "fac76a3c0b730e8d53ea1d10cd6015322d78c9900af91736f2cca51d5837b612  /tmp/patchelf-0.19.3.tar.gz" | sha256sum -c -
+              (
+                cd /tmp
+                tar -xzf patchelf-0.19.3.tar.gz
+                cd patchelf-0.19.3
+                ./configure
+                make -j4
+                make install
+              )
+              patchelf --version
+              patchelf --version | grep -q "0.19.3" || {
+                echo "ERROR: patchelf 0.19.3 not active on PATH" >&2
+                exit 1
+              }
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               python -m pip install --upgrade pip
