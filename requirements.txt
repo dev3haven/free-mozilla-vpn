@@ -3,8 +3,15 @@
 #
 # This is THE single source of truth for the script's runtime deps; the
 # CI workflow (release.yml) only runs `pip install -r requirements.txt`
-# and FAILS if it cannot be satisfied — nothing runtime-related is
-# pinned or hardcoded in the workflow.
+# in EVERY build environment — the Windows runner cells, the Debian 13
+# "trixie" glibc containers, the Alpine 3.24 musl containers and the
+# Termux environment — and FAILS if it cannot be satisfied; nothing
+# runtime-related is pinned or hardcoded in the workflow. The two
+# files are verified IN SYNC (2026-10-31): the workflow quotes the
+# pin line below verbatim, installs the system headers this file's
+# comments promise (apt in the trixie glibc containers, apk in the
+# Alpine musl containers) and pre-installs the Termux packages
+# described below BEFORE running pip against this file.
 #
 # Direct runtime deps of mozvpn.py:
 #   pyotp      — TOTP code generation (REQUIRED for 2FA)
@@ -14,7 +21,8 @@
 #                without it every upstream falls back to HTTP CONNECT)
 #
 # Transitive dependency of aioquic that needs an explicit constraint:
-#   cryptography — aioquic requires `cryptography>=43.0.0`. Two problem
+#   cryptography — aioquic requires `cryptography>=43.0.0` (aioquic
+#                 1.7.0, verified on PyPI 2026-10-31). Two problem
 #                 platforms in the current release line (50.x; latest
 #                 50.0.2, released 2026-09-30):
 #                   * win_arm64: no wheel at all — pyca dropped them
@@ -36,11 +44,19 @@
 #                 The pin is applied to ALL Windows via the PEP 508
 #                 marker `sys_platform == "win32"` — uniform and immune
 #                 to the platform_machine() ambiguity of 32-bit Python
-#                 under WOW64. Linux keeps resolving to the latest
-#                 release, which has prebuilt wheels there (on i686
-#                 Linux the workflow apt-installs pkg-config +
-#                 libssl-dev so the sdist build succeeds). macOS is not
-#                 targeted by this workflow; note that the latest
+#                 under WOW64. LINUX (glibc AND musl) keeps resolving
+#                 to the latest release: prebuilt manylinux AND
+#                 musllinux_1_2 wheels exist for x86_64/aarch64; on the
+#                 32-bit x86 cells the sdist builds succeed because
+#                 the workflow installs the system headers first —
+#                 pkg-config + libssl-dev via apt (Debian 13 trixie
+#                 glibc container) and pkgconf + openssl-dev via apk
+#                 (Alpine 3.24 musl container), plus zlib1g-dev +
+#                 libjpeg-dev (glibc) / zlib-dev + jpeg-dev (musl) for
+#                 the Pillow sdist; the Rust toolchain for the
+#                 cryptography sdist is fetched by its build backend
+#                 itself (seen live; FIX 10 in release.yml). macOS is
+#                 not targeted by this workflow; note that the latest
 #                 releases ship macOS arm64 wheels only. FORWARD-LOOKING:
 #                 the unreleased 51.0.0 changelog requires "CFFI 2.1.1
 #                 or newer on Python 3.15 to avoid an ABI issue" —
