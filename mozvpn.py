@@ -4,6 +4,46 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-10-31 (v9.4) - THE 502 LOG DEDUP (the user's report:
+  'Egress answered HTTP 502 for <...>' lines keep coming while
+  everything works, and the run feels slower than it should; every
+  algorithm NOT listed here is UNTOUCHED).
+
+  1) WHAT THE LINES MEAN (stated honestly, no behavior change): the
+     'Egress answered HTTP 502' / open-timeout warn lines are
+     PER-DESTINATION diagnostics - the EGRESS could not reach THAT
+     destination (a 502 is a gateway that 'received an invalid
+     response from the upstream', MDN; a dead-from-the-exit-country
+     site, a blocked telemetry endpoint, a broken IPv6 path). The
+     v9.0 socks5 remote-DNS default made this class VISIBLE (such a
+     destination now fails AT the egress with 502 instead of dying in
+     the local resolver - the v9.2 analysis); the TUNNEL and every
+     working destination are NOT affected, which is why 'everything
+     works'.
+
+  2) THE REMAINING NOISE: v9.2 closed the pass-refresh cascade and
+     exempted the DNS relay's DoH target, but an APPLICATION retrying
+     ONE dead destination still printed ONE LINE PER FAILED CONNECT -
+     and every warn line also LIFTS + REDRAWS the live UI panel (the
+     v8.1 per-line panel redraw), so a client retry storm meant real
+     console churn on top of the log flood (the user's 'slower than
+     it should be': the failed CONNECTs themselves are the client's
+     own roundtrips to a dead destination - that latency is the
+     destination's, not the tunnel's; only the LOG/panel churn was
+     the script's to fix).
+
+  3) THE FIX (the zap sampler shape - cap the CPU and I/O load of
+     logging while keeping a representative subset, uber-go/zap
+     zapcore.NewSamplerWithOptions): ONE warn line per DISTINCT
+     (kind, target) inside the SAME _PASS_FAIL_WINDOW of 60 s
+     (_warn_target_failure_once; the FIRST failure of a destination
+     says everything a human needs, the repeats are the client's own
+     retry loop). The pass-health accounting still counts EVERY
+     failure: the 3-distinct-targets session-break detection, the
+     400/401/403 pass-rejection class, the DoH-target exemption, the
+     --verbose target reveal and the client-visible reply codes are
+     byte-identical - only the CONSOLE LINE is deduplicated.
+
 VERSION 2026-10-31 (v9.3) - THE FULL IMPLEMENTATION AUDIT (the user's
   request: check EVERY implementation for correctness and adequacy, the
   comments AND the code, compare with the analog projects and verify
@@ -11319,6 +11359,10 @@ def port_is_free(port: int, host: str = "127.0.0.1") -> bool:
 # 'session looks broken' pass refresh. The DNS relay's own DoH wire
 # target is exempted from the target-failure classes entirely (see
 # _is_doh_wire_target); the PASS-REJECTION classes stay counted.
+# v9.4 (the user's report): the target-failure LOG LINES are
+# deduplicated per (kind, target) per _PASS_FAIL_WINDOW - ONE line
+# per window (see _warn_target_failure_once); the pass-health
+# accounting below still counts EVERY failure.
 # ---------------------------------------------------------------------------
 
 _VERBOSE_TARGETS = {"v": False}
@@ -11381,6 +11425,54 @@ def _warn_doh_target_unreachable(target: str):
     if target not in _DOH_TARGET_WARNED:
         _DOH_TARGET_WARNED.add(target)
         warn(tr("connect_target_doh_unreachable", target=target))
+
+# v9.4 (the user's report): the LOG DEDUP book for the two
+# target-failure classes. The 'Egress answered HTTP 502' /
+# open-timeout lines are PER-DESTINATION diagnostics (a 502 means
+# the EGRESS could not reach THAT destination - 'a server acting
+# as a gateway or proxy received an invalid response from the
+# upstream', MDN), but an application hammering ONE dead
+# destination printed ONE LINE PER FAILED CONNECT while the tunnel
+# kept serving everything else - and every warn line also lifts +
+# redraws the live UI panel (the v8.1 per-line panel redraw), so a
+# client retry storm meant real console churn on top of the log
+# flood. The zap sampler shape (uber-go/zap zapcore: 'cap the CPU
+# and I/O load of logging while attempting to preserve a
+# representative subset') applied to the terminal: ONE line per
+# DISTINCT (kind, target) inside the SAME _PASS_FAIL_WINDOW - the
+# FIRST failure of a destination tells a human everything; the
+# repeats are the client's own retry loop. The pass-health
+# accounting (_PassMonitor.note_target_failure) still counts EVERY
+# failure, so the 3-distinct-targets session-break detection, the
+# 400/401/403 pass-rejection class, the DoH-target exemption, the
+# --verbose reveal and the client-visible reply codes are ALL
+# untouched - only the CONSOLE LINE is deduplicated.
+_TARGET_FAIL_WARNED = {}                    # (kind, target) -> ts
+_TARGET_FAIL_LOCK = threading.Lock()
+
+def _warn_target_failure_once(kind: str, code: int, target: str):
+    """v9.4: print the open-timeout / bad-gateway warn line for
+    (kind, target) only when THIS target has not already had a
+    line inside _PASS_FAIL_WINDOW (60 s) - one dead destination
+    hammered by a client retry loop must not flood the log nor
+    lift the live panel once per failed CONNECT. The silent repeats
+    are still fully counted by _PassMonitor.note_target_failure
+    (the session-health semantics of v6.6/v9.2 are unchanged)."""
+    now = time.time()
+    with _TARGET_FAIL_LOCK:
+        for k in [k for k, ts in _TARGET_FAIL_WARNED.items()
+                  if ts < now - _PASS_FAIL_WINDOW]:
+            del _TARGET_FAIL_WARNED[k]
+        key = (kind, target)
+        if key in _TARGET_FAIL_WARNED:
+            return          # already said inside the window
+        _TARGET_FAIL_WARNED[key] = now
+    if kind == "open_timeout":
+        warn(tr("connect_target_open_timeout",
+                target=_redact_target(target)))
+    else:
+        warn(tr("connect_target_bad_gateway", code=code,
+                target=_redact_target(target)))
 
 class _PassMonitor:
     """v6.6: thread-safe registry of the pass-health signals raised by
@@ -12333,8 +12425,10 @@ class BuiltinProxyEngine:
                         # _is_doh_wire_target).
                         _warn_doh_target_unreachable(target_full)
                     else:
-                        warn(tr("connect_target_open_timeout",
-                                target=_redact_target(target_full)))
+                        # v9.4: ONE line per (kind, target) inside the
+                        # 60 s window (see _warn_target_failure_once).
+                        _warn_target_failure_once("open_timeout", 0,
+                                                   target_full)
                         _PassMonitor.note_target_failure(
                             "open_timeout", target_full, proxy["host"])
                     _socks5_reply(conn, 0x01)
@@ -12362,9 +12456,10 @@ class BuiltinProxyEngine:
                         # classes above stay counted for it.
                         _warn_doh_target_unreachable(target_full)
                     else:
-                        warn(tr("connect_target_bad_gateway",
-                                code=code_num,
-                                target=_redact_target(target_full)))
+                        # v9.4: ONE line per (kind, target) inside the
+                        # 60 s window (see _warn_target_failure_once).
+                        _warn_target_failure_once("bad_gateway", code_num,
+                                                   target_full)
                         _PassMonitor.note_target_failure(
                             "bad_gateway", target_full, proxy["host"])
                     _socks5_reply(conn, 0x04)
@@ -12482,8 +12577,10 @@ class BuiltinProxyEngine:
                             # (see _is_doh_wire_target).
                             _warn_doh_target_unreachable(target)
                         else:
-                            warn(tr("connect_target_open_timeout",
-                                    target=_redact_target(target)))
+                            # v9.4: ONE line per (kind, target) inside
+                            # the 60 s window (_warn_target_failure_once).
+                            _warn_target_failure_once("open_timeout", 0,
+                                                       target)
                             _PassMonitor.note_target_failure(
                                 "open_timeout", target, proxy["host"])
                         conn.sendall(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
@@ -12512,9 +12609,10 @@ class BuiltinProxyEngine:
                             # classes above stay counted for it.
                             _warn_doh_target_unreachable(target)
                         else:
-                            warn(tr("connect_target_bad_gateway",
-                                    code=code_num,
-                                    target=_redact_target(target)))
+                            # v9.4: ONE line per (kind, target) inside
+                            # the 60 s window (_warn_target_failure_once).
+                            _warn_target_failure_once("bad_gateway",
+                                                      code_num, target)
                             _PassMonitor.note_target_failure(
                                 "bad_gateway", target, proxy["host"])
                         conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
