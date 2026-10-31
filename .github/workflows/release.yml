@@ -604,9 +604,10 @@
 #      Pillow ships musllinux wheels — on those architectures pip
 #      installs everything with NO source build at all. Every sdist
 #      fallback is covered by apk packages (the FIX 10 analog):
-#        * cryptography i686 — sdist via maturin (maturin/puccinialin
-#          fetch the Rust toolchain themselves): OpenSSL discovered
-#          via pkgconf + openssl-dev;
+#        * cryptography i686 — sdist (NO musllinux i686 wheel exists):
+#          OpenSSL via pkgconf + openssl-dev, and the Rust toolchain
+#          via Alpine NATIVE rust package — the sdist backend CANNOT
+#          rustup-bootstrap on i686-musl (FIX 28);
 #        * Pillow i686 — zlib-dev + jpeg-dev;
 #        * zstandard — libffi-dev for the cffi backend chain;
 #        * zxing-cpp — cmake + ninja (scikit-build-core needs a system
@@ -637,6 +638,26 @@
 #      Termux (Android — not a Linux distribution) and Windows keep
 #      their existing annotations (bionic24 / ucrt-win10); the
 #      release gate list (FIX 22) is updated accordingly.
+#
+# FIX 28 (musl x86: the cryptography sdist cannot bootstrap Rust,
+#      live run 2026-10-31): the linux-x86-musl cell died in
+#      "Preparing metadata (pyproject.toml)" for cryptography 50.0.2 —
+#      no musllinux i686 wheel exists, and the sdist build backend
+#      computed the rustc target triple i686-unknown-linux-musl from
+#      the interpreter SOABI (cpython-315-i386-linux-musl) and tried
+#      to rustup-install a toolchain into a temporary directory —
+#      impossible: rustup publishes NO i686-unknown-linux-musl HOST
+#      toolchain (rustup issue #2984; the live log printed "Target
+#      triple not supported by rustup"). FIX: the musl job
+#      apk-installs Alpine own NATIVE rust/cargo packages (1.96.1 in
+#      Alpine 3.24, published for the x86 arch) on the linux-x86
+#      cell; the build backend then finds rustc/cargo on PATH and
+#      skips the rustup path entirely. The x86_64/aarch64 cells
+#      install musllinux_1_2 wheels and need no Rust at all (the
+#      per-cell install keeps ~350 MB of unnecessary download off
+#      the other cells). The glibc i686 cell is NOT affected: on
+#      i686-unknown-linux-gnu the rustup bootstrap works (seen
+#      live, FIX 10).
 #
 # RELEASE ATTACHMENTS: individual BINARY files, no zip. The release-bundle
 # job downloads all build artifacts into one folder (merge-multiple:
@@ -1253,13 +1274,35 @@ jobs:
               #                 which needs a system cmake >= 3.18 (FIX 13)
               #   pkgconf + openssl-dev — the cryptography sdist build
               #                 (maturin discovers OpenSSL via pkg-config;
-              #                 needed on i686 where no musllinux wheel exists)
+              #                 needed on i686 where no musllinux wheel
+              #                 exists; its Rust toolchain comes from the
+              #                 FIX 28 case below)
               #   libffi-dev — the cffi chain (zstandard sdist)
               #   zlib-dev + jpeg-dev — the Pillow sdist (i686)
               #   linux-headers — the pylsqpack / aioquic sdist builds
               apk add --no-cache \
                 build-base patchelf file ccache cmake ninja pkgconf \
                 openssl-dev libffi-dev zlib-dev jpeg-dev linux-headers
+              # FIX 28 (musl i686 cryptography sdist, live run
+              # 2026-10-31): cryptography 50.0.2 has NO musllinux
+              # i686 wheel, so on the linux-x86 cell pip builds the
+              # sdist; its Rust build backend normally bootstraps a
+              # toolchain via rustup — but rustup publishes NO
+              # i686-unknown-linux-musl HOST toolchain (rustup issue
+              # #2984; live log: "Computed rustc target triple:
+              # i686-unknown-linux-musl / Target triple not supported
+              # by rustup"), and the metadata step dies. FIX: install
+              # Alpine own NATIVE musl rust/cargo (1.96.1, published
+              # for the x86 arch) on that cell — the backend then
+              # finds rustc/cargo on PATH and skips the rustup path.
+              # The x86_64/aarch64 cells install musllinux_1_2 wheels
+              # and need no Rust at all (per-cell install: the rust
+              # package is ~350 MB of otherwise wasted download).
+              case "${TARGET}" in
+                linux-x86)
+                  apk add --no-cache rust cargo
+                  ;;
+              esac
               python --version
               python -c "import platform; print(\"arch:\", platform.machine())"
               python -m pip install --upgrade pip
@@ -1268,7 +1311,7 @@ jobs:
               # installed; wheels are used where they exist — cryptography
               # and Pillow ship musllinux wheels for x86_64/aarch64 —
               # and every sdist fallback is covered by the apk packages
-              # above). The Windows-only cryptography pin in
+              # above and the FIX 28 native rust toolchain on i686). The Windows-only cryptography pin in
               # requirements.txt does not apply here (sys_platform is
               # linux).
               if [ -f requirements.txt ]; then
