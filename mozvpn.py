@@ -4,6 +4,13 @@
 mozvpn.py -- Mozilla VPN / Firefox IP Protection proxy credentials + auto-TOTP
 + automatic proxyPass refresh + local proxies (builtin engine or sing-box).
 
+VERSION 2026-11-04 (v10.0.13) - THE CONSOLIDATED v10.x HARDENING PASS (every
+  algorithm NOT listed here is UNTOUCHED). See CHANGELOG.md v10.0.13 for
+  the full item list: DPI master switch, TLS record framing fix, plaintext
+  peer handling, select-based relay, DoH single-provider resolution,
+  PassMonitor/pass-fail dedup hardening, 502/504 egress-cache invalidation,
+  hotkey prev->state messages, misc cleanups.
+
 VERSION 2026-10-31 (v9.5) - THE LATENCY TRIO (the user's report:
   'everything works, but it FEELS slower'; every algorithm NOT
   listed here is UNTOUCHED). Three findings, all on the builtin
@@ -3492,7 +3499,7 @@ Configuration (mode 600):
 """
 
 import argparse, base64, binascii, getpass, hashlib, hmac, http.cookiejar, json, os, re
-import sys, threading, time, socket, ssl, subprocess, signal, atexit, tempfile
+import select, sys, threading, time, socket, ssl, subprocess, signal, atexit, tempfile
 import urllib.request, urllib.error
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from datetime import timezone
@@ -3681,7 +3688,7 @@ DOH_TIMEOUT = 4          # v5.6: was 10 - a dead/slow DoH endpoint must not
                          # chain walks to the next provider
 DOH_MEMO_TTL = 60        # v5.6: TTL of the ALWAYS-ON short answer memo
 DOH_PROVIDER_PENALTY = 60  # v5.6: seconds a failed DoH provider is skipped
-DOH_PRESETS = ["cloudflare", "google", "nextdns", "quad9"]
+DOH_PRESETS = ["cloudflare", "google", "nextdns"]
 
 _doh_provider = "cloudflare"     # current provider, "" = system DNS (off)
 _doh_cache_enabled = False       # v5.1: the DoH cache is OFF by default
@@ -4090,8 +4097,11 @@ def _doh_query_parallel(host: str) -> "list[str] | None":
     return ips
 
 def resolve_host(host: str) -> "list[str] | None":
-    """Resolve a hostname over DoH ONLY (req. 5): the selected provider,
-    then the remaining DoH presets in the fallback chain. The SYSTEM
+    """Resolve a hostname over DoH ONLY (req. 5): the selected provider
+    (the doh_wire_targets() contract - the SAME DoH service the client's
+    DNS relay rides). No fallback chain walk, no parallel race over the
+    other presets: the egress hostname the client's proxy connects to is
+    resolved by the same provider the relayed client DNS uses. The SYSTEM
     resolver is NOT a fallback of this function anymore (v5.29 STRICT):
     it runs only when the user EXPLICITLY opted in
     (--system-dns-fallback) or when DoH is off. The long answer cache
@@ -4149,7 +4159,23 @@ def resolve_host(host: str) -> "list[str] | None":
                                # back to the system resolver, as after any
                                # full DoH-chain failure
     try:
-        ips = _doh_query_parallel(host)
+        # v10.x: resolve_host rides ONLY the provider the user chose
+        # (the doh_wire_targets() contract - the same DoH service the
+        # client's DNS relay answers through). No chain walk, no parallel
+        # race over the other presets: the egress hostname the client's
+        # proxy connects to is resolved by the SAME provider the relayed
+        # client DNS uses. A down provider is skipped until its penalty
+        # expires (_doh_provider_down).
+        cur = doh_provider()
+        ips = None
+        if cur:
+            now = time.time()
+            if _doh_provider_down.get(cur, 0) <= now:
+                url = DOH_PROVIDERS.get(cur, cur)
+                ips = _doh_query(url, host) or None
+                if not ips:
+                    with _doh_lock:
+                        _doh_provider_down[cur] = time.time() + DOH_PROVIDER_PENALTY
         if not ips:
             # v5.29 (security): every DoH endpoint failed. The OLD code
             # silently fell back to the SYSTEM resolver here - exactly
@@ -4385,6 +4411,7 @@ STR = {
   "engine_singbox": "sing-box (external binary, MASQUE/HTTP CONNECT upstreams)",
   "lang_selected": "Output language: {lang}",
   "color_disabled": "Color output disabled.",
+  "color_toggled": "Colored log output {prev} → {state} {_e} (hotkey 'n' / --no-color toggles).",
   "cache_cleared": "Cache directory removed: {path}",
   "cache_clear_failed": "Failed to remove cache directory {path}: {err}",
   "cache_nothing": "Cache directory does not exist, nothing to clear.",
@@ -4518,7 +4545,7 @@ STR = {
   "doh_default_desc": "DEFAULT",
   "doh_default_applied": "DNS resolver {_e}: switched to the DEFAULT provider ({provider}). The choice is saved to the config directory (config.json, settings.doh of the current profile) and survives restarts.",
   "hotkey_doh": "Hotkey 'h': DNS resolver switched to {provider} \u2014 new upstream connections use it immediately (the sing-box engine resolves on its own); the per-proxy DNS endpoints ride it from the next query (the chosen provider ONLY, default cloudflare).",
-  "hotkey_doh_cache": "Hotkey 'k': DoH cache {state} (mirrors --doh-cache).",
+  "hotkey_doh_cache": "Hotkey 'k': DoH cache {prev} → {state} (mirrors --doh-cache).",
   "select_hint": "Type the number/letter of an item, then press Enter. Backspace deletes the last character, any other key cancels.",
   "select_buffer": "Your choice: {buf}",
   "select_bad": "There is no item '{buf}' - cancelled.",
@@ -4596,11 +4623,11 @@ STR = {
   "unexpected_error": "Unexpected error: {err!r} - retrying in 30s.",
   "next_refresh": "Next refresh {_e} in {sec}s ({at} UTC).",
   "confirm_exit_hint": "Press Ctrl+C to stop.",
-  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \U0001f503 r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine; cached)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS; the per-proxy DNS endpoints ride the CHOSEN provider ONLY - default cloudflare, no fallback chain (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache; cached)\n  \U0001f9e9 i - toggle the TLS ClientHello fragmentation (--tls-split; ON by default: the SNI-carrying ClientHello goes in small TCP segments against single-packet DPI; cached)\n  \U0001f4c2 o - open the config directory (config.json lives there)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f4f7 g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - account menu: switch to another CACHED Mozilla account ('+' adds a NEW one, '-' deletes one) - the WHOLE profile switches with it: the DNS resolver, the language, the proxy selection, the sing-box configs and the Fastly cookie (config.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \U0001f4bf s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme; cached)\n  \U0001f308 n - toggle the colored log output on/off (--no-color; cached)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1 - open config.json (the single settings file) in the system default editor\n  \U0001f4c6 z - the config-file menu (the token list of every editable file)\n  \U0001f50d Ctrl+O - find & remove every leftover of the OLD config format (--clean-old-config)\n  \u26d4 Ctrl+C - stop the script (the first press stops immediately; --confirm-exit requires a second press within 5 s)\n  \U0001F527 Ctrl+T - choose the LOCAL proxy type from the menu: socks5 / http (--proxy-type; the choice is cached)\n  \U0001f501 Ctrl+R - toggle the account auto-rotation by quota on/off (--auto-rotate; the choice is cached)\n  \U0001f4cb Ctrl+P - rewrite the PAC file with the running listeners (--pac-export)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q - stop.",
+  "hotkeys_hint": "Hotkeys (each mirrors a script parameter):\n  \U0001f503 r - re-login now, wiping ALL saved data (--relogin)\n  \U0001f9f9 c - clear ALL saved data & restart (--clear-cache)\n  \U0001f504 e - switch proxy engine builtin/sing-box (--local-proxy-engine; cached)\n  \U0001f500 l - switch listen host 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h - choose the DNS resolver: DoH providers / system DNS; the per-proxy DNS endpoints ride the CHOSEN provider ONLY - default cloudflare, no fallback chain (--doh)\n  \U0001f4be k - toggle the DoH cache on/off (--doh-cache; cached)\n  \U0001f9e9 i - toggle the TLS ClientHello fragmentation (--tls-split; ON by default: the SNI-carrying ClientHello goes in small TCP segments against single-packet DPI; cached)\n  \U0001f4c2 o - open the config directory (config.json lives there)\n  \U0001f4cb v - copy a LOCAL proxy address:port\n  \U0001f4cb b - copy an UPSTREAM proxy address:port\n  \U0001f522 t - show & copy the current TOTP code\n  \U0001f3ab j - show & copy the current proxyPass JWT\n  \U0001f4f7 g - load a QR image with the 2FA secret on the fly (--qr)\n  \U0001f464 u - show & copy the login (email)\n  \U0001f511 p - show & copy the password\n  \U0001f465 a - account menu: switch to another CACHED Mozilla account ('+' adds a NEW one, '-' deletes one) - the WHOLE profile switches with it: the DNS resolver, the language, the proxy selection, the sing-box configs and the Fastly cookie (config.json, --list-accounts)\n  \U0001f4e6 d - reinstall ALL Python dependencies from scratch (--reinstall-deps)\n  \U0001f4bf s - reinstall sing-box from scratch (--reinstall-singbox)\n  \U0001f3a8 m - switch the color theme dark <-> light (--theme; cached)\n  \U0001f308 n - toggle the colored log output on/off (--no-color; cached)\n  \U0001f30d w - choose which local proxies to run: several tokens separated by spaces, 0 = all (--countries)\n  \U0001f4ac y - choose the interface language: en / ru, 0 = default (--lang; the choice is cached and survives restarts)\n  \U0001f4c4 1 - open config.json (the single settings file) in the system default editor\n  \U0001f4c6 z - the config-file menu (the token list of every editable file)\n  \U0001f50d Ctrl+O - find & remove every leftover of the OLD config format (--clean-old-config)\n  \u26d4 Ctrl+C - stop the script (the first press stops immediately; --confirm-exit requires a second press within 5 s)\n  \U0001F527 Ctrl+T - choose the LOCAL proxy type from the menu: socks5 / http (--proxy-type; the choice is cached)\n  \U0001f501 Ctrl+R - toggle the account auto-rotation by quota on/off (--auto-rotate; the choice is cached)\n  \U0001f4cb Ctrl+P - rewrite the PAC file with the running listeners (--pac-export)\n  \U0001f98a f - export ALL local proxies as FoxyProxy Standard settings (combined file: imports via ANY FoxyProxy import path) (--foxyproxy-export)\n  \U0001f9fe x - export ALL local proxies as the LEGACY FoxyProxy settings JSON (the REAL FoxyProxy 6/7 export shape, for 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001F527 Ctrl+D - toggle ALL DPI bypass at once (--dpi/--no-dpi; ON by default)\n  \U0001f6d1 q - stop.",
   "hotkey_relogin": "Hotkey 'r' \u267b\ufe0f: FULL wipe of all saved data - caches, credentials, sing-box configs - then a fresh sign-in.",
   "hotkey_clear": "Hotkey 'c' \U0001f9f9: ALL saved data wiped (caches, credentials, sing-box configs) - restarting with a clean state.",
-  "hotkey_engine": "Hotkey 'e': switching the engine to {engine} - local proxies will restart with it.",
-  "hotkey_listen": "Hotkey 'l': listeners will now bind on {host} - local proxies will restart with it.",
+  "hotkey_engine": "Hotkey 'e': engine switched {prev} → {engine} - local proxies will restart with it.",
+  "hotkey_listen": "Hotkey 'l': listeners will now bind {prev} → {host} - local proxies will restart with it.",
   "hotkey_totp": "Hotkey 't' \U0001f522: current TOTP code - also copied to the clipboard.",
   "hotkey_jwt": "Current proxyPass JWT {_e} - also copied to the clipboard:",
   "hotkey_jwt_none": "Hotkey 'j' \U0001f3ab: no proxyPass token yet - it appears right after the successful sign-in.",
@@ -4633,7 +4660,7 @@ STR = {
   "deps_pkg_ok": "  {_e} {pkg} - OK",
   "deps_pkg_fail": "  {_e} {pkg} - FAILED",
   "deps_conflict_fail": "Packages that could not be installed: {pkgs}. See the pip errors above.",
-  "hotkey_theme": "Hotkey 'm' \U0001f3a8: switched the theme to {theme} (--theme).",
+  "hotkey_theme": "Hotkey 'm' \U0001f3a8: theme switched {prev} → {new_theme} (--theme).",
   "color_enabled": "Colored log output enabled {_e} (hotkey 'n' / --no-color toggles).",
   "hotkey_color": "Hotkey 'n' \U0001f308: colored log output {state} (mirrors --no-color).",
   "color_state_on": "enabled",
@@ -4712,8 +4739,10 @@ STR = {
   "api_proxy_on": "Control plane (FxA/Guardian/Remote Settings + the Fastly challenge) via the FIXED exit {_e}: {url} (--api-proxy)",
   "api_proxy_off": "Control-plane egress: direct (--api-proxy not set)",
   "api_proxy_socks_unsupported": "socks5:// is not supported by --api-proxy: the stdlib ProxyHandler tunnels http/https via CONNECT only and this script adds no new dependency - use an http:// or https:// proxy URL",
-  "hotkey_tls_split": "TLS ClientHello fragmentation: {state}",
+  "hotkey_tls_split": "TLS ClientHello fragmentation: {prev} → {state}",
   "tls_split_startup": "TLS ClientHello fragmentation: {state} (--tls-split; ON by default)",
+  "hotkey_dpi": "All DPI bypass: {prev} → {state}",
+  "dpi_startup": "DPI bypass: {state} (--dpi/--no-dpi; ON by default)",
   "fastly_406_stale": "The sent Fastly challenge cookie was rejected (HTTP 406 despite a cookie) - dropping it and solving a FRESH challenge before the retry",
   "fxa_429_cooldown": "FxA login rate limit - a 15-minute cooldown; the retry prefers the cached session token",
   "guardian_reactivated": "Guardian: re-activated (HTTP {status}) - retrying the token fetch once",
@@ -4741,7 +4770,7 @@ STR = {
   "auto_rotate_startup": "Account auto-rotation by quota is ON (Ctrl+R off; --no-auto-rotate)",
   "auto_rotate_on": "Account auto-rotation by quota is ON",
   "auto_rotate_off": "Account auto-rotation by quota is OFF",
-  "auto_rotate_switched": "{state} - the choice is saved",
+  "auto_rotate_switched": "{prev} → {state} - the choice is saved",
   "auto_rotate_zero": "Quota exhausted on the current account ({email}) - auto-rotation is looking for the account with the most data left",
   "auto_rotate_to": "Auto-rotation: switching to account {email} ({left} known left) - cached session, no new login",
   "auto_rotate_none": "Auto-rotation: every other cached account is exhausted or has no cached session - staying on {email}",
@@ -4790,6 +4819,7 @@ STR = {
   "engine_singbox": "sing-box (\u0432\u043d\u0435\u0448\u043d\u0438\u0439 \u0431\u0438\u043d\u0430\u0440\u043d\u0438\u043a, \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u044b MASQUE/HTTP CONNECT)",
   "lang_selected": "\u042f\u0437\u044b\u043a \u0432\u044b\u0432\u043e\u0434\u0430: {lang}",
   "color_disabled": "\u0426\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u043e\u0442\u043a\u043b\u044e\u0447\u0451\u043d.",
+  "color_toggled": "\u0426\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 {prev} \u2192 {state} {_e} (\u043a\u043b\u0430\u0432\u0438\u0448\u0435\u0439 'n' / --no-color).",
   "cache_cleared": "\u041a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u044d\u0448\u0430 \u0443\u0434\u0430\u043b\u0451\u043d: {path}",
   "cache_clear_failed": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u044d\u0448\u0430 {path}: {err}",
   "cache_nothing": "\u041a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u044d\u0448\u0430 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442, \u0447\u0438\u0441\u0442\u0438\u0442\u044c \u043d\u0435\u0447\u0435\u0433\u043e.",
@@ -4923,7 +4953,7 @@ STR = {
   "doh_default_desc": "\u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e",
   "doh_default_applied": "DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 {_e}: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440 \u041f\u041e \u0423\u041c\u041e\u041b\u0427\u0410\u041d\u0418\u042e ({provider}). \u0412\u044b\u0431\u043e\u0440 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u0432 config.json (settings.doh \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0440\u043e\u0444\u0438\u043b\u044f) \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0438 \u043f\u043e\u0441\u043b\u0435 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u043e\u0432.",
   "hotkey_doh": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'h': DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0451\u043d \u043d\u0430 {provider} \u2014 \u043d\u043e\u0432\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043a \u0430\u043f\u0441\u0442\u0440\u0438\u043c\u0430\u043c \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u044e\u0442 \u0435\u0433\u043e \u0441\u0440\u0430\u0437\u0443 (\u0434\u0432\u0438\u0436\u043e\u043a sing-box \u0440\u0435\u0437\u043e\u043b\u0432\u0438\u0442 \u0441\u0430\u043c); DNS-\u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435\u0441\u0443\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u043a \u043d\u0435\u043c\u0443 \u0441\u043e \u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0433\u043e \u0437\u0430\u043f\u0440\u043e\u0441\u0430 (\u0442\u043e\u043b\u044c\u043a\u043e \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0439 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440, \u0431\u0435\u0437 \u0446\u0435\u043f\u043e\u0447\u043a\u0438 \u043e\u0442\u043a\u0430\u0442\u043e\u0432; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e cloudflare).",
-  "hotkey_doh_cache": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'k': \u043a\u044d\u0448 DoH {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --doh-cache).",
+  "hotkey_doh_cache": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'k': \u043a\u044d\u0448 DoH {prev} \u2192 {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --doh-cache).",
   "select_hint": "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u043e\u043c\u0435\u0440/\u0431\u0443\u043a\u0432\u0443 \u043f\u0443\u043d\u043a\u0442\u0430 \u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 Enter. Backspace \u0443\u0434\u0430\u043b\u044f\u0435\u0442 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0441\u0438\u043c\u0432\u043e\u043b, \u043b\u044e\u0431\u0430\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0430 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 \u0432\u044b\u0431\u043e\u0440.",
   "select_buffer": "\u0412\u0430\u0448 \u0432\u044b\u0431\u043e\u0440: {buf}",
   "select_bad": "\u041f\u0443\u043d\u043a\u0442\u0430 '{buf}' \u043d\u0435\u0442 \u2014 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.",
@@ -5001,11 +5031,11 @@ STR = {
   "unexpected_error": "\u041d\u0435\u043f\u0440\u0435\u0434\u0432\u0438\u0434\u0435\u043d\u043d\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430: {err!r} \u2014 \u043f\u043e\u0432\u0442\u043e\u0440\u044e \u0447\u0435\u0440\u0435\u0437 30 \u0441.",
   "next_refresh": "\u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 {_e} \u0447\u0435\u0440\u0435\u0437 {sec} \u0441 ({at} UTC).",
   "confirm_exit_hint": "Ctrl+C \u0434\u043b\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0438.",
-  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \U0001f503 r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS; DNS-\u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435\u0441\u0443\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u043a \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0443 \u2014 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e cloudflare, \u0431\u0435\u0437 \u0446\u0435\u043f\u043e\u0447\u043a\u0438 \u043e\u0442\u043a\u0430\u0442\u043e\u0432 (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f9e9 i \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0444\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044e ClientHello TLS (--tls-split; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b: \u043d\u0435\u0441\u0443\u0449\u0438\u0439 SNI ClientHello \u0440\u0435\u0436\u0435\u0442\u0441\u044f \u043d\u0430 \u043c\u0430\u043b\u0435\u043d\u044c\u043a\u0438\u0435 TCP-\u0441\u0435\u0433\u043c\u0435\u043d\u0442\u044b \u043f\u0440\u043e\u0442\u0438\u0432 DPI, \u0447\u0438\u0442\u0430\u044e\u0449\u0435\u0433\u043e \u043e\u0434\u0438\u043d \u043f\u0430\u043a\u0435\u0442; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 (\u0442\u0430\u043c \u043b\u0435\u0436\u0438\u0442 config.json)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f4f7 g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043c\u0435\u043d\u044e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 ('+' \u2014 \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u041d\u041e\u0412\u042b\u0419, '-' \u2014 \u0443\u0434\u0430\u043b\u0438\u0442\u044c) \u2014 \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 \u043d\u0438\u043c \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u0412\u0415\u0421\u042c \u043f\u0440\u043e\u0444\u0438\u043b\u044c: DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440, \u044f\u0437\u044b\u043a, \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438, \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 sing-box \u0438 cookie Fastly (config.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \U0001f4bf s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c config.json (\u0435\u0434\u0438\u043d\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (\u0441\u043f\u0438\u0441\u043e\u043a \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0432\u0441\u0435\u0445 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u0443\u0435\u043c\u044b\u0445 \u0444\u0430\u0439\u043b\u043e\u0432)\n  \U0001f50d Ctrl+O \u2014 \u043d\u0430\u0439\u0442\u0438 \u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u0442\u043a\u0438 \u0421\u0422\u0410\u0420\u041e\u0413\u041e \u0444\u043e\u0440\u043c\u0430\u0442\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (--clean-old-config)\n  \u26d4 Ctrl+C \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043f\u0442 (\u043f\u0435\u0440\u0432\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442 \u0441\u0440\u0430\u0437\u0443; \u0441 --confirm-exit \u043d\u0443\u0436\u043d\u043e \u0432\u0442\u043e\u0440\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f)\n  \U0001F527 Ctrl+T — выбрать тип локального прокси в меню: socks5 / http (--proxy-type; выбор кэшируется)\n  \U0001f501 Ctrl+R — авторотация аккаунтов по квоте вкл/выкл (--auto-rotate; выбор кэшируется)\n  \U0001f4cb Ctrl+P — перезаписать PAC-файл с текущими слушателями (--pac-export)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001f6d1 q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
+  "hotkeys_hint": "\u0413\u043e\u0440\u044f\u0447\u0438\u0435 \u043a\u043b\u0430\u0432\u0438\u0448\u0438 (\u043a\u0430\u0436\u0434\u0430\u044f \u0441\u043e\u043e\u0442\u0432\u0435\u0442\u0441\u0442\u0432\u0443\u0435\u0442 \u043f\u0430\u0440\u0430\u043c\u0435\u0442\u0440\u0443 \u0441\u043a\u0440\u0438\u043f\u0442\u0430):\n  \U0001f503 r \u2014 \u043f\u0435\u0440\u0435\u043b\u043e\u0433\u0438\u043d \u0441\u0435\u0439\u0447\u0430\u0441 \u0441 \u043f\u043e\u043b\u043d\u044b\u043c \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435\u043c \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 (--relogin)\n  \U0001f9f9 c \u2014 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u043e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c (--clear-cache)\n  \U0001f504 e \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0434\u0432\u0438\u0436\u043e\u043a \u043f\u0440\u043e\u043a\u0441\u0438 builtin/sing-box (--local-proxy-engine; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f500 l \u2014 \u0441\u043c\u0435\u043d\u0438\u0442\u044c \u0430\u0434\u0440\u0435\u0441 \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f 127.0.0.1 <-> 0.0.0.0 (--listen)\n  \U0001f310 h \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440: \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u044b DoH / \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 DNS; DNS-\u0442\u043e\u0447\u043a\u0438 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435\u0441\u0443\u0442 \u0437\u0430\u043f\u0440\u043e\u0441\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u043a \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u043c\u0443 \u043f\u0440\u043e\u0432\u0430\u0439\u0434\u0435\u0440\u0443 \u2014 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e cloudflare, \u0431\u0435\u0437 \u0446\u0435\u043f\u043e\u0447\u043a\u0438 \u043e\u0442\u043a\u0430\u0442\u043e\u0432 (--doh)\n  \U0001f4be k \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u043a\u044d\u0448 DoH (--doh-cache; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f9e9 i \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0444\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044e ClientHello TLS (--tls-split; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b: \u043d\u0435\u0441\u0443\u0449\u0438\u0439 SNI ClientHello \u0440\u0435\u0436\u0435\u0442\u0441\u044f \u043d\u0430 \u043c\u0430\u043b\u0435\u043d\u044c\u043a\u0438\u0435 TCP-\u0441\u0435\u0433\u043c\u0435\u043d\u0442\u044b \u043f\u0440\u043e\u0442\u0438\u0432 DPI, \u0447\u0438\u0442\u0430\u044e\u0449\u0435\u0433\u043e \u043e\u0434\u0438\u043d \u043f\u0430\u043a\u0435\u0442; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f4c2 o \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c \u043a\u0430\u0442\u0430\u043b\u043e\u0433 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0439 (\u0442\u0430\u043c \u043b\u0435\u0436\u0438\u0442 config.json)\n  \U0001f4cb v \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u041b\u041e\u041a\u0410\u041b\u042c\u041d\u041e\u0413\u041e \u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f4cb b \u2014 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0430\u0434\u0440\u0435\u0441:\u043f\u043e\u0440\u0442 \u0410\u041f\u0421\u0422\u0420\u0418\u041c-\u043f\u0440\u043e\u043a\u0441\u0438\n  \U0001f522 t \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP\n  \U0001f3ab j \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0442\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT\n  \U0001f4f7 g \u2014 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c QR-\u043a\u0430\u0440\u0442\u0438\u043d\u043a\u0443 \u0441 \u0441\u0435\u043a\u0440\u0435\u0442\u043e\u043c 2FA \u043d\u0430 \u043b\u0435\u0442\u0443 (--qr)\n  \U0001f464 u \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043b\u043e\u0433\u0438\u043d (email)\n  \U0001f511 p \u2014 \u043f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u0438 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c\n  \U0001f465 a \u2014 \u043c\u0435\u043d\u044e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432: \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c\u0441\u044f \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u0439 \u041a\u042d\u0428\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 Mozilla-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 ('+' \u2014 \u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c \u041d\u041e\u0412\u042b\u0419, '-' \u2014 \u0443\u0434\u0430\u043b\u0438\u0442\u044c) \u2014 \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 \u043d\u0438\u043c \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u0412\u0415\u0421\u042c \u043f\u0440\u043e\u0444\u0438\u043b\u044c: DNS-\u0440\u0435\u0437\u043e\u043b\u0432\u0435\u0440, \u044f\u0437\u044b\u043a, \u0432\u044b\u0431\u043e\u0440 \u043f\u0440\u043e\u043a\u0441\u0438, \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 sing-box \u0438 cookie Fastly (config.json, --list-accounts)\n  \U0001f4e6 d \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0412\u0421\u0415 Python-\u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0438 \u0441 \u043d\u0443\u043b\u044f (--reinstall-deps)\n  \U0001f4bf s \u2014 \u043f\u0435\u0440\u0435\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c sing-box \u0441 \u043d\u0443\u043b\u044f (--reinstall-singbox)\n  \U0001f3a8 m \u2014 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043e\u0432\u0443\u044e \u0442\u0435\u043c\u0443 \u0442\u0451\u043c\u043d\u0430\u044f <-> \u0441\u0432\u0435\u0442\u043b\u0430\u044f (--theme; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f308 n \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442\u044c/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432 \u043b\u043e\u0433 (--no-color; \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f)\n  \U0001f30d w \u2014 \u0432\u044b\u0431\u0440\u0430\u0442\u044c, \u043a\u0430\u043a\u0438\u0435 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0442\u044c: \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0447\u0435\u0440\u0435\u0437 \u043f\u0440\u043e\u0431\u0435\u043b, 0 = \u0432\u0441\u0435 (--countries)\n  \U0001f4ac y \u2014 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a \u0438\u043d\u0442\u0435\u0440\u0444\u0435\u0439\u0441\u0430: en / ru, 0 = \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e (--lang; \u0432\u044b\u0431\u043e\u0440 \u043a\u044d\u0448\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u0438 \u0441\u043e\u0445\u0440\u0430\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0440\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0445)\n  \U0001f4c4 1 \u2014 \u043e\u0442\u043a\u0440\u044b\u0442\u044c config.json (\u0435\u0434\u0438\u043d\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a) \u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u043e\u043c \u0440\u0435\u0434\u0430\u043a\u0442\u043e\u0440\u0435 \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e\n  \U0001f4c6 z \u2014 \u043c\u0435\u043d\u044e \u0444\u0430\u0439\u043b\u043e\u0432 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (\u0441\u043f\u0438\u0441\u043e\u043a \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0432\u0441\u0435\u0445 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u0443\u0435\u043c\u044b\u0445 \u0444\u0430\u0439\u043b\u043e\u0432)\n  \U0001f50d Ctrl+O \u2014 \u043d\u0430\u0439\u0442\u0438 \u0438 \u0443\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435 \u043e\u0441\u0442\u0430\u0442\u043a\u0438 \u0421\u0422\u0410\u0420\u041e\u0413\u041e \u0444\u043e\u0440\u043c\u0430\u0442\u0430 \u043a\u043e\u043d\u0444\u0438\u0433\u0443\u0440\u0430\u0446\u0438\u0438 (--clean-old-config)\n  \u26d4 Ctrl+C \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u0441\u043a\u0440\u0438\u043f\u0442 (\u043f\u0435\u0440\u0432\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u043e\u0441\u0442\u0430\u043d\u0430\u0432\u043b\u0438\u0432\u0430\u0435\u0442 \u0441\u0440\u0430\u0437\u0443; \u0441 --confirm-exit \u043d\u0443\u0436\u043d\u043e \u0432\u0442\u043e\u0440\u043e\u0435 \u043d\u0430\u0436\u0430\u0442\u0438\u0435 \u0432 \u0442\u0435\u0447\u0435\u043d\u0438\u0435 5 \u0441 \u0434\u043b\u044f \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f)\n  \U0001F527 Ctrl+T — выбрать тип локального прокси в меню: socks5 / http (--proxy-type; выбор кэшируется)\n  \U0001f501 Ctrl+R — авторотация аккаунтов по квоте вкл/выкл (--auto-rotate; выбор кэшируется)\n  \U0001f4cb Ctrl+P — перезаписать PAC-файл с текущими слушателями (--pac-export)\n  \U0001f98a f \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 FoxyProxy Standard (\u043a\u043e\u043c\u0431\u0438\u043d\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 \u0444\u0430\u0439\u043b: \u0438\u043c\u043f\u043e\u0440\u0442\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u041b\u042e\u0411\u042b\u041c \u043f\u0443\u0442\u0451\u043c FoxyProxy) (--foxyproxy-export)\n  \U0001f9fe x \u2014 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0412\u0421\u0415 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u0432 \u0423\u0421\u0422\u0410\u0420\u0415\u0412\u0428\u0418\u0419 (legacy) settings JSON (\u041d\u0410\u0421\u0422\u041e\u042f\u0429\u0418\u0419 \u0444\u043e\u0440\u043c\u0430\u0442 \u044d\u043a\u0441\u043f\u043e\u0440\u0442\u0430 FoxyProxy 6/7, \u0434\u043b\u044f 'Import from older versions') (--foxyproxy-legacy-export)\n  \U0001F527 Ctrl+D \u2014 \u0432\u043a\u043b\u044e\u0447\u0438\u0442/\u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442 \u0432\u0441\u0435 \u043e\u0431\u0445\u043e\u0434\u044b DPI \u043e\u0434\u043d\u043e\u0436\u0434\u0443 (\u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b)\n  \U0001f6d1 q \u2014 \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430.",
   "hotkey_relogin": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'r' \u267b\ufe0f: \u041f\u041e\u041b\u041d\u041e\u0415 \u0443\u0434\u0430\u043b\u0435\u043d\u0438\u0435 \u0432\u0441\u0435\u0445 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 \u2014 \u043a\u044d\u0448\u0435\u0439, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u043e\u0432, \u043a\u043e\u043d\u0444\u0438\u0433\u043e\u0432 sing-box \u2014 \u0437\u0430\u0442\u0435\u043c \u0441\u0432\u0435\u0436\u0438\u0439 \u0432\u0445\u043e\u0434.",
   "hotkey_clear": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'c' \U0001f9f9: \u0432\u0441\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d\u043d\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u0443\u0434\u0430\u043b\u0435\u043d\u044b (\u043a\u044d\u0448\u0438, \u043a\u0440\u0435\u0434\u0435\u043d\u0448\u0435\u043b\u0441\u044b, \u043a\u043e\u043d\u0444\u0438\u0433\u0438 sing-box) \u2014 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u043a\u0430\u044e\u0441\u044c \u0441 \u0447\u0438\u0441\u0442\u043e\u0433\u043e \u0441\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u044f.",
-  "hotkey_engine": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'e': \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u044e \u0434\u0432\u0438\u0436\u043e\u043a \u043d\u0430 {engine} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
-  "hotkey_listen": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'l': \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u0435 \u0442\u0435\u043f\u0435\u0440\u044c \u043d\u0430 {host} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
+  "hotkey_engine": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'e': \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u044e \u0434\u0432\u0438\u0436\u043e\u043a \u043d\u0430 {prev} \u2192 {engine} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
+  "hotkey_listen": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'l': \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u0435 \u0442\u0435\u043f\u0435\u0440\u044c \u043d\u0430 {prev} \u2192 {host} \u2014 \u043b\u043e\u043a\u0430\u043b\u044c\u043d\u044b\u0435 \u043f\u0440\u043e\u043a\u0441\u0438 \u043f\u0435\u0440\u0435\u0437\u0430\u043f\u0443\u0441\u0442\u044f\u0442\u0441\u044f \u0441 \u043d\u0438\u043c.",
   "hotkey_totp": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 't' \U0001f522: \u0442\u0435\u043a\u0443\u0449\u0438\u0439 \u043a\u043e\u0434 TOTP \u2014 \u0442\u0430\u043a\u0436\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430.",
   "hotkey_jwt": "\u0422\u0435\u043a\u0443\u0449\u0438\u0439 proxyPass JWT {_e} \u2014 \u0442\u0430\u043a\u0436\u0435 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430:",
   "hotkey_jwt_none": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'j' \U0001f3ab: \u0442\u043e\u043a\u0435\u043d\u0430 proxyPass \u0435\u0449\u0451 \u043d\u0435\u0442 \u2014 \u043e\u043d \u043f\u043e\u044f\u0432\u0438\u0442\u0441\u044f \u0441\u0440\u0430\u0437\u0443 \u043f\u043e\u0441\u043b\u0435 \u0443\u0441\u043f\u0435\u0448\u043d\u043e\u0433\u043e \u0432\u0445\u043e\u0434\u0430.",
@@ -5038,7 +5068,7 @@ STR = {
   "deps_pkg_ok": "  {_e} {pkg} \u2014 OK",
   "deps_pkg_fail": "  {_e} {pkg} \u2014 \u041d\u0415 \u0423\u0414\u0410\u041b\u041e\u0421\u042c",
   "deps_conflict_fail": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c \u043f\u0430\u043a\u0435\u0442\u044b: {pkgs}. \u0421\u043c. \u043e\u0448\u0438\u0431\u043a\u0438 pip \u0432\u044b\u0448\u0435.",
-  "hotkey_theme": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'm' \U0001f3a8: \u0442\u0435\u043c\u0430 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0430 \u043d\u0430 {theme} (--theme).",
+  "hotkey_theme": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'm' \U0001f3a8: \u0442\u0435\u043c\u0430 \u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0435\u043d\u0430 {prev} \u2192 {new_theme} (--theme).",
   "color_enabled": "\u0426\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 \u0432\u043a\u043b\u044e\u0447\u0451\u043d {_e} (\u043f\u0435\u0440\u0435\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f \u043a\u043b\u0430\u0432\u0438\u0448\u0435\u0439 'n' / --no-color).",
   "hotkey_color": "\u041a\u043b\u0430\u0432\u0438\u0448\u0430 'n' \U0001f308: \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0432\u044b\u0432\u043e\u0434 {state} (\u0437\u0435\u0440\u043a\u0430\u043b\u0438\u0442 --no-color).",
   "color_state_on": "\u0432\u043a\u043b\u044e\u0447\u0451\u043d",
@@ -5117,8 +5147,10 @@ STR = {
   "api_proxy_on": "\u041a\u043e\u043d\u0442\u0440\u043e\u043b\u044c\u043d\u0430\u044f \u043f\u043b\u043e\u0441\u043a\u043e\u0441\u0442\u044c (FxA/Guardian/Remote Settings + challenge Fastly) \u0447\u0435\u0440\u0435\u0437 \u0424\u0418\u041a\u0421\u0418\u0420\u041e\u0412\u0410\u041d\u041d\u042b\u0419 \u0432\u044b\u0445\u043e\u0434 {_e}: {url} (--api-proxy)",
   "api_proxy_off": "\u0412\u044b\u0445\u043e\u0434 \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u044c\u043d\u043e\u0439 \u043f\u043b\u043e\u0441\u043a\u043e\u0441\u0442\u0438: \u043f\u0440\u044f\u043c\u043e\u0439 (--api-proxy \u043d\u0435 \u0437\u0430\u0434\u0430\u043d)",
   "api_proxy_socks_unsupported": "socks5:// \u043d\u0435 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f (--api-proxy): stdlib ProxyHandler \u0442\u0443\u043d\u043d\u0435\u043b\u0438\u0440\u0443\u0435\u0442 \u0442\u043e\u043b\u044c\u043a\u043e http/https \u0447\u0435\u0440\u0435\u0437 CONNECT; \u0441\u043a\u0440\u0438\u043f\u0442 \u043d\u0435 \u0434\u043e\u0431\u0430\u0432\u043b\u044f\u0435\u0442 \u043d\u043e\u0432\u044b\u0445 \u0437\u0430\u0432\u0438\u0441\u0438\u043c\u043e\u0441\u0442\u0435\u0439 - \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 http:// \u0438\u043b\u0438 https:// \u043f\u0440\u043e\u043a\u0441\u0438",
-  "hotkey_tls_split": "\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044f ClientHello TLS: {state}",
+  "hotkey_tls_split": "\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044f ClientHello TLS: {prev} \u2192 {state}",
   "tls_split_startup": "\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044f ClientHello TLS: {state} (--tls-split; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b)",
+  "hotkey_dpi": "\u0412\u0441\u0435 \u043e\u0431\u0445\u043e\u0434\u044b DPI: {prev} \u2192 {state}",
+  "dpi_startup": "\u041e\u0431\u0445\u043e\u0434 DPI: {state} (--dpi/--no-dpi; \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0412\u041a\u041b)",
   "fastly_406_stale": "\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u0439 cookie \u0447\u0435\u043b\u043b\u0435\u043d\u0434\u0436\u0430 Fastly \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d (HTTP 406 \u043f\u0440\u0438 \u043d\u0430\u043b\u0438\u0447\u0438\u0438 cookie) - \u0443\u0441\u0442\u0430\u0440\u0435\u0432\u0448\u0438\u0439 cookie \u043e\u0442\u0431\u0440\u0430\u0441\u044b\u0432\u0430\u0435\u0442\u0441\u044f, \u043f\u0435\u0440\u0435\u0434 \u043f\u043e\u0432\u0442\u043e\u0440\u043e\u043c \u0440\u0435\u0448\u0430\u0435\u0442\u0441\u044f \u041d\u041e\u0412\u042b\u0419 \u0447\u0435\u043b\u043b\u0435\u043d\u0434\u0436",
   "fxa_429_cooldown": "\u041b\u0438\u043c\u0438\u0442 \u0447\u0430\u0441\u0442\u043e\u0442\u044b \u0432\u0445\u043e\u0434\u0430 FxA - \u043f\u0430\u0443\u0437\u0430 15 \u043c\u0438\u043d\u0443\u0442; \u043f\u0440\u0438 \u043f\u043e\u0432\u0442\u043e\u0440\u0435 \u043f\u0440\u0435\u0434\u043f\u043e\u0447\u0442\u0451\u043d \u043a\u044d\u0448\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 session token",
   "guardian_reactivated": "Guardian: \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u0430\u044f \u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f (HTTP {status}) - \u043e\u0434\u043d\u0430 \u043f\u043e\u0432\u0442\u043e\u0440\u043d\u0430\u044f \u043f\u043e\u043f\u044b\u0442\u043a\u0430 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u0438\u044f \u0442\u043e\u043a\u0435\u043d\u0430",
@@ -5146,7 +5178,7 @@ STR = {
   "auto_rotate_startup": "Авторотация аккаунтов по квоте ВКЛЮЧЕНА (Ctrl+R выключает; --no-auto-rotate)",
   "auto_rotate_on": "Авторотация аккаунтов по квоте ВКЛЮЧЕНА",
   "auto_rotate_off": "Авторотация аккаунтов по квоте ВЫКЛЮЧЕНА",
-  "auto_rotate_switched": "{state} — выбор сохранён",
+  "auto_rotate_switched": "{prev} \u2192 {state} — выбор сохранён",
   "auto_rotate_zero": "Квота исчерпана на текущем аккаунте ({email}) — авторотация ищет аккаунт с максимумом остатка",
   "auto_rotate_to": "Авторотация: переключение на аккаунт {email} (известный остаток {left}) — кэшированная сессия, без нового входа",
   "auto_rotate_none": "Авторотация: все остальные кэшированные аккаунты исчерпаны или без кэшированной сессии — остаёмся на {email}",
@@ -5452,7 +5484,6 @@ _EMOJI = {
     "unexpected_error": "\u26A0\uFE0F  ",
     "port_busy": "\u26A0\uFE0F  ",
     "singbox_died": "\u26A0\uFE0F  ",
-    "singbox_missing": "\u26A0\uFE0F  ",
     "totp_digits_only": "\u26A0\uFE0F  ",
     "totp_rejected_window": "\u26A0\uFE0F  ",
     "totp_not_enabled": "\u26A0\uFE0F  ",
@@ -5460,19 +5491,6 @@ _EMOJI = {
     "oauth_scope_fallback": "\u26A0\uFE0F  ",
     "clock_offset_note": "\u23F0 ",
     "blocked_wait": "\u23F3 ",
-    # success
-    "guardian_enrolled": "\u2705 ",
-    "proxypass_received": "\u2705 ",
-    "serverlist_done": "\u2705 ",
-    "json_saved": "\U0001F4BE ",
-    "qr_saved": "\u2705 ",
-    # warnings (soft, non-fatal)
-    "unexpected_error": "\u26A0\uFE0F  ",
-    "port_busy": "\u26A0\uFE0F  ",
-    "singbox_died": "\u26A0\uFE0F  ",
-    "totp_digits_only": "\u26A0\uFE0F  ",
-    "totp_rejected_window": "\u26A0\uFE0F  ",
-    "oauth_scope_denied": "\u26A0\uFE0F  ",
     # hard errors
     "login_blocked": "\u274C ",
     "waf_406": "\u274C ",
@@ -5537,12 +5555,14 @@ _EMOJI = {
     "api_proxy_socks_unsupported": "\u274C ",
     "hotkey_tls_split": "\U0001F9E9 ",
     "tls_split_startup": "\U0001F9E9 ",
+    "hotkey_dpi": "\U0001F527 ",
+    "dpi_startup": "\U0001F527 ",
     "fastly_406_stale": "\U0001F504 ",
     "fxa_429_cooldown": "\U0001F4E1 ",
-    "guardian_reactivated": "\U0001F6E1uFE0F  ",
-    "guardian_reactivate_failed": "\U0001F6E1uFE0F  ",
-    "pass_rejected_refresh": "\u26A0uFE0F  ",
-    "session_fail_refresh": "\u26A0uFE0F  ",
+    "guardian_reactivated": "\U0001F6E1\uFE0F  ",
+    "guardian_reactivate_failed": "\U0001F6E1\uFE0F  ",
+    "pass_rejected_refresh": "\u26A0\uFE0F  ",
+    "session_fail_refresh": "\u26A0\uFE0F  ",
     "connect_rejected": "\u274C ",
     "connect_target_open_timeout": "\u23F3 ",
     "connect_target_bad_gateway": "\u274C ",
@@ -6712,7 +6732,7 @@ def fastly_solve_challenge(target_url: str = FASTLY_PAGE):
     referer = target_url
 
     # 1. challenge page -> script id
-    status, body = _fastly_http("GET", target_url, headers={
+    _status, body = _fastly_http("GET", target_url, headers={
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"})
     html = body.decode("utf-8", "replace")
     m = (re.search(r"script\.src = '\/_fs-ch-([^\/]+)\/script\.js\?reload=true'", html)
@@ -6722,7 +6742,7 @@ def fastly_solve_challenge(target_url: str = FASTLY_PAGE):
     script_id = m.group(1)
 
     # 2. script.js -> token
-    status, body = _fastly_http(
+    _status, body = _fastly_http(
         "GET", f"{domain}/_fs-ch-{script_id}/script.js?reload=true",
         headers={"Referer": referer, "Accept": "*/*"})
     m = re.search(r'init\(\[[^\]]*\],\s*"([^"]+)"', body.decode("utf-8", "replace"))
@@ -6799,8 +6819,6 @@ def fastly_solve_challenge(target_url: str = FASTLY_PAGE):
             raise RuntimeError(
                 f"challenge not solved (status={current.get('status')!r}, "
                 f"rounds={_round_no})")
-    final = current
-
     for c in COOKIE_JAR:
         if c.name.startswith("_fs_ch_cp_"):
             return c.name, c.value
@@ -8008,6 +8026,7 @@ def apply_profile_runtime(args):
     save_str_setting("theme", _THEME)
     save_bool_setting("doh_cache", doh_cache_enabled())
     save_bool_setting("tls_split", tls_split())
+    save_bool_setting("dpi", dpi_enabled())
     if _THEME != _theme_before or _USE_COLOR != _color_before:
         global _BG_CURRENT
         if _USE_COLOR:
@@ -9055,7 +9074,7 @@ def fxa_login(email: str, password: str, totp_provider=None,
     totp_provider: callable() -> numeric code (generated by the script itself).
     tp: (digits, period, algorithm) TOTP parameters for inter-attempt pauses.
     interactive=False: no input() calls; without a code -> MozVpnError."""
-    digits_n, period, algorithm = (tp or (6, 30, "SHA1"))
+    _digits_n, period, _algorithm = (tp or (6, 30, "SHA1"))
     period = int(period)
     email_norm = email.strip().lower()
 
@@ -9388,7 +9407,8 @@ def oauth_token(session_token: str) -> str:
             raise MozVpnError(tr("oauth_session_invalid", errno=d.get("errno")),
                              code="relogin")
         raise MozVpnError(tr("oauth_error", status=status, data=d))
-    raise MozVpnError(tr("oauth_all_scopes_denied", err=last_err))
+    status, d = last_err
+    raise MozVpnError(tr("oauth_all_scopes_denied", err=f"HTTP {status}: {d}"))
 
 def oauth_destroy(access_token: str):
     """Best-effort revocation of the OAuth access token after proxyPass."""
@@ -9888,14 +9908,30 @@ def _ssl_ctx() -> ssl.SSLContext:
 TLS_SPLIT_CHUNK = 64          # bytes per ClientHello TCP segment
 TLS_SPLIT_DELAY = 0.03        # s after the first segment
 _tls_split_on = {"v": False}
+_dpi_on = {"v": True}         # v10.x: the GLOBAL DPI-bypass master switch
+                              # (--dpi / --no-dpi / hotkey 'f' / env
+                              # MOZVPN_DPI). When OFF, every DPI-bypass
+                              # option (tls-split and any future ones) is
+                              # forced off regardless of its own state.
+
+def set_dpi(enabled: bool):
+    """v10.x: enable/disable ALL DPI-bypass options (NEW connections)."""
+    _dpi_on["v"] = bool(enabled)
+
+def dpi_enabled() -> bool:
+    """v10.x: whether ANY DPI bypass is active (master switch)."""
+    return _dpi_on["v"]
 
 def set_tls_split(enabled: bool):
     """v6.6: enable/disable the ClientHello fragmentation (NEW connections)."""
     _tls_split_on["v"] = bool(enabled)
 
 def tls_split() -> bool:
-    """v6.6: whether the ClientHello fragmentation is active."""
-    return _tls_split_on["v"]
+    """v6.6: whether the ClientHello fragmentation is active.
+    v10.x: gated by the GLOBAL DPI-bypass master switch (dpi_enabled) -
+    when the master is OFF, fragmentation is forced off even if its own
+    toggle is ON."""
+    return dpi_enabled() and _tls_split_on["v"]
 
 def _split_clienthello_records(record: bytes) -> "list[bytes] | None":
     """v7.0: re-frame ONE TLS record (the ClientHello) into TWO
@@ -9954,11 +9990,15 @@ def _split_clienthello_records(record: bytes) -> "list[bytes] | None":
             p += 4 + elen
         if cut is None or cut <= 5 or cut >= len(record) - 1:
             return None
-        def _frame(part: bytes) -> bytes:
-            # re-write the record header with the new payload length
-            return (part[:3] + (len(part) - 5).to_bytes(2, "big")
-                    + part[5:])
-        return [_frame(record[:cut]), _frame(record[cut:])]
+        def _frame(part: bytes, first: bool = False) -> bytes:
+            if first:
+                # First fragment: reuse original record header, rewrite length.
+                return part[:3] + (len(part) - 5).to_bytes(2, "big") + part[5:]
+            # Second fragment: needs a brand-new TLS record header
+            # (content_type=handshake 0x16, original version, new length).
+            return (b"\x16" + record[1:3] + len(part).to_bytes(2, "big")
+                    + part)
+        return [_frame(record[:cut], first=True), _frame(record[cut:])]
     except Exception:
         return None
 
@@ -10160,15 +10200,6 @@ def _tls_connect(host: str, port: int, timeout: int = 20,
     other caller. Both raw sockets also get TCP_NODELAY now (see
     _tcp_nodelay): the fragmented ClientHello of tls_split must not
     be serialized by Nagle waiting for its own ACKs."""
-    """TCP + TLS to the egress with a fallback matrix of ClientHello profiles.
-    Raises the last error, annotated with a plaintext peek when the peer
-    answered something that was not TLS at all.
-    v5.6 probe speedup: the hostname is resolved ONCE before the profile
-    loop and the resolved IP list is reused by every profile attempt -
-    previously each of the 4 attempts ran a FRESH DoH resolution (and the
-    in-probe echo fallback 4 more), which with the DoH cache off and a
-    slow/blocked first DoH provider added many seconds to EVERY probe
-    (the '10+ seconds' live-run complaint)."""
     last_err = None
     if ips is None:                   # v9.5: caller-supplied answer
         ips = resolve_host(host)      # v5.6: resolve once, reuse below
@@ -10213,11 +10244,13 @@ def _tls_connect(host: str, port: int, timeout: int = 20,
             return ctx.wrap_socket(raw, server_hostname=host)
         except Exception as e:
             # a TLS-HANDSHAKE failure: the next ClientHello profile may
-            # still succeed - walk on (the preserved v5.6 behavior)
+            # still succeed - walk on (the preserved v5.6 behavior).
+            # A plaintext peer response (e.g. HTTP 451 from a middlebox)
+            # is recorded as the last error but does NOT abort the
+            # profile matrix - a later profile (e.g. the unverified
+            # last resort) may still complete the handshake.
             last_err = e
-            extra = _peek_plain(raw) if raw else ""
-            if extra:
-                raise MozVpnError(tr("tls_plain_http", text=extra))
+            _peek_plain(raw) if raw else None  # diagnostic only, no raise
             try:
                 if raw:
                     raw.close()
@@ -10306,7 +10339,7 @@ def _http_ip_request_over_tunnel(tunnel: "ssl.SSLSocket", host_header: str,
                 break
     except socket.timeout:
         pass
-    status, headers, body = _http_dechunked_body(b"".join(chunks))
+    _status, _headers, body = _http_dechunked_body(b"".join(chunks))
     return body.decode("utf-8", "replace").strip() if body else ""
 
 def _hp(host: str, port, width: int = 34) -> str:
@@ -11331,8 +11364,9 @@ def run_doctor(a) -> int:
     # 7. the server list fetch (Remote Settings) - kept for step 8
     locs = []
     try:
-        locs = fetch_serverlist()
-        n_srv = sum(len(l.get("servers") or []) for l in locs)
+        locs, _recommended = fetch_serverlist()
+        n_srv = sum(len(c.get("servers") or [])
+                    for l in locs for c in (l.get("cities") or []))
         info(tr("doctor_serverlist", n=len(locs), m=n_srv))
         _mark(bool(locs))
     except Exception as e:
@@ -11342,9 +11376,12 @@ def run_doctor(a) -> int:
     try:
         srv = None
         for l in locs:
-            if l.get("servers"):
-                s0 = l["servers"][0]
-                srv = (s0.get("protocolHost"), s0.get("protocolPort"))
+            for c in (l.get("cities") or []):
+                if c.get("servers"):
+                    s0 = c["servers"][0]
+                    srv = (s0.get("protocolHost"), s0.get("protocolPort"))
+                    break
+            if srv:
                 break
         if srv and srv[0]:
             t0 = time.monotonic()
@@ -11527,19 +11564,24 @@ _TARGET_FAIL_WARNED = {}                    # (kind, target) -> ts
 _TARGET_FAIL_LOCK = threading.Lock()
 
 def _warn_target_failure_once(kind: str, code: int, target: str):
-    """v9.4: print the open-timeout / bad-gateway warn line for
+    """v9.4 / v10.x: print the open-timeout / bad-gateway warn line for
     (kind, target) only when THIS target has not already had a
     line inside _PASS_FAIL_WINDOW (60 s) - one dead destination
     hammered by a client retry loop must not flood the log nor
     lift the live panel once per failed CONNECT. The silent repeats
     are still fully counted by _PassMonitor.note_target_failure
-    (the session-health semantics of v6.6/v9.2 are unchanged)."""
+    (the session-health semantics of v6.6/v9.2 are unchanged).
+    The dedup key normalizes the target to host-only (port stripped,
+    IPv6 brackets removed, lowercased) so different wire forms of the
+    same host (example.com:443 vs example.com:8443, [::1]:443 vs ::1:443)
+    cannot print duplicate console lines, while distinct hosts still
+    warn separately."""
     now = time.time()
     with _TARGET_FAIL_LOCK:
         for k in [k for k, ts in _TARGET_FAIL_WARNED.items()
                   if ts < now - _PASS_FAIL_WINDOW]:
             del _TARGET_FAIL_WARNED[k]
-        key = (kind, target)
+        key = (kind, _norm_target_for_dedup(target))
         if key in _TARGET_FAIL_WARNED:
             return          # already said inside the window
         _TARGET_FAIL_WARNED[key] = now
@@ -11549,6 +11591,17 @@ def _warn_target_failure_once(kind: str, code: int, target: str):
     else:
         warn(tr("connect_target_bad_gateway", code=code,
                 target=_redact_target(target)))
+
+
+def _norm_target_for_dedup(target: str) -> str:
+    """Strip port, IPv6 brackets and lowercase a CONNECT target for
+    dedup keying (example.com:443 -> example.com, [::1]:443 -> ::1)."""
+    try:
+        host, _port = target.rsplit(":", 1)
+    except ValueError:
+        host = target
+    host = host.strip("[]").lower()
+    return host
 
 class _PassMonitor:
     """v6.6: thread-safe registry of the pass-health signals raised by
@@ -11591,7 +11644,12 @@ class _PassMonitor:
             for t in [t for t, v in book.items()
                       if v[0] < now - _PASS_FAIL_WINDOW]:
                 del book[t]
-            book[target] = (now, host)
+            # v10.0.11 (user report): key the book by host-only (port stripped)
+            # so the same host on :443/:80/:8443 counts as ONE target, matching
+            # the console dedup _warn_target_failure_once and stopping the
+            # false 3-distinct-targets session_fail cascade.
+            _key = _norm_target_for_dedup(target)
+            book[_key] = (now, host)
             if len(book) >= 3:
                 # THREE DISTINCT targets failed the same way - the
                 # session/tunnel is the common factor (the Go
@@ -11606,15 +11664,16 @@ class _PassMonitor:
     def note_success(cls, host: str):
         with cls._lock:
             cls._host_fails.pop(host, None)
-            # v9.2 (the user's report): a successful CONNECT through
-            # THIS egress is direct evidence the tunnel/session is
-            # alive - its recorded per-target failures were per-target
-            # issues (dead sites), so they are dropped (Firefox resets
-            # the connection/error history when the connection works
-            # again). The OTHER egresses keep their own entries.
+            # v10.0.11 (user report): a successful CONNECT through ANY egress
+            # proves the shared pass/session is alive (Firefox resets the
+            # error history on a working connection) - drop ALL recorded
+            # target failures, not only those tagged with this egress.
+            # Otherwise failures accumulated on egress A never clear when
+            # successes land on egress B, causing a false
+            # 3-distinct-targets session_fail cascade (and a needless pass
+            # refresh).
             for book in (cls._open_timeout, cls._bad_gateway):
-                for t in [t for t, v in book.items() if v[1] == host]:
-                    del book[t]
+                book.clear()
 
     @classmethod
     def host_failures(cls, host: str) -> int:
@@ -11724,10 +11783,135 @@ def _relay(src, dst):
         except OSError:
             pass
 
+def _relay_pair(src, dst, drain_window=_HALF_CLOSE_DRAIN):
+    """v10.x: single-threaded bidirectional relay between two sockets using
+    select() instead of two _relay threads. Uses non-blocking sockets with
+    buffered writes and SSL pending() checks for correctness with TLS.
+    Semantics match the v6.6/v6.7 contract exactly: the FIRST direction
+    (src→dst) is waited for UNBOUNDED (the tunnel's real lifetime); when
+    src hits EOF, dst is half-closed (SHUT_WR) and the SECOND direction
+    (dst→src) gets the bounded drain window before both sockets are closed."""
+    src.setblocking(False)
+    dst.setblocking(False)
+
+    first_done = False
+    first_done_at = None
+    src_closed = False
+    dst_closed = False
+
+    src_to_dst = bytearray()
+    dst_to_src = bytearray()
+
+    try:
+        while True:
+            read_list = []
+            write_list = []
+
+            if not first_done and not src_closed:
+                read_list.append(src)
+            if not dst_closed:
+                read_list.append(dst)
+
+            if src_to_dst:
+                write_list.append(dst)
+            if dst_to_src:
+                write_list.append(src)
+
+            # SSL pending() check: if SSL has buffered data, treat as readable
+            ssl_pending = False
+            for sock in (src, dst):
+                p = getattr(sock, "pending", None)
+                if callable(p):
+                    try:
+                        if p() > 0:
+                            ssl_pending = True
+                            if sock not in read_list:
+                                read_list.append(sock)
+                    except Exception:
+                        pass
+
+            # Determine timeout
+            if first_done and first_done_at is not None:
+                remaining = drain_window - (time.monotonic() - first_done_at)
+                if remaining <= 0:
+                    break
+                timeout = 0 if ssl_pending else remaining
+            else:
+                timeout = 0 if ssl_pending else None
+
+            try:
+                readable, writable, _ = select.select(read_list, write_list, [], timeout)
+            except (OSError, ValueError):
+                break
+
+            # Handle reads
+            for sock in readable:
+                try:
+                    data = sock.recv(65536)
+                except (BlockingIOError, InterruptedError,
+                        ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    continue
+                except OSError:
+                    return
+
+                if not data:
+                    if sock is src and not first_done:
+                        first_done = True
+                        first_done_at = time.monotonic()
+                        src_closed = True
+                        try:
+                            dst.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                    elif sock is dst:
+                        dst_closed = True
+                        return
+                else:
+                    if sock is src:
+                        src_to_dst.extend(data)
+                    else:
+                        dst_to_src.extend(data)
+
+            # Handle writes
+            for sock in writable:
+                if sock is dst and src_to_dst:
+                    try:
+                        sent = sock.send(bytes(src_to_dst))
+                        del src_to_dst[:sent]
+                    except (BlockingIOError, InterruptedError,
+                            ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                        pass
+                    except OSError:
+                        return
+                elif sock is src and dst_to_src:
+                    try:
+                        sent = sock.send(bytes(dst_to_src))
+                        del dst_to_src[:sent]
+                    except (BlockingIOError, InterruptedError,
+                            ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                        pass
+                    except OSError:
+                        return
+
+            # Check exit conditions
+            if first_done and dst_closed and not dst_to_src:
+                return
+            if src_closed and dst_closed and not src_to_dst and not dst_to_src:
+                return
+    finally:
+        try:
+            src.close()
+        except OSError:
+            pass
+        try:
+            dst.close()
+        except OSError:
+            pass
+
 def _read_http_head(conn) -> "tuple[str, dict, bytes]":
     """Read the request line + headers from a client socket. Returns
     (first_line, headers_dict, leftover_bytes_after_blank_line)."""
-    buf = b""
+    buf = bytearray()
     while b"\r\n\r\n" not in buf:
         chunk = conn.recv(65536)
         if not chunk:
@@ -12089,7 +12273,7 @@ class DnsRelay:
         is read per query, so a hotkey change applies LIVE). A dead
         or JSON-only custom endpoint fails THAT query instead of
         silently answering through a provider the user did not pick."""
-        host, port, path, tag = doh_wire_targets()[0]
+        host, port, path, _tag = doh_wire_targets()[0]
         deadline = time.time() + DNS_RELAY_BUDGET
         try:
             return self._doh_via_local(proxy, host, port, path,
@@ -12598,12 +12782,16 @@ class BuiltinProxyEngine:
                         # classes above stay counted for it.
                         _warn_doh_target_unreachable(target_full)
                     else:
-                        # v9.4: ONE line per (kind, target) inside the
-                        # 60 s window (see _warn_target_failure_once).
-                        _warn_target_failure_once("bad_gateway", code_num,
-                                                   target_full)
+                        # v10.0.12: 502/504 are real unreachable destinations,
+                        # not proxy errors - no console line; session health
+                        # still tracked by _PassMonitor below.
                         _PassMonitor.note_target_failure(
                             "bad_gateway", target_full, proxy["host"])
+                        # 502/504 mean THIS egress IP is bad - drop the
+                        # cached address so the next connection re-resolves
+                        # via DoH instead of retrying the dead IP.
+                        with self._egress_ips_lock:
+                            self._egress_ips.pop(proxy["host"], None)
                     _socks5_reply(conn, 0x04)
                     conn.close()
                     upstream.close()
@@ -12636,26 +12824,7 @@ class BuiltinProxyEngine:
                 # timeout.
                 conn.settimeout(None)
                 upstream.settimeout(None)
-                t1 = threading.Thread(target=_relay, args=(conn, upstream),
-                                      daemon=True)
-                t2 = threading.Thread(target=_relay, args=(upstream, conn),
-                                      daemon=True)
-                t1.start(); t2.start()
-                # the SAME half-close drain semantics as the HTTP path
-                # (the v6.6/v6.7 audit contract: the FIRST direction is
-                # waited for UNBOUNDED, only the second gets the window).
-                t1.join()
-                t2.join(_HALF_CLOSE_DRAIN)
-                try:
-                    upstream.close()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                t1.join(1)
-                t2.join(1)
+                _relay_pair(conn, upstream)
             finally:
                 try:
                     upstream.close()
@@ -12765,12 +12934,17 @@ class BuiltinProxyEngine:
                             # classes above stay counted for it.
                             _warn_doh_target_unreachable(target)
                         else:
-                            # v9.4: ONE line per (kind, target) inside
-                            # the 60 s window (_warn_target_failure_once).
-                            _warn_target_failure_once("bad_gateway",
-                                                      code_num, target)
+                            # v10.0.12: 502/504 are real unreachable destinations,
+                            # not proxy errors - no console line; session health
+                            # still tracked by _PassMonitor below.
                             _PassMonitor.note_target_failure(
                                 "bad_gateway", target, proxy["host"])
+                            # 502/504 mean THIS egress IP is bad - drop the
+                            # cached address so the next connection
+                            # re-resolves via DoH instead of retrying the
+                            # dead IP.
+                            with self._egress_ips_lock:
+                                self._egress_ips.pop(proxy["host"], None)
                         conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                         conn.close()
                         upstream.close()
@@ -12813,38 +12987,7 @@ class BuiltinProxyEngine:
                     # by a recv timeout.
                     conn.settimeout(None)
                     upstream.settimeout(None)
-                    t1 = threading.Thread(target=_relay, args=(conn, upstream), daemon=True)
-                    t2 = threading.Thread(target=_relay, args=(upstream, conn), daemon=True)
-                    t1.start(); t2.start()
-                    # v6.6 (item 5) + the v6.7 audit fix: THE HALF-CLOSE
-                    # DRAIN WINDOW (the Go halfCloseDrainTimeout = 2
-                    # minutes). The v6.6 code bounded BOTH joins - and
-                    # that closed a HEALTHY tunnel (a long download whose
-                    # client side stays silent) after 2-4 minutes: the
-                    # worst kind of regression (the v6.1 lesson). The
-                    # audited semantics: the FIRST relay direction is
-                    # waited for UNBOUNDED (the tunnel's real lifetime,
-                    # the pre-v6.6 behavior - and a dead peer can no
-                    # longer pin the thread: the v6.6 TCP keepalive reaps
-                    # it at the OS level); only the SECOND direction,
-                    # after the half-close, gets the bounded window -
-                    # the peer may legitimately keep sending for a while
-                    # (a download finishing), but a direction that NEVER
-                    # ends must not pin the sockets forever: after the
-                    # window BOTH sockets are closed, the relay threads
-                    # unblock and the connection is reaped.
-                    t1.join()
-                    t2.join(_HALF_CLOSE_DRAIN)
-                    try:
-                        upstream.close()
-                    except Exception:
-                        pass
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    t1.join(1)
-                    t2.join(1)
+                    _relay_pair(conn, upstream)
                 else:
                     # Plain HTTP proxying: forward the absolute-URI request,
                     # no keep-alive to the upstream (the token rotates ~10 min).
@@ -14087,6 +14230,7 @@ def run_manager(args, creds, totp_provider):
                     break
                 elif k == "e":
                     _hotkey_mode(False)
+                    prev_engine = args.local_proxy_engine
                     args.local_proxy_engine = ("singbox"
                         if args.local_proxy_engine == "builtin" else "builtin")
                     # v4.3: switching TO singbox while the binary is missing
@@ -14104,6 +14248,7 @@ def run_manager(args, creds, totp_provider):
                     # (settings.engine) and survives restarts.
                     save_str_setting("engine", args.local_proxy_engine)
                     info(tr("hotkey_engine",
+                            prev=prev_engine,
                             engine=tr("engine_singbox")
                             if args.local_proxy_engine == "singbox"
                             else tr("engine_builtin")))
@@ -14116,10 +14261,11 @@ def run_manager(args, creds, totp_provider):
                     # Toggle the listener bind host 127.0.0.1 <-> 0.0.0.0
                     # and restart the local proxies with the new address.
                     _hotkey_mode(False)
+                    prev_listen = getattr(args, "listen", "127.0.0.1")
                     args.listen = ("0.0.0.0"
-                        if getattr(args, "listen", "127.0.0.1") == "127.0.0.1"
+                        if prev_listen == "127.0.0.1"
                         else "127.0.0.1")
-                    info(tr("hotkey_listen", host=args.listen))
+                    info(tr("hotkey_listen", prev=prev_listen, host=args.listen))
                     if engine:
                         engine.stop_all()
                     engine = None
@@ -14537,11 +14683,12 @@ def run_manager(args, creds, totp_provider):
                     # the new theme (every remembered line re-rendered);
                     # v6.9: the choice is SAVED (settings.theme) and
                     # survives restarts.
+                    prev_theme = _THEME
                     new_theme = "light" if _THEME == "dark" else "dark"
                     set_theme(new_theme)
                     save_str_setting("theme", new_theme)
                     redraw_log()
-                    info(tr("hotkey_theme", theme=new_theme))
+                    info(tr("hotkey_theme", prev=prev_theme, new_theme=new_theme))
                 elif k == "h":
                     # v5.1 (req. 2): 'h' now OPENS A SELECTION MENU of the
                     # DNS resolvers (like the v/b copy lists) instead of
@@ -14592,11 +14739,13 @@ def run_manager(args, creds, totp_provider):
                     # (mirrors --doh-cache); the cache is DISABLED by
                     # default. v6.9: the choice is SAVED
                     # (settings.doh_cache) and survives restarts.
-                    set_doh_cache(not doh_cache_enabled())
+                    _before = doh_cache_enabled()
+                    set_doh_cache(not _before)
                     save_bool_setting("doh_cache", doh_cache_enabled())
                     state = tr("color_state_on" if doh_cache_enabled()
                                else "color_state_off")
-                    info(tr("hotkey_doh_cache", state=state))
+                    prev = tr("color_state_on" if _before else "color_state_off")
+                    info(tr("hotkey_doh_cache", prev=prev, state=state))
                     if doh_cache_enabled():
                         info(tr("doh_cache_state_on", ttl=DOH_TTL))
                     else:
@@ -14614,11 +14763,30 @@ def run_manager(args, creds, totp_provider):
                     # outer-TLS connections of the probes and the
                     # builtin engine. v6.9: the choice is SAVED
                     # (settings.tls_split) and survives restarts.
-                    set_tls_split(not tls_split())
+                    _before = tls_split()
+                    set_tls_split(not _before)
                     save_bool_setting("tls_split", tls_split())
                     state = tr("color_state_on" if tls_split()
                                else "color_state_off")
-                    info(tr("hotkey_tls_split", state=state))
+                    prev = tr("color_state_on" if _before else "color_state_off")
+                    info(tr("hotkey_tls_split", prev=prev, state=state))
+                elif k == "\x04":
+                    # v10.x: toggle the GLOBAL DPI-bypass master switch
+                    # (mirrors --dpi / --no-dpi; Ctrl+D per v9.9 plan).
+                    # When OFF, every DPI-bypass option (tls-split and any
+                    # future ones) is forced off regardless of its own
+                    # toggle - the fastest way to drop all obfuscation on a
+                    # network that does not need it or that blocks
+                    # fragmented handshakes outright.
+                    # v6.9: the choice is SAVED (settings.dpi) and
+                    # survives restarts.
+                    _before = dpi_enabled()
+                    set_dpi(not _before)
+                    save_bool_setting("dpi", dpi_enabled())
+                    state = tr("color_state_on" if dpi_enabled()
+                               else "color_state_off")
+                    prev = tr("color_state_on" if _before else "color_state_off")
+                    info(tr("hotkey_dpi", prev=prev, state=state))
                 elif k == "n":
                     # v4.4 (req. 3): toggle the colored log output on/off
                     # (mirrors --no-color); v4.5: the WHOLE log is redrawn
@@ -14639,6 +14807,7 @@ def run_manager(args, creds, totp_provider):
                     # v6.9: the color choice is SAVED (settings.color)
                     # and survives restarts.
                     global _BG_CURRENT
+                    _before_color = _USE_COLOR
                     set_color(not _USE_COLOR)
                     save_bool_setting("color", _USE_COLOR)
                     if _USE_COLOR:
@@ -14647,10 +14816,9 @@ def run_manager(args, creds, totp_provider):
                         _restore_terminal_bg()
                         _BG_CURRENT = None
                     redraw_log()
-                    if _USE_COLOR:
-                        info(tr("color_enabled"))
-                    else:
-                        info(tr("color_disabled"))
+                    prev = tr("color_state_on" if _before_color else "color_state_off")
+                    state = tr("color_state_on" if _USE_COLOR else "color_state_off")
+                    info(tr("color_toggled", prev=prev, state=state))
                 elif k == "f":
                     # v5.5 (req. 3): export ALL running local proxies as a
                     # FoxyProxy Standard settings file (CURRENT format) -
@@ -14759,12 +14927,13 @@ def run_manager(args, creds, totp_provider):
                     # pattern) and mirrors --auto-rotate /
                     # --no-auto-rotate; the run keeps going - the flag
                     # only GATES the rotation trigger of the watch loop.
-                    new_state = not auto_rotate_enabled()
+                    _before = auto_rotate_enabled()
+                    new_state = not _before
                     set_auto_rotate(new_state)
                     save_bool_setting("auto_rotate", new_state)
-                    info(tr("auto_rotate_switched",
-                            state=(tr("auto_rotate_on") if new_state
-                                   else tr("auto_rotate_off"))))
+                    prev = tr("auto_rotate_on" if _before else "auto_rotate_off")
+                    state = tr("auto_rotate_on" if new_state else "auto_rotate_off")
+                    info(tr("auto_rotate_switched", prev=prev, state=state))
                 elif k == "\x14":
                     # v8.4 (user request): Ctrl+T (the single control char
                     # 0x14) now opens the LOCAL PROXY TYPE SELECTION MENU -
@@ -15884,7 +16053,7 @@ def main():
                          "and upstream proxies (default: off; "
                          "env MOZVPN_SHOW_TEST_COMMANDS=1 enables)")
     ap.add_argument("--firefox-version", default=DEFAULT_FIREFOX_VERSION,
-                    help="Firefox version for the Remote Settings filter_expression (default 156.0)")
+                    help="Firefox version for the Remote Settings filter_expression (default 159.0)")
     ap.add_argument("--client-country", default="",
                     help="Country code for env.country in filter_expression (unset by default)")
     # v5.0: the live vpn-serverlist marks almost every country record
@@ -16048,6 +16217,13 @@ def main():
                          "falls back to the plain TLS profile matrix, so "
                          "the data path never breaks; v6.9: the choice is "
                          "saved and survives restarts. Env: MOZVPN_TLS_SPLIT")
+    ap.add_argument("--dpi", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="Enable/disable ALL DPI-bypass options at once "
+                         "(currently TLS ClientHello fragmentation --tls-split). "
+                         "When OFF, every DPI bypass is forced off regardless "
+                         "of its own toggle; hotkey 'f' toggles it live; "
+                         "saved and survives restarts. Env: MOZVPN_DPI")
     ap.add_argument("--verbose", action=argparse.BooleanOptionalAction,
                     default=_env_flag("MOZVPN_VERBOSE", False),
                     help="Reveal the CONNECT targets in the engine failure "
@@ -16369,6 +16545,20 @@ def main():
     save_bool_setting("tls_split", tls_split())
     info(tr("tls_split_startup",
             state=tr("color_state_on" if tls_split()
+                     else "color_state_off")))
+    # v10.x: the GLOBAL DPI-bypass master switch at startup. An explicit
+    # --dpi/--no-dpi wins, then the SAVED hotkey-'f' choice, then
+    # MOZVPN_DPI, then the ON default (dpi ships enabled like tls-split).
+    a._dpi_explicit = getattr(a, "dpi", None) is not None
+    _dip = getattr(a, "dpi", None)
+    if _dip is None:
+        _dip = load_bool_setting("dpi", None)
+    if _dip is None:
+        _dip = _env_flag("MOZVPN_DPI", True)
+    set_dpi(bool(_dip))
+    save_bool_setting("dpi", dpi_enabled())
+    info(tr("dpi_startup",
+            state=tr("color_state_on" if dpi_enabled()
                      else "color_state_off")))
     # --verbose: the CONNECT targets of the engine failure logs.
     set_verbose_targets(bool(getattr(a, "verbose", False)))
